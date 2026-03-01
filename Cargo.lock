@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libseccomp",
+ "libseccomp-sys",
  "thiserror",
 ]
 
