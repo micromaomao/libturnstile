@@ -34,6 +34,7 @@ impl TurnstileTracer {
 			.map_err(TurnstileTracerError::AddArch)?;
 
 		fs::add_filter_rules(&mut filter_ctx)?;
+		crate::syscalls::net::add_filter_rules(&mut filter_ctx)?;
 
 		Ok(Self {
 			filter_ctx,
@@ -157,10 +158,16 @@ impl TurnstileTracer {
 				let scmpctx_ptr = scmpctx_ptr.into_ptr();
 				let rc = libseccomp_sys::seccomp_load(scmpctx_ptr);
 				if rc != 0 {
-					panic!("seccomp_load failed with error code: {}", rc);
+					return Err(std::io::Error::from_raw_os_error(-rc));
 				}
 				let notify_fd = libseccomp_sys::seccomp_notify_fd(scmpctx_ptr);
-				todo!("Send notify_fd via scm_rights on child_sock");
+				if notify_fd < 0 {
+					return Err(std::io::Error::last_os_error());
+				}
+
+				// Send notify_fd to the parent via SCM_RIGHTS.
+				send_fd_via_scm_rights(child_sock, notify_fd)?;
+
 				libc::close(child_sock);
 				libc::close(notify_fd);
 				Ok(())
@@ -171,7 +178,15 @@ impl TurnstileTracer {
 		}
 
 		let child = cmd.spawn().map_err(TurnstileTracerError::Spawn)?;
-		todo!("Receive notify fd from parent_sock via scm_rights and store it in self.notify_fd");
+
+		// Receive notify_fd from child via SCM_RIGHTS.
+		let received_fd = recv_fd_via_scm_rights(parent_sock)
+			.map_err(TurnstileTracerError::TransferNotifyFd)?;
+		unsafe {
+			libc::close(parent_sock);
+		}
+		self.notify_fd = Some(received_fd);
+
 		Ok(child)
 	}
 }
@@ -184,4 +199,90 @@ impl SendableContextPtr {
 	fn into_ptr(self) -> scmp_filter_ctx {
 		self.0
 	}
+}
+
+/// Send a file descriptor to another process via a Unix socket using SCM_RIGHTS.
+unsafe fn send_fd_via_scm_rights(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
+	// Use a [u64] buffer to ensure 8-byte alignment required by cmsghdr.
+	let cmsg_space = unsafe {
+		libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize
+	};
+	let num_u64s = (cmsg_space + 7) / 8;
+	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
+
+	let mut dummy: u8 = 0;
+	let mut iov = libc::iovec {
+		iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
+		iov_len: 1,
+	};
+
+	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+	msg.msg_iov = &mut iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+	msg.msg_controllen = (num_u64s * 8) as libc::size_t;
+
+	unsafe {
+		let cmsg = libc::CMSG_FIRSTHDR(&msg);
+		if cmsg.is_null() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"CMSG_FIRSTHDR returned null — control message buffer too small",
+			));
+		}
+		(*cmsg).cmsg_level = libc::SOL_SOCKET;
+		(*cmsg).cmsg_type = libc::SCM_RIGHTS;
+		(*cmsg).cmsg_len =
+			libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as libc::size_t;
+		let fd_data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
+		*fd_data = fd;
+	}
+
+	let ret = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
+	if ret < 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+/// Receive a file descriptor sent via SCM_RIGHTS over a Unix socket.
+fn recv_fd_via_scm_rights(sock: libc::c_int) -> std::io::Result<libc::c_int> {
+	let cmsg_space = unsafe {
+		libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize
+	};
+	let num_u64s = (cmsg_space + 7) / 8;
+	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
+
+	let mut dummy: u8 = 0;
+	let mut iov = libc::iovec {
+		iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
+		iov_len: 1,
+	};
+
+	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+	msg.msg_iov = &mut iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+	msg.msg_controllen = (num_u64s * 8) as libc::size_t;
+
+	let ret = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+	if ret < 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	if ret == 0 {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::UnexpectedEof,
+			"child closed socket without sending notify fd",
+		));
+	}
+
+	let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+	if cmsg.is_null() {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"no control message received",
+		));
+	}
+	let received_fd = unsafe { *(libc::CMSG_DATA(cmsg) as *const libc::c_int) };
+	Ok(received_fd)
 }

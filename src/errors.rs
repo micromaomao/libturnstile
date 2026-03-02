@@ -14,6 +14,8 @@ pub enum TurnstileTracerError {
 	Socketpair(std::io::Error),
 	#[error("failed to spawn child process: {0}")]
 	Spawn(std::io::Error),
+	#[error("failed to transfer notify fd from child process: {0}")]
+	TransferNotifyFd(std::io::Error),
 	#[error("failed to resolve syscall {0}: {1}")]
 	ResolveSyscall(&'static str, libseccomp::error::SeccompError),
 	#[error("failed to add filter rule for {0}: {1}")]
