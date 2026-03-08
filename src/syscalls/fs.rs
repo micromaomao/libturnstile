@@ -529,11 +529,7 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	),
 ];
 
-// (name, handler, arg index of the dfd, arg index of the path, arg index of AT_* flags or None)
-//
-// The flags field records where to find AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW
-// in the syscall arguments (a non-None value means that arg index holds
-// the AT_* flags bitmask; None means no such flags are present).
+// (name, handler, arg index of the dfd, arg index of the path, arg index of AT_* flags or None if no such flag)
 const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	(
 		"openat",
@@ -652,10 +648,7 @@ const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
 		1,
 	),
 ];
-// (name, handler, dfd1, path1, dfd2, path2, arg index of AT_* flags or None)
-//
-// The flags field records where to find AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW
-// flags that apply to the first (source) path.
+// (name, handler, dfd1, path1, dfd2, path2, arg index of AT_* flags affecting path1, or None if no such flag)
 const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, Option<u8>)] = &[
 	(
 		"renameat",
@@ -757,10 +750,6 @@ pub(crate) fn handler_return_to_access_req(ret: (Operation, Option<Operation>)) 
 	}
 	ar
 }
-
-// Resolved syscall-number tables, built once (lazily) from the name tables
-// above.  Comparisons against ScmpSyscall (a plain i32 wrapper) are far
-// cheaper than allocating a string via get_name() and doing a string compare.
 
 lazy_syscall_table_name_to_number!(FS_SYSCALLS_PATH, resolved_path, SyscallHandler1, u8);
 lazy_syscall_table_name_to_number!(
