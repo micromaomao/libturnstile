@@ -195,10 +195,7 @@ impl FsTarget {
 		{
 			let dir_bytes = &path_bytes[..last_slash];
 			let dir_cstr = if dir_bytes.is_empty() {
-				assert!(
-					self.dfd.is_none(),
-					"Internal error: absolute path should not have dfd set"
-				);
+				assert!(self.dfd.is_none(), "absolute path should not have dfd set");
 				CString::new("/").unwrap()
 			} else {
 				CString::new(dir_bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?

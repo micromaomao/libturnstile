@@ -11,6 +11,28 @@ use crate::{
 	syscalls::{RequestContext, fs, net},
 };
 
+use log::error;
+
+fn dump_seccomp_request(req: &ScmpNotifReq) -> String {
+	let comm = std::fs::read_to_string(format!("/proc/{}/comm", req.pid))
+		.ok()
+		.map(|s| s.trim().to_string())
+		.unwrap_or_else(|| "???".to_string());
+	format!(
+		"process: {}[{}]\nsyscall: {} ({})\nargs: [{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+		comm,
+		req.pid,
+		req.data.syscall.get_name().unwrap_or("???".to_string()),
+		req.data.syscall.as_raw_syscall(),
+		req.data.args[0],
+		req.data.args[1],
+		req.data.args[2],
+		req.data.args[3],
+		req.data.args[4],
+		req.data.args[5],
+	)
+}
+
 #[derive(Debug)]
 pub struct TurnstileTracer {
 	/// Stores the seccomp filter context.
@@ -91,6 +113,11 @@ impl TurnstileTracer {
 					Ok(None)
 				} else {
 					_ = ctx.send_continue();
+					error!(
+						"Error while handling seccomp notification:\nRequest: \n{}\nError: {:#?}",
+						dump_seccomp_request(&ctx.sreq),
+						e
+					);
 					Err(e)
 				}
 			}
@@ -110,7 +137,9 @@ impl TurnstileTracer {
 		return Ok(None);
 	}
 
-	/// Load the seccomp filter into the current thread.
+	/// Load the seccomp filter into the current thread.  Use
+	/// [`Self::run_command`] instead for loading the filter into a child
+	/// process.
 	pub fn install_filters(&mut self) -> Result<(), TurnstileTracerError> {
 		if self.notify_fd.is_some() {
 			panic!("Seccomp filters already loaded");
