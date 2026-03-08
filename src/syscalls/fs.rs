@@ -678,8 +678,7 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 	(
 		"renameat2",
 		|req, target1, target2| {
-			// RENAME_EXCHANGE = 1 << 1
-			let exchange = req.arg(4) & (1u64 << 1) != 0;
+			let exchange = req.arg(4) & libc::RENAME_EXCHANGE as u64 != 0;
 			Ok((
 				Operation::FsRename(crate::syscalls::fs::RenameOperation {
 					from: target1,
