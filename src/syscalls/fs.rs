@@ -119,21 +119,12 @@ impl FsTarget {
 		path_arg_index: u8,
 		at_flags: Option<u64>,
 	) -> Result<Self, AccessRequestError> {
-		let at_empty_path = at_flags.map_or(false, |f| f & libc::AT_EMPTY_PATH as u64 != 0);
+		let _at_empty_path = at_flags.map_or(false, |f| f & libc::AT_EMPTY_PATH as u64 != 0);
 		let no_follow = at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
 
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
 		let path = req.cstr_from_target_memory(path_ptr)?;
 		let pathb = path.as_bytes();
-
-		// AT_EMPTY_PATH: if path is empty, the target is the dfd itself.
-		if at_empty_path && pathb.is_empty() {
-			return Ok(Self {
-				dfd: Some(req.arg_to_fd(dfd_arg_index as usize)?),
-				path,
-				no_follow,
-			});
-		}
 
 		if pathb.len() > 0 && pathb[0] == b'/' {
 			return Ok(Self {
@@ -143,7 +134,8 @@ impl FsTarget {
 			});
 		}
 
-		// Relative path: need to resolve dfd.
+		// ??? what happens if AT_EMPTY_PATH is not set but path is empty
+
 		Ok(Self {
 			dfd: Some(req.arg_to_fd(dfd_arg_index as usize)?),
 			path,
@@ -156,7 +148,6 @@ impl FsTarget {
 	pub fn open_target(&self) -> Result<ForeignFd, io::Error> {
 		let path_bytes = self.path.to_bytes();
 
-		// AT_EMPTY_PATH: the target is the dfd itself — dup it.
 		if path_bytes.is_empty() {
 			let dfd = self
 				.dfd
@@ -184,61 +175,62 @@ impl FsTarget {
 	/// everything except the final component of the path to exist (which
 	/// is a normal requirement of most fs syscalls anyway).
 	pub fn open_target_dir(&self) -> Result<(ForeignFd, &CStr), io::Error> {
-		let path_bytes = self.path.to_bytes();
+		let path_bytes_nul = self.path.to_bytes_with_nul();
 
-		let (dir_cstr, file_part) = if let Some(last_slash) =
-			path_bytes.iter().rposition(|&b| b == b'/')
-		{
-			let dir_bytes = &path_bytes[..last_slash];
-			let dir_cstr = if dir_bytes.is_empty() {
-				assert!(self.dfd.is_none(), "absolute path should not have dfd set");
-				CString::new("/").unwrap()
-			} else {
-				CString::new(dir_bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?
+		if let Some(last_slash) = path_bytes_nul.iter().rposition(|&b| b == b'/') {
+			let dir_bytes = &path_bytes_nul[..last_slash];
+			let file_bytes_nul = &path_bytes_nul[last_slash + 1..];
+			let actual_parent_fd_raw = match &self.dfd {
+				Some(dfd) => unsafe {
+					// We have to allocate a new CString to have NUL at the end
+					libc::openat(
+						dfd.as_raw_fd(),
+						CString::new(dir_bytes)
+							.expect("self.path should not have NUL in the middle")
+							.as_ptr(),
+						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+						0,
+					)
+				},
+				None => {
+					assert!(dir_bytes.starts_with(b"/"));
+					// We have to allocate a new CString to have NUL at the end
+					unsafe {
+						libc::open(
+							CString::new(dir_bytes)
+								.expect("self.path should not have NUL in the middle")
+								.as_ptr(),
+							libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+							0,
+						)
+					}
+				}
 			};
-			// Safety: `self.path` is a `CString` which guarantees exactly one NUL byte at
-			// the very end and no interior NUL bytes.  The sub-slice starts at `last_slash+1`
-			// (≤ `path_bytes.len()`) and extends through the trailing NUL, so it is a
-			// well-formed NUL-terminated byte sequence with exactly one NUL, satisfying
-			// the requirements of `from_bytes_with_nul_unchecked`.
-			let file_part = unsafe {
-				CStr::from_bytes_with_nul_unchecked(
-					&self.path.to_bytes_with_nul()[last_slash + 1..],
-				)
-			};
-			(dir_cstr, file_part)
+			let file_name = CStr::from_bytes_with_nul(file_bytes_nul).unwrap();
+			Ok((
+				ForeignFd {
+					local_fd: actual_parent_fd_raw,
+				},
+				file_name,
+			))
 		} else {
-			// No slash — the directory is the base (dfd or cwd).
-			// If path is empty (AT_EMPTY_PATH), refer to the dfd itself as '.'.
-			let file_part: &CStr = if path_bytes.is_empty() {
-				CStr::from_bytes_with_nul(b".\0").unwrap()
-			} else {
-				self.path.as_c_str()
+			let file_name = match path_bytes_nul {
+				// In the AT_EMPTY_PATH case, we can't recover the
+				// filename, so just represent it as "." to the
+				// caller.  Should it need the full path it can always
+				// realpath().
+				b"\0" => CStr::from_bytes_with_nul(b".\0").unwrap(),
+				other => CStr::from_bytes_with_nul(other).unwrap(),
 			};
-			(CString::new(".").unwrap(), file_part)
-		};
-
-		let dir_fd = match &self.dfd {
-			None => unsafe {
-				libc::open(
-					dir_cstr.as_ptr(),
-					libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
-					0,
-				)
-			},
-			Some(dfd) => unsafe {
-				libc::openat(
-					dfd.as_raw_fd(),
-					dir_cstr.as_ptr(),
-					libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
-					0,
-				)
-			},
-		};
-		if dir_fd < 0 {
-			return Err(io::Error::last_os_error());
+			let actual_parent_fd = match &self.dfd {
+				Some(dfd) => dfd.clone(),
+				None => {
+					// Absolute path, open root.
+					ForeignFd::from_path(CStr::from_bytes_with_nul(b"/\0").unwrap())?
+				}
+			};
+			Ok((actual_parent_fd, file_name))
 		}
-		Ok((ForeignFd { local_fd: dir_fd }, file_part))
 	}
 
 	/// Return the absolute path of the target.  This requires everything
