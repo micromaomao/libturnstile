@@ -182,14 +182,15 @@ impl<'a> RequestContext<'a> {
 			));
 		}
 
-		// Second read: one more full page.
+		// Second read: one more full page, appended directly to buf.
 		let second_addr = first_end;
-		let mut buf2: Vec<u8> = Vec::with_capacity(PAGE_SIZE);
+		let old_len = buf.len();
+		buf.reserve_exact(PAGE_SIZE);
 
 		let ret = unsafe {
 			libc::pread(
 				self.mem_fd.as_raw_fd(),
-				buf2.as_mut_ptr() as *mut libc::c_void,
+				buf.as_mut_ptr().add(old_len) as *mut libc::c_void,
 				PAGE_SIZE,
 				second_addr as libc::off_t,
 			)
@@ -200,13 +201,13 @@ impl<'a> RequestContext<'a> {
 				io::Error::last_os_error(),
 			));
 		}
-		// Safety: pread wrote ret bytes into the buffer's spare capacity.
-		unsafe { buf2.set_len(ret as usize) };
+		// Safety: pread wrote ret bytes into buf's spare capacity starting at old_len.
+		unsafe { buf.set_len(old_len + ret as usize) };
 
-		if let Some(nul) = buf2.iter().position(|&b| b == 0) {
-			buf.extend_from_slice(&buf2[..nul]);
-			// Neither buf (no NUL found in first page) nor buf2[..nul] contains
-			// a NUL byte, so CString::new cannot fail here.
+		if let Some(nul) = buf[old_len..].iter().position(|&b| b == 0) {
+			buf.truncate(old_len + nul);
+			// buf was NUL-free up to old_len (first page had none) and we
+			// truncated at the first NUL in the second page, so no interior NUL.
 			return Ok(
 				std::ffi::CString::new(buf).expect("buf should not have NUL bytes in the middle")
 			);
