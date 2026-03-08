@@ -1,3 +1,5 @@
+use std::ffi::CStr;
+
 use libseccomp::{ScmpFilterContext, ScmpSyscall};
 
 use crate::{
@@ -77,10 +79,11 @@ fn read_unix_target(
 			no_follow: false,
 		}
 	} else {
-		let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
+		let cwdstr = format!("/proc/{}/cwd\0", req.sreq.pid);
 		FsTarget {
 			dfd: Some(
-				ForeignFd::from_path(&cwdstr).map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
+				ForeignFd::from_path(CStr::from_bytes_with_nul(cwdstr.as_bytes()).unwrap())
+					.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
 			),
 			path,
 			no_follow: false,

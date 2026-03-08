@@ -1,5 +1,5 @@
 use core::panic;
-use std::os::unix::process::CommandExt;
+use std::{ffi::CStr, os::unix::process::CommandExt};
 
 use libseccomp::{
 	ScmpArch, ScmpFd, ScmpFilterContext, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags,
@@ -83,13 +83,16 @@ impl TurnstileTracer {
 	) -> Result<Option<(AccessRequest, RequestContext<'a>)>, AccessRequestError> {
 		let notify_fd = self.notify_fd.expect("notify fd not initialized");
 		let req = ScmpNotifReq::receive(notify_fd).map_err(AccessRequestError::NotifyReceive)?;
+		let procmem = format!("/proc/{}/mem\0", req.pid);
 		let mut ctx = RequestContext {
 			tracer: self,
 			sreq: req,
 			notify_fd,
 			valid: true,
-			mem_fd: fs::ForeignFd::from_path(&format!("/proc/{}/mem", req.pid))
-				.map_err(|e| AccessRequestError::ReadProcessMemory(req.pid, e))?,
+			mem_fd: fs::ForeignFd::from_path(
+				CStr::from_bytes_with_nul(procmem.as_bytes()).unwrap(),
+			)
+			.map_err(|e| AccessRequestError::ReadProcessMemory(req.pid, e))?,
 		};
 		let result = self.handle_notification(&mut ctx);
 		match result {
@@ -311,6 +314,7 @@ fn recv_fd_via_scm_rights(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 			"no control message received",
 		));
 	}
-	let received_fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::c_int) };
+	let received_fd =
+		unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::c_int) };
 	Ok(received_fd)
 }

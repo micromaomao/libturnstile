@@ -1,4 +1,4 @@
-use std::io;
+use std::{ffi::CStr, io};
 
 use libseccomp::{ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
 use log::warn;
@@ -248,11 +248,13 @@ impl<'a> RequestContext<'a> {
 		let fd = libc::c_int::try_from(raw)
 			.map_err(|_| AccessRequestError::InvalidSyscallData("fd arg not a valid c_int"))?;
 		if fd == libc::AT_FDCWD {
-			let path = format!("/proc/{}/cwd", self.sreq.pid);
-			ForeignFd::from_path(&path).map_err(|e| AccessRequestError::OpenFd(path, e))
+			let path = format!("/proc/{}/cwd\0", self.sreq.pid);
+			ForeignFd::from_path(CStr::from_bytes_with_nul(path.as_bytes()).unwrap())
+				.map_err(|e| AccessRequestError::OpenFd(path, e))
 		} else if fd >= 0 {
-			let path = format!("/proc/{}/fd/{}", self.sreq.pid, fd);
-			ForeignFd::from_path(&path).map_err(|e| AccessRequestError::OpenFd(path, e))
+			let path = format!("/proc/{}/fd/{}\0", self.sreq.pid, fd);
+			ForeignFd::from_path(CStr::from_bytes_with_nul(path.as_bytes()).unwrap())
+				.map_err(|e| AccessRequestError::OpenFd(path, e))
 		} else {
 			Err(AccessRequestError::InvalidSyscallData("fd invalid"))
 		}

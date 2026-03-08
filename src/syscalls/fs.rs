@@ -25,10 +25,8 @@ pub struct ForeignFd {
 }
 
 impl ForeignFd {
-	pub(crate) fn from_path(path: &str) -> Result<Self, io::Error> {
-		// path is always an ASCII /proc/... string that we construct ourselves,
-		// so it will never contain interior NUL bytes.
-		let c_path = CString::new(path).expect("path should not contain NUL bytes");
+	pub(crate) fn from_path<P: AsRef<CStr>>(path: P) -> Result<Self, io::Error> {
+		let c_path = path.as_ref();
 		let local_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC, 0) };
 		if local_fd < 0 {
 			return Err(io::Error::last_os_error());
@@ -106,9 +104,10 @@ impl FsTarget {
 			no_follow: false,
 		};
 		if !absolute {
-			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
+			let cwdstr = format!("/proc/{}/cwd\0", req.sreq.pid);
 			ret.dfd = Some(
-				ForeignFd::from_path(&cwdstr).map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
+				ForeignFd::from_path(CStr::from_bytes_with_nul(cwdstr.as_bytes()).unwrap())
+					.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
 			);
 		}
 		Ok(ret)
