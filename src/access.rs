@@ -1,10 +1,4 @@
-use libseccomp::error::SeccompError;
-use libseccomp::{ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
-
-use crate::syscalls::RequestContext;
-use crate::syscalls::fs::{self, FsTarget};
-use crate::tracer::TurnstileTracer;
-use crate::{AccessRequestError, tracer};
+use crate::syscalls::fs;
 
 /// Represents a traced syscall, which may itself involve multiple
 /// operations executed atomically (e.g. an openat() with O_CREAT is

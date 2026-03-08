@@ -69,7 +69,7 @@ pub(crate) use lazy_syscall_table_name_to_number;
 
 #[derive(Debug)]
 pub struct RequestContext<'a> {
-	pub(crate) tracer: &'a TurnstileTracer,
+	pub(crate) _tracer: &'a TurnstileTracer,
 	pub(crate) sreq: ScmpNotifReq,
 	pub(crate) notify_fd: ScmpFd,
 	pub(crate) valid: bool,

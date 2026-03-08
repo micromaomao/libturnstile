@@ -1,9 +1,7 @@
 use core::panic;
 use std::{ffi::CStr, os::unix::process::CommandExt};
 
-use libseccomp::{
-	ScmpArch, ScmpFd, ScmpFilterContext, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags,
-};
+use libseccomp::{ScmpArch, ScmpFd, ScmpFilterContext, ScmpNotifReq};
 use libseccomp_sys::scmp_filter_ctx;
 
 use crate::{
@@ -85,7 +83,7 @@ impl TurnstileTracer {
 		let req = ScmpNotifReq::receive(notify_fd).map_err(AccessRequestError::NotifyReceive)?;
 		let procmem = format!("/proc/{}/mem\0", req.pid);
 		let mut ctx = RequestContext {
-			tracer: self,
+			_tracer: self,
 			sreq: req,
 			notify_fd,
 			valid: true,
