@@ -1,15 +1,9 @@
-use std::{
-	ffi::CString,
-	io,
-	os::unix::io::AsRawFd,
-	sync::OnceLock,
-};
+use std::{ffi::CString, io, os::unix::io::AsRawFd, sync::OnceLock};
 
 use libseccomp::{ScmpFilterContext, ScmpSyscall};
 
 use crate::{
-	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
-	syscalls::RequestContext,
+	AccessRequest, AccessRequestError, Operation, TurnstileTracerError, syscalls::RequestContext,
 };
 
 use log::warn;
@@ -98,7 +92,11 @@ impl FsTarget {
 		let path = req.cstr_from_target_memory(path_ptr)?;
 		let pathb = path.as_bytes();
 		if pathb.len() > 0 && pathb[0] == b'/' {
-			Ok(Self { dfd: None, path, no_follow: false })
+			Ok(Self {
+				dfd: None,
+				path,
+				no_follow: false,
+			})
 		} else {
 			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
 			Ok(Self {
@@ -118,10 +116,8 @@ impl FsTarget {
 		path_arg_index: u8,
 		at_flags: Option<u64>,
 	) -> Result<Self, AccessRequestError> {
-		let at_empty_path =
-			at_flags.map_or(false, |f| f & libc::AT_EMPTY_PATH as u64 != 0);
-		let no_follow =
-			at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
+		let at_empty_path = at_flags.map_or(false, |f| f & libc::AT_EMPTY_PATH as u64 != 0);
+		let no_follow = at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
 
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
 		let path = req.cstr_from_target_memory(path_ptr)?;
@@ -157,7 +153,11 @@ impl FsTarget {
 		}
 
 		if pathb.len() > 0 && pathb[0] == b'/' {
-			return Ok(Self { dfd: None, path, no_follow });
+			return Ok(Self {
+				dfd: None,
+				path,
+				no_follow,
+			});
 		}
 		if dfd == libc::AT_FDCWD {
 			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
@@ -224,24 +224,24 @@ impl FsTarget {
 	pub fn open_target_dir(&self) -> Result<(libc::c_int, &str), io::Error> {
 		let path_bytes = self.path.to_bytes();
 
-		let (dir_cstr, file_part) =
-			if let Some(last_slash) = path_bytes.iter().rposition(|&b| b == b'/') {
-				let dir_bytes = &path_bytes[..last_slash];
-				let dir_cstr = if dir_bytes.is_empty() {
-					CString::new("/").unwrap()
-				} else {
-					CString::new(dir_bytes)
-						.map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?
-				};
-				let file_part = std::str::from_utf8(&path_bytes[last_slash + 1..])
-					.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?;
-				(dir_cstr, file_part)
+		let (dir_cstr, file_part) = if let Some(last_slash) =
+			path_bytes.iter().rposition(|&b| b == b'/')
+		{
+			let dir_bytes = &path_bytes[..last_slash];
+			let dir_cstr = if dir_bytes.is_empty() {
+				CString::new("/").unwrap()
 			} else {
-				// No slash — the directory is the base (dfd or cwd).
-				let file_part = std::str::from_utf8(path_bytes)
-					.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?;
-				(CString::new(".").unwrap(), file_part)
+				CString::new(dir_bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?
 			};
+			let file_part = std::str::from_utf8(&path_bytes[last_slash + 1..])
+				.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?;
+			(dir_cstr, file_part)
+		} else {
+			// No slash — the directory is the base (dfd or cwd).
+			let file_part = std::str::from_utf8(path_bytes)
+				.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?;
+			(CString::new(".").unwrap(), file_part)
+		};
 
 		let dir_fd = match &self.dfd {
 			None => unsafe {
@@ -398,7 +398,9 @@ fn handle_open_like(
 			// X_OK alone => execution request.
 			if mode == libc::X_OK as u64 {
 				return Ok((
-					Operation::FsExec(ExecOperation { target: target.clone() }),
+					Operation::FsExec(ExecOperation {
+						target: target.clone(),
+					}),
 					None,
 				));
 			}
@@ -414,26 +416,30 @@ fn handle_open_like(
 				libc::O_PATH
 			};
 			return Ok((
-				Operation::FsOpen(OpenOperation { target: target.clone(), flags }),
+				Operation::FsOpen(OpenOperation {
+					target: target.clone(),
+					flags,
+				}),
 				None,
 			));
 		}
 		// No access_mode either — treat as a read-only open.
 		return Ok((
-			Operation::FsOpen(OpenOperation { target: target.clone(), flags: libc::O_RDONLY }),
+			Operation::FsOpen(OpenOperation {
+				target: target.clone(),
+				flags: libc::O_RDONLY,
+			}),
 			None,
 		));
 	}
 
 	// Open-like syscall: use openat_flags if available, otherwise default to
 	// O_CREAT|O_WRONLY|O_TRUNC (the implicit flags of creat(2)).
-	let flags =
-		openat_flags.unwrap_or((libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64)
-			as libc::c_int;
+	let flags = openat_flags.unwrap_or((libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64)
+		as libc::c_int;
 
 	// Create if O_CREAT is set, or if there are no openat_flags (creat syscall).
-	let creates = create_mode.is_some()
-		&& (flags & libc::O_CREAT != 0 || openat_flags.is_none());
+	let creates = create_mode.is_some() && (flags & libc::O_CREAT != 0 || openat_flags.is_none());
 
 	if creates {
 		let create_op = Operation::FsCreate(CreateOperation {
@@ -441,10 +447,19 @@ fn handle_open_like(
 			mode: create_mode.unwrap(),
 			kind: CreateKind::File,
 		});
-		let open_op = Operation::FsOpen(OpenOperation { target: target.clone(), flags });
+		let open_op = Operation::FsOpen(OpenOperation {
+			target: target.clone(),
+			flags,
+		});
 		Ok((create_op, Some(open_op)))
 	} else {
-		Ok((Operation::FsOpen(OpenOperation { target: target.clone(), flags }), None))
+		Ok((
+			Operation::FsOpen(OpenOperation {
+				target: target.clone(),
+				flags,
+			}),
+			None,
+		))
 	}
 }
 
@@ -474,9 +489,9 @@ fn handle_create_like(
 	let actual_kind = if let Some(idx) = symlink_from_arg_index {
 		let src_ptr = req.arg(idx as usize) as *const libc::c_char;
 		let src = req.cstr_from_target_memory(src_ptr)?;
-		let src_str = src
-			.into_string()
-			.map_err(|_| AccessRequestError::InvalidSyscallData("invalid UTF-8 in symlink target"))?;
+		let src_str = src.into_string().map_err(|_| {
+			AccessRequestError::InvalidSyscallData("invalid UTF-8 in symlink target")
+		})?;
 		CreateKind::Symlink { target: src_str }
 	} else {
 		kind
@@ -515,7 +530,13 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 	(
 		"mkdir",
 		|req, target| {
-			handle_create_like(req, target, req.arg(1) as libc::mode_t, CreateKind::Directory, None)
+			handle_create_like(
+				req,
+				target,
+				req.arg(1) as libc::mode_t,
+				CreateKind::Directory,
+				None,
+			)
 		},
 		0,
 	),
@@ -551,13 +572,12 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 		|req, target| {
 			let mode = req.arg(1) as libc::mode_t;
 			let dev = req.arg(2) as libc::dev_t;
-			let kind = if mode & libc::S_IFMT == libc::S_IFBLK
-				|| mode & libc::S_IFMT == libc::S_IFCHR
-			{
-				CreateKind::Device { dev }
-			} else {
-				CreateKind::File
-			};
+			let kind =
+				if mode & libc::S_IFMT == libc::S_IFBLK || mode & libc::S_IFMT == libc::S_IFCHR {
+					CreateKind::Device { dev }
+				} else {
+					CreateKind::File
+				};
 			handle_create_like(req, target, mode, kind, None)
 		},
 		0,
@@ -653,7 +673,13 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 	(
 		"mkdirat",
 		|req, target| {
-			handle_create_like(req, target, req.arg(2) as libc::mode_t, CreateKind::Directory, None)
+			handle_create_like(
+				req,
+				target,
+				req.arg(2) as libc::mode_t,
+				CreateKind::Directory,
+				None,
+			)
 		},
 		0,
 		1,
@@ -664,13 +690,12 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 		|req, target| {
 			let mode = req.arg(2) as libc::mode_t;
 			let dev = req.arg(3) as libc::dev_t;
-			let kind = if mode & libc::S_IFMT == libc::S_IFBLK
-				|| mode & libc::S_IFMT == libc::S_IFCHR
-			{
-				CreateKind::Device { dev }
-			} else {
-				CreateKind::File
-			};
+			let kind =
+				if mode & libc::S_IFMT == libc::S_IFBLK || mode & libc::S_IFMT == libc::S_IFCHR {
+					CreateKind::Device { dev }
+				} else {
+					CreateKind::File
+				};
 			handle_create_like(req, target, mode, kind, None)
 		},
 		0,
@@ -848,7 +873,9 @@ fn resolved_path() -> &'static ResolvedPath {
 		FS_SYSCALLS_PATH
 			.iter()
 			.filter_map(|&(name, handler, path_arg)| {
-				ScmpSyscall::from_name(name).ok().map(|sc| (sc, handler, path_arg))
+				ScmpSyscall::from_name(name)
+					.ok()
+					.map(|sc| (sc, handler, path_arg))
 			})
 			.collect()
 	})
@@ -860,7 +887,9 @@ fn resolved_dfd_path() -> &'static ResolvedDfdPath {
 		FS_SYSCALLS_DFD_PATH
 			.iter()
 			.filter_map(|&(name, handler, dfd, path, flags)| {
-				ScmpSyscall::from_name(name).ok().map(|sc| (sc, handler, dfd, path, flags))
+				ScmpSyscall::from_name(name)
+					.ok()
+					.map(|sc| (sc, handler, dfd, path, flags))
 			})
 			.collect()
 	})
@@ -872,7 +901,9 @@ fn resolved_path_path() -> &'static ResolvedPathPath {
 		FS_SYSCALLS_PATH_PATH
 			.iter()
 			.filter_map(|&(name, handler, p1, p2)| {
-				ScmpSyscall::from_name(name).ok().map(|sc| (sc, handler, p1, p2))
+				ScmpSyscall::from_name(name)
+					.ok()
+					.map(|sc| (sc, handler, p1, p2))
 			})
 			.collect()
 	})
@@ -924,17 +955,20 @@ pub(crate) fn handle_notification<'a>(
 		}
 	}
 
-	for &(scmp, handler, dfd1_arg_index, path1_arg_index, dfd2_arg_index, path2_arg_index, flags_arg_index) in
-		resolved_dfd_path_dfd_path()
+	for &(
+		scmp,
+		handler,
+		dfd1_arg_index,
+		path1_arg_index,
+		dfd2_arg_index,
+		path2_arg_index,
+		flags_arg_index,
+	) in resolved_dfd_path_dfd_path()
 	{
 		if syscall == scmp {
 			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
-			let target1 = FsTarget::from_at_path(
-				request_ctx,
-				dfd1_arg_index,
-				path1_arg_index,
-				at_flags,
-			)?;
+			let target1 =
+				FsTarget::from_at_path(request_ctx, dfd1_arg_index, path1_arg_index, at_flags)?;
 			let target2 =
 				FsTarget::from_at_path(request_ctx, dfd2_arg_index, path2_arg_index, None)?;
 			let (op, extra_op) = handler(request_ctx, &target1, &target2)?;

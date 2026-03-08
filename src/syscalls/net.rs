@@ -63,13 +63,16 @@ fn read_unix_target(
 	let path_bytes = path.as_bytes();
 
 	let target = if path_bytes.first() == Some(&b'/') {
-		FsTarget { dfd: None, path, no_follow: false }
+		FsTarget {
+			dfd: None,
+			path,
+			no_follow: false,
+		}
 	} else {
 		let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
 		FsTarget {
 			dfd: Some(
-				ForeignFd::from_path(&cwdstr)
-					.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
+				ForeignFd::from_path(&cwdstr).map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
 			),
 			path,
 			no_follow: false,
@@ -106,7 +109,9 @@ pub(crate) fn handle_notification<'a>(
 			read_unix_target(request_ctx, addr_arg as usize, addrlen_arg as usize)?
 		{
 			let op = builder(&target);
-			return Ok(Some(AccessRequest { operations: vec![op] }));
+			return Ok(Some(AccessRequest {
+				operations: vec![op],
+			}));
 		}
 		// Not a Unix socket or no address — let the kernel handle it.
 		return Ok(None);

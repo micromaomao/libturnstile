@@ -134,7 +134,9 @@ impl<'a> RequestContext<'a> {
 				.map_err(|_| AccessRequestError::InvalidSyscallData("interior NUL byte in path"));
 		}
 
-		Err(AccessRequestError::InvalidSyscallData("provided path string exceeds PATH_MAX"))
+		Err(AccessRequestError::InvalidSyscallData(
+			"provided path string exceeds PATH_MAX",
+		))
 	}
 
 	pub(crate) fn value_from_target_memory<T: Copy>(

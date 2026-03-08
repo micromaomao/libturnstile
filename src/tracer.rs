@@ -180,8 +180,8 @@ impl TurnstileTracer {
 		let child = cmd.spawn().map_err(TurnstileTracerError::Spawn)?;
 
 		// Receive notify_fd from child via SCM_RIGHTS.
-		let received_fd = recv_fd_via_scm_rights(parent_sock)
-			.map_err(TurnstileTracerError::TransferNotifyFd)?;
+		let received_fd =
+			recv_fd_via_scm_rights(parent_sock).map_err(TurnstileTracerError::TransferNotifyFd)?;
 		unsafe {
 			libc::close(parent_sock);
 		}
@@ -204,9 +204,8 @@ impl SendableContextPtr {
 /// Send a file descriptor to another process via a Unix socket using SCM_RIGHTS.
 unsafe fn send_fd_via_scm_rights(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
 	// Use a [u64] buffer to ensure 8-byte alignment required by cmsghdr.
-	let cmsg_space = unsafe {
-		libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize
-	};
+	let cmsg_space =
+		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
 	let num_u64s = (cmsg_space + 7) / 8;
 	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
 
@@ -247,9 +246,8 @@ unsafe fn send_fd_via_scm_rights(sock: libc::c_int, fd: libc::c_int) -> std::io:
 
 /// Receive a file descriptor sent via SCM_RIGHTS over a Unix socket.
 fn recv_fd_via_scm_rights(sock: libc::c_int) -> std::io::Result<libc::c_int> {
-	let cmsg_space = unsafe {
-		libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize
-	};
+	let cmsg_space =
+		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
 	let num_u64s = (cmsg_space + 7) / 8;
 	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
 
