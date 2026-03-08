@@ -1,10 +1,12 @@
-use std::{ffi::CString, io, os::unix::io::AsRawFd, sync::OnceLock};
+use std::{ffi::CString, io, os::unix::io::AsRawFd};
 
 use libseccomp::{ScmpFilterContext, ScmpSyscall};
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError, syscalls::RequestContext,
 };
+
+use super::lazy_syscall_table_name_to_number;
 
 use log::warn;
 
@@ -818,66 +820,32 @@ pub(crate) fn handler_return_to_access_req(ret: (Operation, Option<Operation>)) 
 // above.  Comparisons against ScmpSyscall (a plain i32 wrapper) are far
 // cheaper than allocating a string via get_name() and doing a string compare.
 
-type ResolvedPath = Vec<(ScmpSyscall, SyscallHandler1, u8)>;
-type ResolvedDfdPath = Vec<(ScmpSyscall, SyscallHandler1, u8, u8, Option<u8>)>;
-type ResolvedPathPath = Vec<(ScmpSyscall, SyscallHandler2, u8, u8)>;
-type ResolvedDfdPathDfdPath = Vec<(ScmpSyscall, SyscallHandler2, u8, u8, u8, u8, Option<u8>)>;
-
-fn resolved_path() -> &'static ResolvedPath {
-	static ONCE: OnceLock<ResolvedPath> = OnceLock::new();
-	ONCE.get_or_init(|| {
-		FS_SYSCALLS_PATH
-			.iter()
-			.filter_map(|&(name, handler, path_arg)| {
-				ScmpSyscall::from_name(name)
-					.ok()
-					.map(|sc| (sc, handler, path_arg))
-			})
-			.collect()
-	})
-}
-
-fn resolved_dfd_path() -> &'static ResolvedDfdPath {
-	static ONCE: OnceLock<ResolvedDfdPath> = OnceLock::new();
-	ONCE.get_or_init(|| {
-		FS_SYSCALLS_DFD_PATH
-			.iter()
-			.filter_map(|&(name, handler, dfd, path, flags)| {
-				ScmpSyscall::from_name(name)
-					.ok()
-					.map(|sc| (sc, handler, dfd, path, flags))
-			})
-			.collect()
-	})
-}
-
-fn resolved_path_path() -> &'static ResolvedPathPath {
-	static ONCE: OnceLock<ResolvedPathPath> = OnceLock::new();
-	ONCE.get_or_init(|| {
-		FS_SYSCALLS_PATH_PATH
-			.iter()
-			.filter_map(|&(name, handler, p1, p2)| {
-				ScmpSyscall::from_name(name)
-					.ok()
-					.map(|sc| (sc, handler, p1, p2))
-			})
-			.collect()
-	})
-}
-
-fn resolved_dfd_path_dfd_path() -> &'static ResolvedDfdPathDfdPath {
-	static ONCE: OnceLock<ResolvedDfdPathDfdPath> = OnceLock::new();
-	ONCE.get_or_init(|| {
-		FS_SYSCALLS_DFD_PATH_DFD_PATH
-			.iter()
-			.filter_map(|&(name, handler, d1, p1, d2, p2, flags)| {
-				ScmpSyscall::from_name(name)
-					.ok()
-					.map(|sc| (sc, handler, d1, p1, d2, p2, flags))
-			})
-			.collect()
-	})
-}
+lazy_syscall_table_name_to_number!(FS_SYSCALLS_PATH, resolved_path, SyscallHandler1, u8);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_DFD_PATH,
+	resolved_dfd_path,
+	SyscallHandler1,
+	u8,
+	u8,
+	Option<u8>
+);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_PATH_PATH,
+	resolved_path_path,
+	SyscallHandler2,
+	u8,
+	u8
+);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_DFD_PATH_DFD_PATH,
+	resolved_dfd_path_dfd_path,
+	SyscallHandler2,
+	u8,
+	u8,
+	u8,
+	u8,
+	Option<u8>
+);
 
 pub(crate) fn handle_notification<'a>(
 	request_ctx: &mut RequestContext<'a>,

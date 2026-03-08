@@ -2,7 +2,7 @@ use libseccomp::{ScmpFilterContext, ScmpSyscall};
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
-	syscalls::{RequestContext, fs::ForeignFd, fs::FsTarget},
+	syscalls::{RequestContext, fs::ForeignFd, fs::FsTarget, lazy_syscall_table_name_to_number},
 };
 
 /// Unix socket syscalls to intercept:
@@ -12,6 +12,14 @@ const UNIX_SOCK_SYSCALLS: &[(&str, fn(&FsTarget) -> Operation, u8, u8)] = &[
 	("bind", |t| Operation::UnixListen(t.clone()), 1, 2),
 	("sendto", |t| Operation::UnixSendto(t.clone()), 4, 5),
 ];
+
+lazy_syscall_table_name_to_number!(
+	UNIX_SOCK_SYSCALLS,
+	resolved_unix_sock_syscalls,
+	fn(&FsTarget) -> Operation,
+	u8,
+	u8
+);
 
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
@@ -84,24 +92,9 @@ fn read_unix_target(
 pub(crate) fn handle_notification<'a>(
 	request_ctx: &mut RequestContext<'a>,
 ) -> Result<Option<AccessRequest>, AccessRequestError> {
-	use std::sync::OnceLock;
-
-	type Resolved = Vec<(ScmpSyscall, fn(&FsTarget) -> Operation, u8, u8)>;
-	static RESOLVED: OnceLock<Resolved> = OnceLock::new();
-	let resolved = RESOLVED.get_or_init(|| {
-		UNIX_SOCK_SYSCALLS
-			.iter()
-			.filter_map(|&(name, builder, addr_arg, addrlen_arg)| {
-				ScmpSyscall::from_name(name)
-					.ok()
-					.map(|sc| (sc, builder, addr_arg, addrlen_arg))
-			})
-			.collect()
-	});
-
 	let syscall = request_ctx.sreq.data.syscall;
 
-	for &(scmp, builder, addr_arg, addrlen_arg) in resolved {
+	for &(scmp, builder, addr_arg, addrlen_arg) in resolved_unix_sock_syscalls() {
 		if syscall != scmp {
 			continue;
 		}

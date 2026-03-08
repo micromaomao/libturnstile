@@ -9,6 +9,104 @@ use std::os::unix::io::AsRawFd;
 pub mod fs;
 pub mod net;
 
+/// Lazily resolves a syscall-name table into a `ScmpSyscall`-keyed `Vec`,
+/// built once via `OnceLock`.
+///
+/// Usage:
+/// ```ignore
+/// lazy_syscall_table_name_to_number!(TABLE, fn_name, Type1, Type2, ...);
+/// ```
+/// Generates `fn fn_name() -> &'static Vec<(ScmpSyscall, Type1, Type2, ...)>`.
+/// The source table must be `&[(&str, Type1, Type2, ...)]` where the leading
+/// `&str` is the syscall name; it is resolved to a `ScmpSyscall` number and
+/// entries whose name cannot be resolved are silently dropped (e.g. on
+/// architectures that don't have that syscall).
+macro_rules! lazy_syscall_table_name_to_number {
+	($table:expr, $fn_name:ident, $t1:ty, $t2:ty) => {
+		fn $fn_name() -> &'static Vec<(libseccomp::ScmpSyscall, $t1, $t2)> {
+			static ONCE: std::sync::OnceLock<Vec<(libseccomp::ScmpSyscall, $t1, $t2)>> =
+				std::sync::OnceLock::new();
+			ONCE.get_or_init(|| {
+				$table
+					.iter()
+					.filter_map(|&(name, f1, f2)| {
+						libseccomp::ScmpSyscall::from_name(name)
+							.ok()
+							.map(|sc| (sc, f1, f2))
+					})
+					.collect()
+			})
+		}
+	};
+	($table:expr, $fn_name:ident, $t1:ty, $t2:ty, $t3:ty) => {
+		fn $fn_name() -> &'static Vec<(libseccomp::ScmpSyscall, $t1, $t2, $t3)> {
+			static ONCE: std::sync::OnceLock<Vec<(libseccomp::ScmpSyscall, $t1, $t2, $t3)>> =
+				std::sync::OnceLock::new();
+			ONCE.get_or_init(|| {
+				$table
+					.iter()
+					.filter_map(|&(name, f1, f2, f3)| {
+						libseccomp::ScmpSyscall::from_name(name)
+							.ok()
+							.map(|sc| (sc, f1, f2, f3))
+					})
+					.collect()
+			})
+		}
+	};
+	($table:expr, $fn_name:ident, $t1:ty, $t2:ty, $t3:ty, $t4:ty) => {
+		fn $fn_name() -> &'static Vec<(libseccomp::ScmpSyscall, $t1, $t2, $t3, $t4)> {
+			static ONCE: std::sync::OnceLock<Vec<(libseccomp::ScmpSyscall, $t1, $t2, $t3, $t4)>> =
+				std::sync::OnceLock::new();
+			ONCE.get_or_init(|| {
+				$table
+					.iter()
+					.filter_map(|&(name, f1, f2, f3, f4)| {
+						libseccomp::ScmpSyscall::from_name(name)
+							.ok()
+							.map(|sc| (sc, f1, f2, f3, f4))
+					})
+					.collect()
+			})
+		}
+	};
+	($table:expr, $fn_name:ident, $t1:ty, $t2:ty, $t3:ty, $t4:ty, $t5:ty) => {
+		fn $fn_name() -> &'static Vec<(libseccomp::ScmpSyscall, $t1, $t2, $t3, $t4, $t5)> {
+			static ONCE: std::sync::OnceLock<
+				Vec<(libseccomp::ScmpSyscall, $t1, $t2, $t3, $t4, $t5)>,
+			> = std::sync::OnceLock::new();
+			ONCE.get_or_init(|| {
+				$table
+					.iter()
+					.filter_map(|&(name, f1, f2, f3, f4, f5)| {
+						libseccomp::ScmpSyscall::from_name(name)
+							.ok()
+							.map(|sc| (sc, f1, f2, f3, f4, f5))
+					})
+					.collect()
+			})
+		}
+	};
+	($table:expr, $fn_name:ident, $t1:ty, $t2:ty, $t3:ty, $t4:ty, $t5:ty, $t6:ty) => {
+		fn $fn_name() -> &'static Vec<(libseccomp::ScmpSyscall, $t1, $t2, $t3, $t4, $t5, $t6)> {
+			static ONCE: std::sync::OnceLock<
+				Vec<(libseccomp::ScmpSyscall, $t1, $t2, $t3, $t4, $t5, $t6)>,
+			> = std::sync::OnceLock::new();
+			ONCE.get_or_init(|| {
+				$table
+					.iter()
+					.filter_map(|&(name, f1, f2, f3, f4, f5, f6)| {
+						libseccomp::ScmpSyscall::from_name(name)
+							.ok()
+							.map(|sc| (sc, f1, f2, f3, f4, f5, f6))
+					})
+					.collect()
+			})
+		}
+	};
+}
+pub(crate) use lazy_syscall_table_name_to_number;
+
 #[derive(Debug)]
 pub struct RequestContext<'a> {
 	pub(crate) tracer: &'a TurnstileTracer,
