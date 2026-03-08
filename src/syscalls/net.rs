@@ -17,7 +17,7 @@ const UNIX_SOCK_SYSCALLS: &[(&str, fn(FsTarget) -> Operation, u8, u8)] = &[
 
 lazy_syscall_table_name_to_number!(
 	UNIX_SOCK_SYSCALLS,
-	resolved_unix_sock_syscalls,
+	unix_sock_syscalls_table,
 	fn(FsTarget) -> Operation,
 	u8,
 	u8
@@ -99,8 +99,8 @@ pub(crate) fn handle_notification<'a>(
 ) -> Result<Option<AccessRequest>, AccessRequestError> {
 	let syscall = request_ctx.sreq.data.syscall;
 
-	for &(scmp, builder, addr_arg, addrlen_arg) in resolved_unix_sock_syscalls() {
-		if syscall != scmp {
+	for &(sys, builder, addr_arg, addrlen_arg) in unix_sock_syscalls_table() {
+		if syscall != sys {
 			continue;
 		}
 		if let Some(target) =

@@ -751,10 +751,15 @@ pub(crate) fn handler_return_to_access_req(ret: (Operation, Option<Operation>)) 
 	ar
 }
 
-lazy_syscall_table_name_to_number!(FS_SYSCALLS_PATH, resolved_path, SyscallHandler1, u8);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_PATH,
+	fs_syscalls_path_table,
+	SyscallHandler1,
+	u8
+);
 lazy_syscall_table_name_to_number!(
 	FS_SYSCALLS_DFD_PATH,
-	resolved_dfd_path,
+	fs_syscalls_dfd_path_table,
 	SyscallHandler1,
 	u8,
 	u8,
@@ -762,14 +767,14 @@ lazy_syscall_table_name_to_number!(
 );
 lazy_syscall_table_name_to_number!(
 	FS_SYSCALLS_PATH_PATH,
-	resolved_path_path,
+	fs_syscalls_path_path_table,
 	SyscallHandler2,
 	u8,
 	u8
 );
 lazy_syscall_table_name_to_number!(
 	FS_SYSCALLS_DFD_PATH_DFD_PATH,
-	resolved_dfd_path_dfd_path,
+	fs_syscall_dfd_path_dfd_path_table,
 	SyscallHandler2,
 	u8,
 	u8,
@@ -783,16 +788,18 @@ pub(crate) fn handle_notification<'a>(
 ) -> Result<Option<AccessRequest>, AccessRequestError> {
 	let syscall = request_ctx.sreq.data.syscall;
 
-	for &(scmp, handler, path_arg_index) in resolved_path() {
-		if syscall == scmp {
+	for &(sys, handler, path_arg_index) in fs_syscalls_path_table() {
+		if syscall == sys {
 			let target = FsTarget::from_path(request_ctx, path_arg_index)?;
 			let (op, extra_op) = handler(request_ctx, target)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
 
-	for &(scmp, handler, dfd_arg_index, path_arg_index, flags_arg_index) in resolved_dfd_path() {
-		if syscall == scmp {
+	for &(sys, handler, dfd_arg_index, path_arg_index, flags_arg_index) in
+		fs_syscalls_dfd_path_table()
+	{
+		if syscall == sys {
 			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
 			let target =
 				FsTarget::from_at_path(request_ctx, dfd_arg_index, path_arg_index, at_flags)?;
@@ -801,8 +808,8 @@ pub(crate) fn handle_notification<'a>(
 		}
 	}
 
-	for &(scmp, handler, path1_arg_index, path2_arg_index) in resolved_path_path() {
-		if syscall == scmp {
+	for &(sys, handler, path1_arg_index, path2_arg_index) in fs_syscalls_path_path_table() {
+		if syscall == sys {
 			let target1 = FsTarget::from_path(request_ctx, path1_arg_index)?;
 			let target2 = FsTarget::from_path(request_ctx, path2_arg_index)?;
 			let (op, extra_op) = handler(request_ctx, target1, target2)?;
@@ -811,16 +818,16 @@ pub(crate) fn handle_notification<'a>(
 	}
 
 	for &(
-		scmp,
+		sys,
 		handler,
 		dfd1_arg_index,
 		path1_arg_index,
 		dfd2_arg_index,
 		path2_arg_index,
 		flags_arg_index,
-	) in resolved_dfd_path_dfd_path()
+	) in fs_syscall_dfd_path_dfd_path_table()
 	{
-		if syscall == scmp {
+		if syscall == sys {
 			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
 			let target1 =
 				FsTarget::from_at_path(request_ctx, dfd1_arg_index, path1_arg_index, at_flags)?;
