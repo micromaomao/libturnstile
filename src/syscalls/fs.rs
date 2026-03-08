@@ -376,8 +376,6 @@ fn handle_access_like(
 	target: &FsTarget,
 	access_mode: u64,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	use crate::syscalls::fs::{ExecOperation, OpenOperation};
-
 	if access_mode == libc::X_OK as u64 {
 		return Ok((
 			Operation::FsExec(ExecOperation {
@@ -403,12 +401,12 @@ fn handle_open_like(
 	openat_flags: Option<u64>,
 	_openat2_resolve: Option<u64>,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	use crate::syscalls::fs::{CreateKind, CreateOperation, OpenOperation};
-
 	// creat(2) has no explicit flags arg; default to O_CREAT|O_WRONLY|O_TRUNC.
 	let flags = openat_flags.unwrap_or((libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64)
 		as libc::c_int;
 
+	// When O_PATH is specified in flags, flag bits other than O_CLOEXEC,
+	// O_DIRECTORY, and O_NOFOLLOW are ignored.
 	let need_read =
 		flags & libc::O_PATH == 0 && (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY == 0);
 	let need_write =
