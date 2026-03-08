@@ -46,31 +46,42 @@ fn read_sockaddr_un(
 		return Ok(None);
 	}
 	let addrlen = req.arg(addrlen_arg) as usize;
+	let path_offset = offset_of!(libc::sockaddr_un, sun_path);
 	// We need at least sa_family (2 bytes) + 1 path byte.
-	if addrlen < 3 {
+	if addrlen < path_offset + 1 {
 		return Ok(None);
 	}
 
-	// Read the address family (first 2 bytes of sockaddr).  We have to do
-	// this separately from reading the path because the target sockaddr
-	// might not in fact be a sockaddr_un, and it might be smaller.  If
-	// the allocated sockaddr is small and crosses a page boundary, we
-	// don't want to read out-of-bound.
-	let family = req.value_from_target_memory(
-		(addr_ptr + offset_of!(libc::sockaddr_un, sun_family)) as *const libc::sa_family_t,
-	)?;
+	// Read the entire sockaddr in one pread call.
+	let mut buf: Vec<u8> = Vec::with_capacity(addrlen);
+	req.read_target_memory(addr_ptr as *const u8, buf.spare_capacity_mut())?;
+	// Safety: read_target_memory initialized all addrlen bytes.
+	unsafe { buf.set_len(addrlen) };
+
+	// Check the address family.
+	let family_offset = offset_of!(libc::sockaddr_un, sun_family);
+	let family = libc::sa_family_t::from_ne_bytes(
+		buf[family_offset..family_offset + std::mem::size_of::<libc::sa_family_t>()]
+			.try_into()
+			.unwrap(),
+	);
 	if family != libc::AF_UNIX as libc::sa_family_t {
 		return Ok(None);
 	}
 
-	let sun_path_ptr = (addr_ptr + offset_of!(libc::sockaddr_un, sun_path)) as *const libc::c_char;
-	let path = req.cstr_from_target_memory(sun_path_ptr)?;
-
-	// Abstract-namespace sockets have a sun_path with the first byte
-	// being NUL, which we will end up reading as an empty string.
-	if path.as_bytes().is_empty() {
+	// Extract the Unix path.  Abstract-namespace sockets have sun_path[0] == 0;
+	// those have no filesystem path, so skip them.
+	let path_bytes = &buf[path_offset..];
+	if path_bytes.first() == Some(&0) {
 		return Ok(None);
 	}
+
+	let path = match path_bytes.iter().position(|&b| b == 0) {
+		Some(nul_pos) => std::ffi::CString::from_vec_with_nul(path_bytes[..nul_pos + 1].to_vec())
+			.expect("sun_path should not contain interior NUL bytes"),
+		None => std::ffi::CString::new(path_bytes)
+			.expect("path_bytes should not contain interior NUL bytes"),
+	};
 
 	let target = if path.as_bytes().first() == Some(&b'/') {
 		FsTarget {
