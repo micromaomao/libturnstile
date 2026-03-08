@@ -197,6 +197,28 @@ impl<'a> RequestContext<'a> {
 		))
 	}
 
+	/// Reads the syscall argument at `fd_arg_index` and opens it as a
+	/// `ForeignFd` via `/proc/{pid}/...`.  Handles `AT_FDCWD` (→ cwd),
+	/// non-negative fds (→ `/proc/{pid}/fd/{fd}`), and returns an error for
+	/// negative non-`AT_FDCWD` values or values that don't fit in `c_int`.
+	pub(crate) fn arg_to_fd(
+		&mut self,
+		fd_arg_index: usize,
+	) -> Result<ForeignFd, AccessRequestError> {
+		let raw = self.arg(fd_arg_index) as i64;
+		let fd = libc::c_int::try_from(raw)
+			.map_err(|_| AccessRequestError::InvalidSyscallData("fd arg not a valid c_int"))?;
+		if fd == libc::AT_FDCWD {
+			let path = format!("/proc/{}/cwd", self.sreq.pid);
+			ForeignFd::from_path(&path).map_err(|e| AccessRequestError::OpenFd(path, e))
+		} else if fd >= 0 {
+			let path = format!("/proc/{}/fd/{}", self.sreq.pid, fd);
+			ForeignFd::from_path(&path).map_err(|e| AccessRequestError::OpenFd(path, e))
+		} else {
+			Err(AccessRequestError::InvalidSyscallData("fd invalid"))
+		}
+	}
+
 	pub(crate) fn value_from_target_memory<T: Copy>(
 		&mut self,
 		src: *const T,

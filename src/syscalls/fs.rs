@@ -1,4 +1,8 @@
-use std::{ffi::CString, io, os::unix::io::AsRawFd};
+use std::{
+	ffi::{CStr, CString},
+	io,
+	os::unix::io::AsRawFd,
+};
 
 use libseccomp::{ScmpFilterContext, ScmpSyscall};
 
@@ -10,8 +14,13 @@ use super::lazy_syscall_table_name_to_number;
 
 use log::warn;
 
+/// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
+/// refers to a path in the traced process's filesystem namespace.
+///
+/// The fd is closed automatically on drop.  Cloning uses `F_DUPFD_CLOEXEC`
+/// so the duplicate always has the close-on-exec flag set.
 #[derive(Debug)]
-pub(crate) struct ForeignFd {
+pub struct ForeignFd {
 	local_fd: libc::c_int,
 }
 
@@ -47,7 +56,7 @@ impl Drop for ForeignFd {
 
 impl Clone for ForeignFd {
 	fn clone(&self) -> Self {
-		let duped_fd = unsafe { libc::dup(self.local_fd) };
+		let duped_fd = unsafe { libc::fcntl(self.local_fd, libc::F_DUPFD_CLOEXEC, 0) };
 		if duped_fd < 0 {
 			panic!("Failed to dup fd: {}", io::Error::last_os_error());
 		}
@@ -75,7 +84,7 @@ impl Clone for ForeignFd {
 /// traced process terminates.
 #[derive(Debug, Clone)]
 pub struct FsTarget {
-	/// None if path is absolute, in which case path must start with '/'.
+	/// None iff path is absolute, in which case path must start with '/'.
 	pub(crate) dfd: Option<ForeignFd>,
 
 	pub(crate) path: CString,
@@ -99,7 +108,7 @@ impl FsTarget {
 			path,
 			no_follow: false,
 		};
-		if absolute {
+		if !absolute {
 			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
 			ret.dfd = Some(
 				ForeignFd::from_path(&cwdstr).map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
@@ -119,35 +128,15 @@ impl FsTarget {
 
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
 		let path = req.cstr_from_target_memory(path_ptr)?;
-		let dfd = libc::c_int::try_from(req.arg(dfd_arg_index as usize) as i64)
-			.map_err(|_| AccessRequestError::InvalidSyscallData("dfd arg not a valid c_int"))?;
 		let pathb = path.as_bytes();
 
 		// AT_EMPTY_PATH: if path is empty, the target is the dfd itself.
 		if at_empty_path && pathb.is_empty() {
-			if dfd == libc::AT_FDCWD {
-				let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
-				return Ok(Self {
-					dfd: Some(
-						ForeignFd::from_path(&cwdstr)
-							.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
-					),
-					path,
-					no_follow,
-				});
-			} else if dfd < 0 {
-				return Err(AccessRequestError::InvalidSyscallData("dfd invalid"));
-			} else {
-				let proc_fd_path = format!("/proc/{}/fd/{}", req.sreq.pid, dfd);
-				return Ok(Self {
-					dfd: Some(
-						ForeignFd::from_path(&proc_fd_path)
-							.map_err(|e| AccessRequestError::OpenFd(proc_fd_path, e))?,
-					),
-					path,
-					no_follow,
-				});
-			}
+			return Ok(Self {
+				dfd: Some(req.arg_to_fd(dfd_arg_index as usize)?),
+				path,
+				no_follow,
+			});
 		}
 
 		if pathb.len() > 0 && pathb[0] == b'/' {
@@ -157,48 +146,27 @@ impl FsTarget {
 				no_follow,
 			});
 		}
-		if dfd == libc::AT_FDCWD {
-			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
-			Ok(Self {
-				dfd: Some(
-					ForeignFd::from_path(&cwdstr)
-						.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
-				),
-				path,
-				no_follow,
-			})
-		} else {
-			if dfd < 0 {
-				Err(AccessRequestError::InvalidSyscallData("dfd invalid"))
-			} else {
-				let proc_fd_path = format!("/proc/{}/fd/{}", req.sreq.pid, dfd);
-				Ok(Self {
-					dfd: Some(
-						ForeignFd::from_path(&proc_fd_path)
-							.map_err(|e| AccessRequestError::OpenFd(proc_fd_path, e))?,
-					),
-					path,
-					no_follow,
-				})
-			}
-		}
+
+		// Relative path: need to resolve dfd.
+		Ok(Self {
+			dfd: Some(req.arg_to_fd(dfd_arg_index as usize)?),
+			path,
+			no_follow,
+		})
 	}
 
 	/// Opens the target with O_PATH.  This requires the path to actually
 	/// be pointing to an existing file or directory.
-	pub fn open_target(&self) -> Result<libc::c_int, io::Error> {
+	pub fn open_target(&self) -> Result<ForeignFd, io::Error> {
 		let path_bytes = self.path.to_bytes();
 
 		// AT_EMPTY_PATH: the target is the dfd itself — dup it.
 		if path_bytes.is_empty() {
-			if let Some(dfd) = &self.dfd {
-				let fd = unsafe { libc::fcntl(dfd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-				if fd < 0 {
-					return Err(io::Error::last_os_error());
-				}
-				return Ok(fd);
-			}
-			return Err(io::Error::from_raw_os_error(libc::ENOENT));
+			let dfd = self
+				.dfd
+				.as_ref()
+				.expect("Expected dfd to exist for non-absolute path");
+			return Ok(dfd.clone());
 		}
 
 		let mut flags = libc::O_PATH | libc::O_CLOEXEC;
@@ -212,14 +180,14 @@ impl FsTarget {
 		if fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
-		Ok(fd)
+		Ok(ForeignFd { local_fd: fd })
 	}
 
 	/// Opens the parent of the target path with O_PATH, and returns the
 	/// dir fd along with the final component of the path.  This requires
 	/// everything except the final component of the path to exist (which
 	/// is a normal requirement of most fs syscalls anyway).
-	pub fn open_target_dir(&self) -> Result<(libc::c_int, &str), io::Error> {
+	pub fn open_target_dir(&self) -> Result<(ForeignFd, &CStr), io::Error> {
 		let path_bytes = self.path.to_bytes();
 
 		let (dir_cstr, file_part) = if let Some(last_slash) =
@@ -227,17 +195,33 @@ impl FsTarget {
 		{
 			let dir_bytes = &path_bytes[..last_slash];
 			let dir_cstr = if dir_bytes.is_empty() {
+				assert!(
+					self.dfd.is_none(),
+					"Internal error: absolute path should not have dfd set"
+				);
 				CString::new("/").unwrap()
 			} else {
 				CString::new(dir_bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?
 			};
-			let file_part = std::str::from_utf8(&path_bytes[last_slash + 1..])
-				.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?;
+			// Safety: `self.path` is a `CString` which guarantees exactly one NUL byte at
+			// the very end and no interior NUL bytes.  The sub-slice starts at `last_slash+1`
+			// (≤ `path_bytes.len()`) and extends through the trailing NUL, so it is a
+			// well-formed NUL-terminated byte sequence with exactly one NUL, satisfying
+			// the requirements of `from_bytes_with_nul_unchecked`.
+			let file_part = unsafe {
+				CStr::from_bytes_with_nul_unchecked(
+					&self.path.to_bytes_with_nul()[last_slash + 1..],
+				)
+			};
 			(dir_cstr, file_part)
 		} else {
 			// No slash — the directory is the base (dfd or cwd).
-			let file_part = std::str::from_utf8(path_bytes)
-				.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?;
+			// If path is empty (AT_EMPTY_PATH), refer to the dfd itself as '.'.
+			let file_part: &CStr = if path_bytes.is_empty() {
+				CStr::from_bytes_with_nul(b".\0").unwrap()
+			} else {
+				self.path.as_c_str()
+			};
 			(CString::new(".").unwrap(), file_part)
 		};
 
@@ -261,7 +245,7 @@ impl FsTarget {
 		if dir_fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
-		Ok((dir_fd, file_part))
+		Ok((ForeignFd { local_fd: dir_fd }, file_part))
 	}
 
 	/// Return the absolute path of the target.  This requires everything
@@ -272,18 +256,22 @@ impl FsTarget {
 
 		// AT_EMPTY_PATH: the target is the dfd itself — read its proc symlink.
 		if path_bytes.is_empty() {
-			if let Some(dfd) = &self.dfd {
-				return readlink_fd(dfd.as_raw_fd());
-			}
-			return Err(io::Error::from_raw_os_error(libc::ENOENT));
+			let dfd = self
+				.dfd
+				.as_ref()
+				.expect("Expected dfd to exist for non-absolute path");
+			return readlink_fd(dfd.as_raw_fd());
 		}
 
 		let (dir_fd, file_name) = self.open_target_dir()?;
-		let _guard = ForeignFd { local_fd: dir_fd };
-		let mut result = readlink_fd(dir_fd)?;
-		if !file_name.is_empty() {
+		let mut result = readlink_fd(dir_fd.as_raw_fd())?;
+		let file_name_bytes = file_name.to_bytes();
+		if !file_name_bytes.is_empty() {
 			result.push('/');
-			result.push_str(file_name);
+			result.push_str(
+				std::str::from_utf8(file_name_bytes)
+					.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?,
+			);
 		}
 		Ok(result)
 	}
@@ -291,11 +279,11 @@ impl FsTarget {
 
 /// Read the real path of an open O_PATH file descriptor via /proc/self/fd.
 fn readlink_fd(fd: libc::c_int) -> Result<String, io::Error> {
-	let proc_path = format!("/proc/self/fd/{}\0", fd);
+	let proc_path = CString::new(format!("/proc/self/fd/{}", fd)).unwrap();
 	let mut buf = vec![0u8; libc::PATH_MAX as usize];
 	let ret = unsafe {
 		libc::readlink(
-			proc_path.as_ptr() as *const libc::c_char,
+			proc_path.as_ptr(),
 			buf.as_mut_ptr() as *mut libc::c_char,
 			buf.len(),
 		)
