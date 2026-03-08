@@ -65,7 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				}
 				ctx.send_continue()?;
 			}
-			Ok(None) => {}
+			Ok(None) => {
+				// Syscall was auto-continued by the tracer (e.g. not a
+				// file operation we care about), nothing to report.
+			}
 			Err(e) => {
 				if child.try_wait()?.is_some() {
 					break;
