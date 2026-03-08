@@ -136,22 +136,17 @@ impl<'a> RequestContext<'a> {
 		let first_len = first_end - addr;
 		let mut buf: Vec<u8> = Vec::with_capacity(first_len);
 
-		let ret = unsafe {
-			libc::pread(
-				self.mem_fd.as_raw_fd(),
-				buf.as_mut_ptr() as *mut libc::c_void,
+		// Safety: we pass spare capacity to read_target_memory_partial,
+		// which writes at most first_len bytes, then we set_len to the
+		// actual number of bytes written.
+		let uninit_buf = unsafe {
+			slice::from_raw_parts_mut(
+				buf.as_mut_ptr() as *mut MaybeUninit<u8>,
 				first_len,
-				addr as libc::off_t,
 			)
 		};
-		if ret < 0 {
-			return Err(AccessRequestError::ReadProcessMemory(
-				self.sreq.pid,
-				io::Error::last_os_error(),
-			));
-		}
-		// Safety: pread wrote ret bytes into the buffer's spare capacity.
-		unsafe { buf.set_len(ret as usize) };
+		let ret = self.read_target_memory_partial(addr as *const u8, uninit_buf)?;
+		unsafe { buf.set_len(ret) };
 
 		if let Some(nul) = buf.iter().position(|&b| b == 0) {
 			buf.truncate(nul + 1);
@@ -160,7 +155,7 @@ impl<'a> RequestContext<'a> {
 				.expect("buf should not have NUL bytes in the middle"));
 		}
 
-		if (ret as usize) < first_len {
+		if ret < first_len {
 			warn!(
 				"Short read from /proc/{}/mem: expected {} bytes, got {}",
 				self.sreq.pid, first_len, ret
@@ -168,31 +163,24 @@ impl<'a> RequestContext<'a> {
 			return Err(AccessRequestError::ShortReadProcessMemory(
 				self.sreq.pid,
 				first_len,
-				ret as usize,
+				ret,
 			));
 		}
 
 		// Second read: one more full page appended to buf
-		let second_addr = first_end;
 		let old_len = buf.len();
 		buf.reserve_exact(page_sz);
 
-		let ret = unsafe {
-			libc::pread(
-				self.mem_fd.as_raw_fd(),
-				buf.as_mut_ptr().add(old_len) as *mut libc::c_void,
+		let uninit_buf = unsafe {
+			slice::from_raw_parts_mut(
+				buf.as_mut_ptr().add(old_len) as *mut MaybeUninit<u8>,
 				page_sz,
-				second_addr as libc::off_t,
 			)
 		};
-		if ret < 0 {
-			return Err(AccessRequestError::ReadProcessMemory(
-				self.sreq.pid,
-				io::Error::last_os_error(),
-			));
-		}
-		// Safety: pread wrote ret bytes into buf's spare capacity starting at old_len.
-		unsafe { buf.set_len(old_len + ret as usize) };
+		let ret = self.read_target_memory_partial(first_end as *const u8, uninit_buf)?;
+		// Safety: read_target_memory_partial wrote ret bytes into buf's
+		// spare capacity starting at old_len.
+		unsafe { buf.set_len(old_len + ret) };
 
 		if let Some(nul) = buf[old_len..].iter().position(|&b| b == 0) {
 			buf.truncate(old_len + nul + 1);
@@ -203,7 +191,7 @@ impl<'a> RequestContext<'a> {
 				.expect("buf should not have NUL bytes in the middle"));
 		}
 
-		if (ret as usize) < page_sz {
+		if ret < page_sz {
 			warn!(
 				"Short read from /proc/{}/mem: expected {} bytes, got {}",
 				self.sreq.pid, page_sz, ret
@@ -211,7 +199,7 @@ impl<'a> RequestContext<'a> {
 			return Err(AccessRequestError::ShortReadProcessMemory(
 				self.sreq.pid,
 				page_sz,
-				ret as usize,
+				ret,
 			));
 		}
 
@@ -243,11 +231,15 @@ impl<'a> RequestContext<'a> {
 		}
 	}
 
-	pub(crate) fn read_target_memory(
+	/// Low-level helper: reads up to `buf.len()` bytes from the target
+	/// process's memory at `src`.  Returns the number of bytes actually
+	/// read.  A negative `pread` return is mapped to
+	/// `ReadProcessMemory`.
+	fn read_target_memory_partial(
 		&mut self,
 		src: *const u8,
 		buf: &mut [MaybeUninit<u8>],
-	) -> Result<(), AccessRequestError> {
+	) -> Result<usize, AccessRequestError> {
 		let ret = unsafe {
 			libc::pread(
 				self.mem_fd.as_raw_fd(),
@@ -262,7 +254,16 @@ impl<'a> RequestContext<'a> {
 				io::Error::last_os_error(),
 			));
 		}
-		if ret as usize != buf.len() {
+		Ok(ret as usize)
+	}
+
+	pub(crate) fn read_target_memory(
+		&mut self,
+		src: *const u8,
+		buf: &mut [MaybeUninit<u8>],
+	) -> Result<(), AccessRequestError> {
+		let ret = self.read_target_memory_partial(src, buf)?;
+		if ret != buf.len() {
 			warn!(
 				"Short read from /proc/{}/mem: expected {} bytes, got {}",
 				self.sreq.pid,
@@ -272,7 +273,7 @@ impl<'a> RequestContext<'a> {
 			return Err(AccessRequestError::ShortReadProcessMemory(
 				self.sreq.pid,
 				buf.len(),
-				ret as usize,
+				ret,
 			));
 		}
 		Ok(())
