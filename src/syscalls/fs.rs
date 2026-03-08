@@ -75,7 +75,7 @@ impl Clone for ForeignFd {
 /// traced process terminates.
 #[derive(Debug, Clone)]
 pub struct FsTarget {
-	/// None if path is absolute.
+	/// None if path is absolute, in which case path must start with '/'.
 	pub(crate) dfd: Option<ForeignFd>,
 
 	pub(crate) path: CString,
@@ -93,23 +93,19 @@ impl FsTarget {
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
 		let path = req.cstr_from_target_memory(path_ptr)?;
 		let pathb = path.as_bytes();
-		if pathb.len() > 0 && pathb[0] == b'/' {
-			Ok(Self {
-				dfd: None,
-				path,
-				no_follow: false,
-			})
-		} else {
+		let absolute = pathb.len() > 0 && pathb[0] == b'/';
+		let mut ret = Self {
+			dfd: None,
+			path,
+			no_follow: false,
+		};
+		if absolute {
 			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
-			Ok(Self {
-				dfd: Some(
-					ForeignFd::from_path(&cwdstr)
-						.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
-				),
-				path,
-				no_follow: false,
-			})
+			ret.dfd = Some(
+				ForeignFd::from_path(&cwdstr).map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
+			);
 		}
+		Ok(ret)
 	}
 
 	pub(crate) fn from_at_path(
