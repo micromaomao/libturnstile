@@ -1,36 +1,43 @@
 use std::{
 	ffi::{CStr, CString},
 	io,
+	os::unix::io::AsRawFd,
 };
 
-use libc::FS;
-use libseccomp::{ScmpFd, ScmpFilterContext, ScmpNotifData, ScmpNotifReq, ScmpSyscall};
+use libseccomp::ScmpFilterContext;
 
 use crate::{
-	AccessRequest, AccessRequestError, Operation, TurnstileTracer, TurnstileTracerError,
-	syscalls::RequestContext,
+	AccessRequest, AccessRequestError, Operation, TurnstileTracerError, syscalls::RequestContext,
 };
+
+use super::lazy_syscall_table_name_to_number;
 
 use log::warn;
 
+/// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
+/// refers to a path in the traced process's filesystem namespace.
+///
+/// The fd is closed automatically on drop.  Cloning uses `F_DUPFD_CLOEXEC`
+/// so the duplicate always has the close-on-exec flag set.
 #[derive(Debug)]
-pub(crate) struct ForeignFd {
+pub struct ForeignFd {
 	local_fd: libc::c_int,
 }
 
 impl ForeignFd {
-	pub(crate) fn from_path(path: &str) -> Result<Self, io::Error> {
-		let local_fd = unsafe {
-			libc::open(
-				path.as_ptr() as *const libc::c_char,
-				libc::O_PATH | libc::O_CLOEXEC,
-				0,
-			)
-		};
+	pub(crate) fn from_path<P: AsRef<CStr>>(path: P) -> Result<Self, io::Error> {
+		let c_path = path.as_ref();
+		let local_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC, 0) };
 		if local_fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
 		Ok(Self { local_fd })
+	}
+}
+
+impl AsRawFd for ForeignFd {
+	fn as_raw_fd(&self) -> libc::c_int {
+		self.local_fd
 	}
 }
 
@@ -44,7 +51,7 @@ impl Drop for ForeignFd {
 
 impl Clone for ForeignFd {
 	fn clone(&self) -> Self {
-		let duped_fd = unsafe { libc::dup(self.local_fd) };
+		let duped_fd = unsafe { libc::fcntl(self.local_fd, libc::F_DUPFD_CLOEXEC, 0) };
 		if duped_fd < 0 {
 			panic!("Failed to dup fd: {}", io::Error::last_os_error());
 		}
@@ -72,10 +79,14 @@ impl Clone for ForeignFd {
 /// traced process terminates.
 #[derive(Debug, Clone)]
 pub struct FsTarget {
-	/// None if path is absolute.
+	/// None iff path is absolute, in which case path must start with '/'.
 	pub(crate) dfd: Option<ForeignFd>,
 
 	pub(crate) path: CString,
+
+	/// Whether to avoid following the final symlink component when resolving
+	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
+	pub(crate) no_follow: bool,
 }
 
 impl FsTarget {
@@ -86,98 +97,199 @@ impl FsTarget {
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
 		let path = req.cstr_from_target_memory(path_ptr)?;
 		let pathb = path.as_bytes();
-		if pathb.len() > 0 && pathb[0] == b'/' {
-			Ok(Self { dfd: None, path })
-		} else {
-			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
-			Ok(Self {
-				dfd: Some(
-					ForeignFd::from_path(&cwdstr)
-						.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
-				),
-				path,
-			})
+		let absolute = pathb.len() > 0 && pathb[0] == b'/';
+		let mut ret = Self {
+			dfd: None,
+			path,
+			no_follow: false,
+		};
+		if !absolute {
+			let cwdstr = format!("/proc/{}/cwd\0", req.sreq.pid);
+			ret.dfd = Some(
+				ForeignFd::from_path(CStr::from_bytes_with_nul(cwdstr.as_bytes()).unwrap())
+					.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
+			);
 		}
+		Ok(ret)
 	}
 
 	pub(crate) fn from_at_path(
 		req: &mut RequestContext,
 		dfd_arg_index: u8,
 		path_arg_index: u8,
+		at_flags: Option<u64>,
 	) -> Result<Self, AccessRequestError> {
+		let _at_empty_path = at_flags.map_or(false, |f| f & libc::AT_EMPTY_PATH as u64 != 0);
+		let no_follow = at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
+
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
 		let path = req.cstr_from_target_memory(path_ptr)?;
-		let dfd = libc::c_int::try_from(req.arg(dfd_arg_index as usize) as i64)
-			.map_err(|_| AccessRequestError::InvalidSyscallData("dfd arg not a valid c_int"))?;
 		let pathb = path.as_bytes();
+
 		if pathb.len() > 0 && pathb[0] == b'/' {
-			return Ok(Self { dfd: None, path });
-		}
-		if dfd == libc::AT_FDCWD {
-			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
-			Ok(Self {
-				dfd: Some(
-					ForeignFd::from_path(&cwdstr)
-						.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
-				),
+			return Ok(Self {
+				dfd: None,
 				path,
-			})
-		} else {
-			if dfd < 0 {
-				Err(AccessRequestError::InvalidSyscallData("dfd invalid"))
-			} else {
-				let proc_fd_path = format!("/proc/{}/fd/{}", req.sreq.pid, dfd);
-				Ok(Self {
-					dfd: Some(
-						ForeignFd::from_path(&proc_fd_path)
-							.map_err(|e| AccessRequestError::OpenFd(proc_fd_path, e))?,
-					),
-					path,
-				})
-			}
+				no_follow,
+			});
 		}
+
+		// ??? what happens if AT_EMPTY_PATH is not set but path is empty
+
+		Ok(Self {
+			dfd: Some(req.arg_to_fd(dfd_arg_index as usize)?),
+			path,
+			no_follow,
+		})
 	}
 
 	/// Opens the target with O_PATH.  This requires the path to actually
 	/// be pointing to an existing file or directory.
-	pub fn open_target(&self) -> Result<libc::c_int, io::Error> {
-		unimplemented!()
+	pub fn open_target(&self) -> Result<ForeignFd, io::Error> {
+		let path_bytes = self.path.to_bytes();
+
+		if path_bytes.is_empty() {
+			let dfd = self
+				.dfd
+				.as_ref()
+				.expect("Expected dfd to exist for non-absolute path");
+			return Ok(dfd.clone());
+		}
+
+		let mut flags = libc::O_PATH | libc::O_CLOEXEC;
+		if self.no_follow {
+			flags |= libc::O_NOFOLLOW;
+		}
+		let fd = match &self.dfd {
+			None => unsafe { libc::open(self.path.as_ptr(), flags, 0) },
+			Some(dfd) => unsafe { libc::openat(dfd.as_raw_fd(), self.path.as_ptr(), flags, 0) },
+		};
+		if fd < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(ForeignFd { local_fd: fd })
 	}
 
 	/// Opens the parent of the target path with O_PATH, and returns the
 	/// dir fd along with the final component of the path.  This requires
 	/// everything except the final component of the path to exist (which
 	/// is a normal requirement of most fs syscalls anyway).
-	pub fn open_target_dir(&self) -> Result<(libc::c_int, &str), io::Error> {
-		unimplemented!()
+	pub fn open_target_dir(&self) -> Result<(ForeignFd, &CStr), io::Error> {
+		let path_bytes_nul = self.path.to_bytes_with_nul();
+
+		if let Some(last_slash) = path_bytes_nul.iter().rposition(|&b| b == b'/') {
+			let dir_bytes = &path_bytes_nul[..last_slash];
+			let file_bytes_nul = &path_bytes_nul[last_slash + 1..];
+			let actual_parent_fd_raw = match &self.dfd {
+				Some(dfd) => unsafe {
+					// We have to allocate a new CString to have NUL at the end
+					libc::openat(
+						dfd.as_raw_fd(),
+						CString::new(dir_bytes)
+							.expect("self.path should not have NUL in the middle")
+							.as_ptr(),
+						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+						0,
+					)
+				},
+				None => {
+					assert!(dir_bytes.starts_with(b"/"));
+					// We have to allocate a new CString to have NUL at the end
+					unsafe {
+						libc::open(
+							CString::new(dir_bytes)
+								.expect("self.path should not have NUL in the middle")
+								.as_ptr(),
+							libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+							0,
+						)
+					}
+				}
+			};
+			let file_name = CStr::from_bytes_with_nul(file_bytes_nul).unwrap();
+			Ok((
+				ForeignFd {
+					local_fd: actual_parent_fd_raw,
+				},
+				file_name,
+			))
+		} else {
+			let file_name = match path_bytes_nul {
+				// In the AT_EMPTY_PATH case, we can't recover the
+				// filename, so just represent it as "." to the
+				// caller.  Should it need the full path it can always
+				// realpath().
+				b"\0" => CStr::from_bytes_with_nul(b".\0").unwrap(),
+				other => CStr::from_bytes_with_nul(other).unwrap(),
+			};
+			let actual_parent_fd = match &self.dfd {
+				Some(dfd) => dfd.clone(),
+				None => {
+					// Absolute path, open root.
+					ForeignFd::from_path(CStr::from_bytes_with_nul(b"/\0").unwrap())?
+				}
+			};
+			Ok((actual_parent_fd, file_name))
+		}
 	}
 
 	/// Return the absolute path of the target.  This requires everything
 	/// except the final component of the path to exist (which is a normal
 	/// requirement of most fs syscalls anyway).
-	pub fn realpath(&self) -> Result<String, io::Error> {
-		todo!("open_target_dir, then readlink that, then append final component")
+	pub fn realpath(&self) -> Result<CString, io::Error> {
+		let path_bytes = self.path.to_bytes();
+
+		// AT_EMPTY_PATH: the target is the dfd itself — read its proc symlink.
+		if path_bytes.is_empty() {
+			let dfd = self
+				.dfd
+				.as_ref()
+				.expect("Expected dfd to exist for non-absolute path");
+			return readlink_fd(dfd.as_raw_fd());
+		}
+
+		let (dir_fd, file_name) = self.open_target_dir()?;
+		let dir_path = readlink_fd(dir_fd.as_raw_fd())?;
+		let file_name_bytes = file_name.to_bytes();
+		if file_name_bytes.is_empty() {
+			return Ok(dir_path);
+		}
+		let mut result = dir_path.into_bytes();
+		result.push(b'/');
+		result.extend_from_slice(file_name_bytes);
+		// Neither readlink results nor CStr file-name bytes can contain NUL,
+		// so CString::new cannot fail here.
+		Ok(CString::new(result).expect("path components should not contain NUL bytes"))
 	}
+}
+
+/// Read the real path of an open O_PATH file descriptor via /proc/self/fd.
+fn readlink_fd(fd: libc::c_int) -> Result<CString, io::Error> {
+	// /proc/self/fd/{fd} is always valid ASCII, so a format! string with a
+	// manual NUL terminator is safe to pass to readlink.
+	let proc_path = format!("/proc/self/fd/{}\0", fd);
+	let mut buf = vec![0u8; libc::PATH_MAX as usize];
+	let ret = unsafe {
+		libc::readlink(
+			proc_path.as_ptr() as *const libc::c_char,
+			buf.as_mut_ptr() as *mut libc::c_char,
+			buf.len(),
+		)
+	};
+	if ret < 0 {
+		return Err(io::Error::last_os_error());
+	}
+	buf.truncate(ret as usize);
+	// readlink does not include a NUL terminator and Linux paths cannot
+	// contain NUL bytes, so CString::new cannot fail here.
+	Ok(CString::new(buf).expect("readlink result should not contain NUL bytes"))
 }
 
 #[derive(Debug)]
 pub struct OpenOperation {
 	pub target: FsTarget,
-	pub flags: libc::c_int,
-}
-
-impl OpenOperation {
-	pub fn has_read(&self) -> bool {
-		(self.flags & libc::O_RDONLY != 0 || self.flags & libc::O_RDWR != 0)
-			&& self.flags & libc::O_WRONLY == 0
-			&& self.flags & libc::O_PATH == 0
-	}
-
-	pub fn has_write(&self) -> bool {
-		(self.flags & libc::O_WRONLY != 0 || self.flags & libc::O_RDWR != 0)
-			&& self.flags & libc::O_RDONLY == 0
-			&& self.flags & libc::O_PATH == 0
-	}
+	pub need_read: bool,
+	pub need_write: bool,
 }
 
 #[derive(Debug)]
@@ -191,7 +303,7 @@ pub struct CreateOperation {
 pub enum CreateKind {
 	File,
 	Directory,
-	Symlink { target: String },
+	Symlink { target: CString },
 	Device { dev: libc::dev_t },
 }
 
@@ -222,62 +334,125 @@ pub struct ExecOperation {
 
 type SyscallHandler1 = fn(
 	req: &mut RequestContext,
-	target: &FsTarget,
+	target: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError>;
 
 type SyscallHandler2 = fn(
 	req: &mut RequestContext,
-	target1: &FsTarget,
-	target2: &FsTarget,
+	target1: FsTarget,
+	target2: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError>;
-
-type SyscallHandlerCustom =
-	fn(req: &mut RequestContext) -> Result<(Operation, Option<Operation>), AccessRequestError>;
 
 // See https://syscalls.mebeim.net
 
+fn handle_access_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+	access_mode: u64,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	if access_mode == libc::X_OK as u64 {
+		return Ok((Operation::FsExec(ExecOperation { target }), None));
+	}
+	Ok((
+		Operation::FsOpen(OpenOperation {
+			target,
+			need_read: access_mode & libc::R_OK as u64 != 0,
+			need_write: access_mode & libc::W_OK as u64 != 0,
+		}),
+		None,
+	))
+}
+
 fn handle_open_like(
-	req: &mut RequestContext,
-	target: &FsTarget,
+	_req: &mut RequestContext,
+	target: FsTarget,
 	create_mode: Option<libc::mode_t>,
 	openat_flags: Option<u64>,
-	access_mode: Option<u64>,
-	openat2_resolve: Option<u64>,
+	_openat2_resolve: Option<u64>,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	todo!(
-		"Return the right Operation. For O_CREAT, return two operations - first an FsCreate, then FsOpen"
-	)
+	// creat(2) has no explicit flags arg; default to O_CREAT|O_WRONLY|O_TRUNC.
+	let flags = openat_flags.unwrap_or((libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64)
+		as libc::c_int;
+
+	// When O_PATH is specified in flags, flag bits other than O_CLOEXEC,
+	// O_DIRECTORY, and O_NOFOLLOW are ignored.
+	let need_read =
+		flags & libc::O_PATH == 0 && (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY == 0);
+	let need_write =
+		flags & libc::O_PATH == 0 && (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY != 0);
+
+	// Create if O_CREAT is set, or if there are no openat_flags (creat syscall).
+	let creates = create_mode.is_some() && (flags & libc::O_CREAT != 0 || openat_flags.is_none());
+
+	if creates {
+		let create_op = Operation::FsCreate(CreateOperation {
+			target: target.clone(),
+			mode: create_mode.unwrap(),
+			kind: CreateKind::File,
+		});
+		let open_op = Operation::FsOpen(OpenOperation {
+			target,
+			need_read,
+			need_write,
+		});
+		Ok((create_op, Some(open_op)))
+	} else {
+		Ok((
+			Operation::FsOpen(OpenOperation {
+				target,
+				need_read,
+				need_write,
+			}),
+			None,
+		))
+	}
 }
 
 fn handle_openat2(
 	req: &mut RequestContext,
-	target: &FsTarget,
+	target: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	let open_how_ptr = req.arg(2) as *const libc::open_how;
-	let open_how = unsafe { req.value_from_target_memory(open_how_ptr) }?;
+	let open_how = req.value_from_target_memory(open_how_ptr)?;
 	handle_open_like(
 		req,
 		target,
 		Some(open_how.mode as libc::mode_t),
 		Some(open_how.flags),
-		None,
 		Some(open_how.resolve),
 	)
 }
 
-fn handle_create_like(
-	req: &mut RequestContext,
-	target: &FsTarget,
+fn handle_mknod_like(
+	target: FsTarget,
 	mode: libc::mode_t,
 	kind: CreateKind,
-	symlink_from_arg_index: Option<u8>,
-	dev_t_arg_index: Option<u8>,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	unimplemented!()
+	Ok((
+		Operation::FsCreate(crate::syscalls::fs::CreateOperation { target, mode, kind }),
+		None,
+	))
+}
+
+fn handle_symlink_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	src_arg_index: u8,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	let src_ptr = req.arg(src_arg_index as usize) as *const libc::c_char;
+	let src = req.cstr_from_target_memory(src_ptr)?;
+	Ok((
+		Operation::FsCreate(crate::syscalls::fs::CreateOperation {
+			target,
+			mode: 0o777,
+			kind: CreateKind::Symlink { target: src },
+		}),
+		None,
+	))
 }
 
 // (name, handler, arg index of the path)
-const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
+const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	(
 		"open",
 		|req, target| {
@@ -286,7 +461,6 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 				target,
 				Some(req.arg(2) as libc::mode_t),
 				Some(req.arg(1)),
-				Some(req.arg(2)),
 				None,
 			)
 		},
@@ -294,42 +468,69 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"access",
-		|req, target| handle_open_like(req, target, None, None, Some(req.arg(1)), None),
+		|req, target| handle_access_like(req, target, req.arg(1)),
 		0,
 	),
-	("mkdir", |req, target| unimplemented!(), 0),
-	("rmdir", |req, target| unimplemented!(), 0),
 	(
-		"creat",
-		|req, target| {
-			handle_open_like(
-				req,
-				target,
-				Some(req.arg(1) as libc::mode_t),
+		"mkdir",
+		|req, target| handle_mknod_like(target, req.arg(1) as libc::mode_t, CreateKind::Directory),
+		0,
+	),
+	(
+		"rmdir",
+		|_req, target| {
+			Ok((
+				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir: true }),
 				None,
-				None,
-				None,
-			)
+			))
 		},
 		0,
 	),
-	("mknod", |req, target| unimplemented!(), 0),
-	("unlink", |req, target| unimplemented!(), 0),
+	(
+		"creat",
+		|req, target| handle_open_like(req, target, Some(req.arg(1) as libc::mode_t), None, None),
+		0,
+	),
+	(
+		"mknod",
+		|req, target| {
+			let mode = req.arg(1) as libc::mode_t;
+			let dev = req.arg(2) as libc::dev_t;
+			let kind =
+				if mode & libc::S_IFMT == libc::S_IFBLK || mode & libc::S_IFMT == libc::S_IFCHR {
+					CreateKind::Device { dev }
+				} else {
+					CreateKind::File
+				};
+			handle_mknod_like(target, mode, kind)
+		},
+		0,
+	),
+	(
+		"unlink",
+		|_req, target| {
+			Ok((
+				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir: false }),
+				None,
+			))
+		},
+		0,
+	),
 	(
 		"execve",
-		|req, target| handle_open_like(req, target, None, None, Some(libc::X_OK as u64), None),
+		|req, target| handle_access_like(req, target, libc::X_OK as u64),
 		0,
 	),
 	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
-	("symlink", |req, target| unimplemented!(), 1),
+	(
+		"symlink",
+		|req, target| handle_symlink_like(req, target, 0),
+		1,
+	),
 ];
 
-// (name, handler, arg index of the dfd, arg index of the path)
-// todo: for this table and the other at table, we should have a few extra
-// fields to denote where to (if at all) find the AT_EMPTY_PATH and
-// AT_SYMLINK_NOFOLLOW flags - i.e. a non-negative arg index if we should
-// try to find the flag in the syscall arguments, or -1 if not.
-const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8)] = &[
+// (name, handler, arg index of the dfd, arg index of the path, arg index of AT_* flags or None if no such flag)
+const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	(
 		"openat",
 		|req, target| {
@@ -339,98 +540,197 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8)] =
 				Some(req.arg(3) as libc::mode_t),
 				Some(req.arg(2)),
 				None,
-				None,
 			)
 		},
 		0,
 		1,
+		None,
 	),
-	("openat2", handle_openat2, 0, 1),
+	("openat2", handle_openat2, 0, 1, None),
 	(
 		"faccessat",
-		|req, target| handle_open_like(req, target, None, None, Some(req.arg(2)), None),
+		|req, target| handle_access_like(req, target, req.arg(2)),
 		0,
 		1,
+		None,
 	),
 	(
 		"faccessat2",
-		|req, target| handle_open_like(req, target, None, Some(req.arg(3)), Some(req.arg(2)), None),
+		|req, target| handle_access_like(req, target, req.arg(2)),
 		0,
 		1,
+		Some(3),
 	),
 	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
-	("symlinkat", |req, target| unimplemented!(), 1, 2),
-	("unlinkat", |req, target| unimplemented!(), 0, 1),
-	("mkdirat", |req, target| unimplemented!(), 0, 1),
-	("mknodat", |req, target| unimplemented!(), 0, 1),
 	(
-		"execveat",
-		|req, target| handle_open_like(req, target, None, None, Some(libc::X_OK as u64), None),
+		"symlinkat",
+		|req, target| handle_symlink_like(req, target, 0),
+		1,
+		2,
+		None,
+	),
+	(
+		"unlinkat",
+		|req, target| {
+			let flags = req.arg(2);
+			let dir = flags & libc::AT_REMOVEDIR as u64 != 0;
+			Ok((
+				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir }),
+				None,
+			))
+		},
 		0,
 		1,
+		None,
+	),
+	(
+		"mkdirat",
+		|req, target| handle_mknod_like(target, req.arg(2) as libc::mode_t, CreateKind::Directory),
+		0,
+		1,
+		None,
+	),
+	(
+		"mknodat",
+		|req, target| {
+			let mode = req.arg(2) as libc::mode_t;
+			let dev = req.arg(3) as libc::dev_t;
+			let kind =
+				if mode & libc::S_IFMT == libc::S_IFBLK || mode & libc::S_IFMT == libc::S_IFCHR {
+					CreateKind::Device { dev }
+				} else {
+					CreateKind::File
+				};
+			handle_mknod_like(target, mode, kind)
+		},
+		0,
+		1,
+		None,
+	),
+	(
+		"execveat",
+		|req, target| handle_access_like(req, target, libc::X_OK as u64),
+		0,
+		1,
+		Some(4),
 	),
 ];
 // (name, handler, arg index of the first path, arg index of the second path)
-const FS_SYSCALLS_PATH_PATH: &'static [(&'static str, SyscallHandler2, u8, u8)] = &[
-	("rename", |req, target1, target2| unimplemented!(), 0, 1),
-	("link", |req, target1, target2| unimplemented!(), 0, 1),
+const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
+	(
+		"rename",
+		|_req, target1, target2| {
+			Ok((
+				Operation::FsRename(crate::syscalls::fs::RenameOperation {
+					from: target1,
+					to: target2,
+					exchange: false,
+				}),
+				None,
+			))
+		},
+		0,
+		1,
+	),
+	(
+		"link",
+		|_req, target1, target2| {
+			Ok((
+				Operation::FsLink(crate::syscalls::fs::LinkOperation {
+					from: target1,
+					to: target2,
+					follow_src_symlink: false,
+				}),
+				None,
+			))
+		},
+		0,
+		1,
+	),
 ];
-// (name, handler, arg index of the first dfd, arg index of the first path, arg index of the second dfd, arg index of the second path)
-const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(&'static str, SyscallHandler2, u8, u8, u8, u8)] = &[
+// (name, handler, dfd1, path1, dfd2, path2, arg index of AT_* flags affecting path1, or None if no such flag)
+const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, Option<u8>)] = &[
 	(
 		"renameat",
-		|req, target1, target2| unimplemented!(),
+		|_req, target1, target2| {
+			Ok((
+				Operation::FsRename(crate::syscalls::fs::RenameOperation {
+					from: target1,
+					to: target2,
+					exchange: false,
+				}),
+				None,
+			))
+		},
 		0,
 		1,
 		2,
 		3,
+		None,
 	),
 	(
 		"renameat2",
-		|req, target1, target2| unimplemented!(),
+		|req, target1, target2| {
+			let exchange = req.arg(4) & libc::RENAME_EXCHANGE as u64 != 0;
+			Ok((
+				Operation::FsRename(crate::syscalls::fs::RenameOperation {
+					from: target1,
+					to: target2,
+					exchange,
+				}),
+				None,
+			))
+		},
 		0,
 		1,
 		2,
 		3,
+		None,
 	),
 	(
 		"linkat",
-		|req, target1, target2| unimplemented!(),
+		|req, target1, target2| {
+			let flags = req.arg(4);
+			let follow_src_symlink = flags & libc::AT_SYMLINK_FOLLOW as u64 != 0;
+			Ok((
+				Operation::FsLink(crate::syscalls::fs::LinkOperation {
+					from: target1,
+					to: target2,
+					follow_src_symlink,
+				}),
+				None,
+			))
+		},
 		0,
 		1,
 		2,
 		3,
+		Some(4),
 	),
 ];
 
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
 ) -> Result<(), TurnstileTracerError> {
-	for list in &[
-		FS_SYSCALLS_PATH
-			.into_iter()
-			.map(|(name, _, _)| *name)
-			.collect::<Vec<_>>(),
-		FS_SYSCALLS_DFD_PATH
-			.into_iter()
-			.map(|(name, _, _, _)| *name)
-			.collect::<Vec<_>>(),
-		FS_SYSCALLS_PATH_PATH
-			.into_iter()
-			.map(|(name, _, _, _)| *name)
-			.collect::<Vec<_>>(),
-		FS_SYSCALLS_DFD_PATH_DFD_PATH
-			.into_iter()
-			.map(|(name, _, _, _, _, _)| *name)
-			.collect::<Vec<_>>(),
-	] {
-		for name in list {
-			let scmpc = ScmpSyscall::from_name(name)
-				.map_err(|e| TurnstileTracerError::ResolveSyscall(name, e))?;
-			filter_ctx
-				.add_rule(libseccomp::ScmpAction::Notify, scmpc)
-				.map_err(|e| TurnstileTracerError::AddRule(name, e))?;
-		}
+	for &(sys, ..) in fs_syscalls_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_dfd_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_path_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscall_dfd_path_dfd_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	Ok(())
 }
@@ -445,59 +745,93 @@ pub(crate) fn handler_return_to_access_req(ret: (Operation, Option<Operation>)) 
 	ar
 }
 
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_PATH,
+	fs_syscalls_path_table,
+	SyscallHandler1,
+	u8
+);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_DFD_PATH,
+	fs_syscalls_dfd_path_table,
+	SyscallHandler1,
+	u8,
+	u8,
+	Option<u8>
+);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_PATH_PATH,
+	fs_syscalls_path_path_table,
+	SyscallHandler2,
+	u8,
+	u8
+);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_DFD_PATH_DFD_PATH,
+	fs_syscall_dfd_path_dfd_path_table,
+	SyscallHandler2,
+	u8,
+	u8,
+	u8,
+	u8,
+	Option<u8>
+);
+
 pub(crate) fn handle_notification<'a>(
 	request_ctx: &mut RequestContext<'a>,
 ) -> Result<Option<AccessRequest>, AccessRequestError> {
-	let sreq = request_ctx.sreq;
+	let syscall = request_ctx.sreq.data.syscall;
 
-	// todo: we really shouldn't be allocating and comparing strings on
-	// this path.  Optimize this later (which will likely require
-	// refactoring the above tables - maybe they need to be constructed at
-	// runtime with resolved syscall numbers).
-	let sysc = match sreq.data.syscall.get_name() {
-		Ok(name) => name,
-		Err(_) => {
-			// todo: warn
-			return Ok(None);
-		}
-	};
-
-	for &(name, handler, path_arg_index) in FS_SYSCALLS_PATH {
-		if sysc == name {
+	for &(sys, handler, path_arg_index) in fs_syscalls_path_table() {
+		if syscall == sys {
 			let target = FsTarget::from_path(request_ctx, path_arg_index)?;
-			let (op, extra_op) = handler(request_ctx, &target)?;
+			let (op, extra_op) = handler(request_ctx, target)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
 
-	for &(name, handler, dfd_arg_index, path_arg_index) in FS_SYSCALLS_DFD_PATH {
-		if sysc == name {
-			let target = FsTarget::from_at_path(request_ctx, dfd_arg_index, path_arg_index)?;
-			let (op, extra_op) = handler(request_ctx, &target)?;
+	for &(sys, handler, dfd_arg_index, path_arg_index, flags_arg_index) in
+		fs_syscalls_dfd_path_table()
+	{
+		if syscall == sys {
+			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
+			let target =
+				FsTarget::from_at_path(request_ctx, dfd_arg_index, path_arg_index, at_flags)?;
+			let (op, extra_op) = handler(request_ctx, target)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
 
-	for &(name, handler, path1_arg_index, path2_arg_index) in FS_SYSCALLS_PATH_PATH {
-		if sysc == name {
+	for &(sys, handler, path1_arg_index, path2_arg_index) in fs_syscalls_path_path_table() {
+		if syscall == sys {
 			let target1 = FsTarget::from_path(request_ctx, path1_arg_index)?;
 			let target2 = FsTarget::from_path(request_ctx, path2_arg_index)?;
-			let (op, extra_op) = handler(request_ctx, &target1, &target2)?;
+			let (op, extra_op) = handler(request_ctx, target1, target2)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
 
-	for &(name, handler, dfd1_arg_index, path1_arg_index, dfd2_arg_index, path2_arg_index) in
-		FS_SYSCALLS_DFD_PATH_DFD_PATH
+	for &(
+		sys,
+		handler,
+		dfd1_arg_index,
+		path1_arg_index,
+		dfd2_arg_index,
+		path2_arg_index,
+		flags_arg_index,
+	) in fs_syscall_dfd_path_dfd_path_table()
 	{
-		if sysc == name {
-			let target1 = FsTarget::from_at_path(request_ctx, dfd1_arg_index, path1_arg_index)?;
-			let target2 = FsTarget::from_at_path(request_ctx, dfd2_arg_index, path2_arg_index)?;
-			let (op, extra_op) = handler(request_ctx, &target1, &target2)?;
+		if syscall == sys {
+			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
+			let target1 =
+				FsTarget::from_at_path(request_ctx, dfd1_arg_index, path1_arg_index, at_flags)?;
+			let target2 =
+				FsTarget::from_at_path(request_ctx, dfd2_arg_index, path2_arg_index, None)?;
+			let (op, extra_op) = handler(request_ctx, target1, target2)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
 
-	warn!("Unhandled syscall: {}", sysc);
+	warn!("Unhandled syscall: {:?}", syscall);
 	Ok(None)
 }

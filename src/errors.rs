@@ -14,10 +14,12 @@ pub enum TurnstileTracerError {
 	Socketpair(std::io::Error),
 	#[error("failed to spawn child process: {0}")]
 	Spawn(std::io::Error),
+	#[error("failed to transfer notify fd from child process: {0}")]
+	TransferNotifyFd(std::io::Error),
 	#[error("failed to resolve syscall {0}: {1}")]
 	ResolveSyscall(&'static str, libseccomp::error::SeccompError),
-	#[error("failed to add filter rule for {0}: {1}")]
-	AddRule(&'static str, libseccomp::error::SeccompError),
+	#[error("failed to add filter rule for syscall {0}: {1}")]
+	AddRule(libseccomp::ScmpSyscall, libseccomp::error::SeccompError),
 }
 
 #[derive(Error, Debug)]
@@ -38,4 +40,6 @@ pub enum AccessRequestError {
 	InvalidSyscallData(&'static str),
 	#[error("Failed to open {0}: {1}")]
 	OpenFd(String, std::io::Error),
+	#[error("Short read from /proc/{0}/mem: expected {1} bytes, got {2}")]
+	ShortReadProcessMemory(u32, usize, usize),
 }
