@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use clap::Parser;
 use libturnstile::{Operation, TurnstileTracer};
+use log::info;
 
 /// Trace file operations of a program using libturnstile
 #[derive(Parser)]
@@ -38,6 +39,8 @@ fn write_operation(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+	env_logger::init();
+
 	let cli = Cli::parse();
 
 	let mut output: Box<dyn Write> = match &cli.output {
@@ -56,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	cmd.args(args);
 
 	let mut child = tracer.run_command(&mut cmd)?;
+	info!("Started child process with pid {}", child.id());
 
 	loop {
 		match tracer.yield_request() {
