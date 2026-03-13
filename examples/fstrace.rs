@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// seccomp-unotify, so we must be processing notifications on the main
 	// thread via yield_request before spawn can return.
 	let tracer_for_thread = Arc::clone(&tracer);
-	let jh = std::thread::spawn(move || -> Result<std::process::Child, Box<dyn std::error::Error + Send + Sync>> {
+	let spawn_handle = std::thread::spawn(move || -> Result<std::process::Child, Box<dyn std::error::Error + Send + Sync>> {
 		let child = tracer_for_thread.run_command(&mut cmd)?;
 		Ok(child)
 	});
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		}
 	}
 
-	let child_result = jh.join().expect("spawn thread panicked");
+	let child_result = spawn_handle.join().expect("spawn thread panicked");
 	match child_result {
 		Ok(mut child) => {
 			let status = child.wait()?;
