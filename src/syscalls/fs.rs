@@ -25,13 +25,20 @@ pub struct ForeignFd {
 }
 
 impl ForeignFd {
-	pub(crate) fn from_path<P: AsRef<CStr>>(path: P) -> Result<Self, io::Error> {
+	pub(crate) fn from_path_with_flags<P: AsRef<CStr>>(
+		path: P,
+		oflags: libc::c_int,
+	) -> Result<Self, io::Error> {
 		let c_path = path.as_ref();
-		let local_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC, 0) };
+		let local_fd = unsafe { libc::open(c_path.as_ptr(), oflags, 0) };
 		if local_fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
 		Ok(Self { local_fd })
+	}
+
+	pub(crate) fn from_path<P: AsRef<CStr>>(path: P) -> Result<Self, io::Error> {
+		Self::from_path_with_flags(path, libc::O_PATH | libc::O_CLOEXEC)
 	}
 }
 

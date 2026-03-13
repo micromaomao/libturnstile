@@ -90,10 +90,11 @@ impl TurnstileTracer {
 			sreq: req,
 			notify_fd,
 			valid: true,
-			mem_fd: fs::ForeignFd::from_path(
+			mem_fd: fs::ForeignFd::from_path_with_flags(
 				CStr::from_bytes_with_nul(procmem.as_bytes()).unwrap(),
+				libc::O_RDONLY | libc::O_CLOEXEC,
 			)
-			.map_err(|e| AccessRequestError::ReadProcessMemory(req.pid, e))?,
+			.map_err(|e| AccessRequestError::ReadProcessMemoryOpen(req.pid, e))?,
 		};
 		let result = self.handle_notification(&mut ctx);
 		match result {
@@ -116,12 +117,15 @@ impl TurnstileTracer {
 				if ctx.still_valid().is_ok_and(|v| v == false) {
 					Ok(None)
 				} else {
-					_ = ctx.send_continue();
+					let cont_err = ctx.send_continue();
 					error!(
 						"Error while handling seccomp notification:\nRequest: \n{}\nError: {:#?}",
 						dump_seccomp_request(&ctx.sreq),
 						e
 					);
+					if let Err(e) = cont_err {
+						error!("failed to send continue response: {:#?}", e);
+					}
 					Err(e)
 				}
 			}

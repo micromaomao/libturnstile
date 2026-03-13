@@ -209,7 +209,7 @@ impl<'a> RequestContext<'a> {
 			)
 		};
 		if ret < 0 {
-			return Err(AccessRequestError::ReadProcessMemory(
+			return Err(AccessRequestError::ReadProcessMemoryPread(
 				self.sreq.pid,
 				io::Error::last_os_error(),
 			));

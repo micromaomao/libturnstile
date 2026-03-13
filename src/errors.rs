@@ -35,7 +35,9 @@ pub enum AccessRequestError {
 	#[error("failed to check seccomp_notify_id_valid(): {0}")]
 	NotifyIdValid(libseccomp::error::SeccompError),
 	#[error("Open /proc/{0}/mem failed: {1}")]
-	ReadProcessMemory(u32, std::io::Error),
+	ReadProcessMemoryOpen(u32, std::io::Error),
+	#[error("Read from /proc/{0}/mem failed: {1}")]
+	ReadProcessMemoryPread(u32, std::io::Error),
 	#[error("Traced process issued invalid syscall: {0}")]
 	InvalidSyscallData(&'static str),
 	#[error("Failed to open {0}: {1}")]
