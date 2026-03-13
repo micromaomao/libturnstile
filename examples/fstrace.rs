@@ -2,10 +2,9 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
-use std::time::SystemTime;
 
 use clap::Parser;
-use libturnstile::{Operation, TurnstileTracer};
+use libturnstile::TurnstileTracer;
 use log::info;
 
 /// Trace file operations of a program using libturnstile
@@ -24,20 +23,6 @@ struct Cli {
 	/// Program to trace and its arguments
 	#[arg(required = true, allow_hyphen_values = true)]
 	command: Vec<String>,
-}
-
-fn write_operation(
-	output: &mut dyn Write,
-	op: &Operation,
-	timestamps: bool,
-) -> std::io::Result<()> {
-	if timestamps {
-		let now = SystemTime::now()
-			.duration_since(SystemTime::UNIX_EPOCH)
-			.unwrap_or_default();
-		write!(output, "[{}.{:03}] ", now.as_secs(), now.subsec_millis())?;
-	}
-	writeln!(output, "{:?}", op)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// the execve even happens, so we need to do this in a separate
 	// thread.
 	let tracer_arc_for_thread = Arc::clone(&tracer_arc);
-	thread::spawn(move || {
+	let jh = thread::spawn(move || {
 		match tracer_arc_for_thread.run_command(&mut cmd) {
 			Ok(mut child) => {
 				info!("Started child process with pid {}", child.id());
@@ -80,11 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	});
 
 	loop {
-		log::debug!("yield_request()...");
 		match tracer_arc.yield_request() {
 			Ok(Some((access_request, mut ctx))) => {
 				for op in &access_request {
-					write_operation(&mut output, op, cli.timestamps)?;
+					writeln!(output, "{}", op)?;
 				}
 				ctx.send_continue()?;
 			}
@@ -94,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			}
 			Err(e) => {
 				eprintln!("fstrace: error: {}", e);
+				jh.join().expect("process wait thread panicked");
 			}
 		}
 	}
