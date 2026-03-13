@@ -12,7 +12,7 @@ use crate::{
 
 use super::lazy_syscall_table_name_to_number;
 
-use log::{debug, warn};
+use log::warn;
 
 /// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
 /// refers to a path in the traced process's filesystem namespace.
@@ -312,20 +312,18 @@ impl std::fmt::Display for FsTarget {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let rp = self.realpath();
 		if let Ok(rp) = rp {
-			write!(f, "{}", rp.to_string_lossy())
+			// Use CStr's Debug format to preserve non-UTF-8 bytes as
+			// escape sequences rather than replacing them with U+FFFD.
+			write!(f, "{:?}", rp)
 		} else {
-			debug!("realpath() on FsTarget failed: {}", rp.unwrap_err());
 			match &self.dfd {
 				Some(dfd) => {
-					let dfd_path = dfd.readlink().unwrap_or_else(|e| {
-						debug!("unable to readlink() on FsTarget's dfd: {}", e);
-						CString::from(c"???")
-					});
-					write!(f, "{}", dfd_path.to_string_lossy())?;
+					let dfd_path = dfd.readlink().unwrap_or_else(|_| CString::from(c"???"));
+					write!(f, "{:?}/", dfd_path)?;
 				}
 				None => {}
 			};
-			write!(f, "{} (invalid)", self.path.to_string_lossy())
+			write!(f, "{:?} (invalid)", self.path)
 		}
 	}
 }

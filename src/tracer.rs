@@ -9,7 +9,7 @@ use crate::{
 	syscalls::{RequestContext, fs, net},
 };
 
-use log::{debug, error};
+use log::error;
 
 fn dump_seccomp_request(req: &ScmpNotifReq) -> String {
 	let comm = std::fs::read_to_string(format!("/proc/{}/comm", req.pid))
@@ -34,16 +34,32 @@ fn dump_seccomp_request(req: &ScmpNotifReq) -> String {
 #[derive(Debug)]
 pub struct TurnstileTracer {
 	/// Stores the seccomp filter context.
+	///
+	/// Only used during initialization ([`Self::new`]) and in
+	/// [`Self::install_filters`] / [`Self::run_command`].  After the
+	/// filters are loaded, only [`Self::notify_fd`] is accessed.
 	pub filter_ctx: ScmpFilterContext,
 
 	/// Stores the notify fd.
 	///
 	/// Seccomp only gives us the notification fd at filter load time.
-	/// Therefore this will only be set when a forked child process calls
-	/// [`Self::load_filters`].
+	/// Therefore this is unset until [`Self::install_filters`] or
+	/// [`Self::run_command`] is called.
+	///
+	/// An [`OnceLock`] is used because [`Self::run_command`] needs to
+	/// receive the fd on a background thread while [`Self::yield_request`]
+	/// may already be waiting for notifications from another thread.
 	pub notify_fd: OnceLock<ScmpFd>,
 }
 
+// SAFETY: ScmpFilterContext wraps a raw C pointer to libseccomp filter
+// state.  We only call C library functions on it during single-threaded
+// initialization in `new()` and `install_filters()`.  In `run_command()`,
+// we only read the raw pointer via `as_ptr()` (no C call) to pass it
+// into a `pre_exec` closure that runs in a forked child process (separate
+// address space).  After initialisation the filter context is never
+// touched again; the only cross-thread shared state is the
+// `OnceLock<ScmpFd>` which is inherently `Send + Sync`.
 unsafe impl Send for TurnstileTracer {}
 unsafe impl Sync for TurnstileTracer {}
 
@@ -79,6 +95,11 @@ impl TurnstileTracer {
 	/// If the caller leaks the returned [`AccessRequest`] without
 	/// responding to it, the traced process will be paused indefinitely
 	/// until it is killed.
+	///
+	/// This method blocks until the notify fd is available (i.e. until
+	/// [`Self::install_filters`] or [`Self::run_command`] has completed
+	/// on another thread).  Callers that need a non-blocking check should
+	/// verify `self.notify_fd.get().is_some()` first.
 	pub fn yield_request<'a>(
 		&'a self,
 	) -> Result<Option<(AccessRequest, RequestContext<'a>)>, AccessRequestError> {
@@ -158,14 +179,21 @@ impl TurnstileTracer {
 			.filter_ctx
 			.get_notify_fd()
 			.map_err(TurnstileTracerError::NotifyFd)?;
-		if let Err(_) = self.notify_fd.set(notify_fd) {
-			// We raced with another thread also trying to load the filters
-			panic!("Seccomp filters already loaded");
-		}
+		self.notify_fd
+			.set(notify_fd)
+			.unwrap_or_else(|_| panic!("Seccomp filters already loaded"));
 		Ok(())
 	}
 
 	/// Spawn a child process with the seccomp filters installed.
+	///
+	/// Because Rust's [`std::process::Command::spawn`] blocks until the
+	/// child's `execve` succeeds, and `execve` will be intercepted by the
+	/// seccomp-unotify filter, the caller **must** be processing
+	/// notifications via [`Self::yield_request`] on another thread before
+	/// `spawn` can return.  This method uses a scoped thread internally
+	/// to receive the notify fd from the child, making it available to
+	/// `yield_request` while `spawn` is still in progress.
 	pub fn run_command(
 		&self,
 		cmd: &mut std::process::Command,
@@ -190,22 +218,19 @@ impl TurnstileTracer {
 		}
 		let child_sock = notify_fd_sock[1];
 		let parent_sock = notify_fd_sock[0];
-		debug!(
-			"Opened notifyfd socket [child={}, parent={}]",
-			child_sock, parent_sock
-		);
 		let scmpctx_ptr = SendableContextPtr(self.filter_ctx.as_ptr());
+		// No logging in pre_exec: the closure runs after fork() in a
+		// potentially multi-threaded process, where only async-signal-safe
+		// operations are permitted.
 		unsafe {
-			debug!("parent pid: {}", libc::getpid());
 			cmd.pre_exec(move || {
-				debug!("pre_exec: child pid: {}", libc::getpid());
+				libc::close(parent_sock);
 
 				let scmpctx_ptr = scmpctx_ptr.into_ptr();
 				let rc = libseccomp_sys::seccomp_load(scmpctx_ptr);
 				if rc != 0 {
 					panic!("seccomp_load failed with error code {}", rc);
 				}
-				debug!("child: seccomp_load succeeded");
 				let notify_fd = libseccomp_sys::seccomp_notify_fd(scmpctx_ptr);
 				if notify_fd < 0 {
 					panic!(
@@ -213,35 +238,51 @@ impl TurnstileTracer {
 						-1 * notify_fd
 					);
 				}
-				debug!("child: acquired notify fd {}", notify_fd);
+
 				// Send notify_fd to the parent via SCM_RIGHTS.
 				unix_send_fd(child_sock, notify_fd)?;
 
-				libc::close(parent_sock);
 				libc::close(child_sock);
 				libc::close(notify_fd);
 				Ok(())
 			});
 		}
 
+		// Close the child's end of the socket in the parent.  The child
+		// inherits its own copy via fork.  Closing here ensures that if
+		// spawn() fails (child never runs), the parent_sock reader will
+		// get EOF and the receiver thread will unblock.
+		unsafe {
+			libc::close(child_sock);
+		}
+
 		thread::scope(|s| -> Result<std::process::Child, TurnstileTracerError> {
 			let jh = s.spawn(|| -> Result<(), TurnstileTracerError> {
-				let received_fd =
-					unix_recv_fd(parent_sock).map_err(TurnstileTracerError::ReceiveNotifyFd)?;
-				if let Err(_) = self.notify_fd.set(received_fd) {
-					// We raced with another thread also trying to load the filters
-					panic!("Seccomp filters already loaded");
-				}
-				debug!("self.notify_fd set to {}", received_fd);
-				unsafe {
-					libc::close(parent_sock);
-					libc::close(child_sock);
-				}
+				let received_fd = unix_recv_fd(parent_sock)
+					.map_err(TurnstileTracerError::ReceiveNotifyFd)?;
+				self.notify_fd
+					.set(received_fd)
+					.unwrap_or_else(|_| panic!("Seccomp filters already loaded"));
 				Ok(())
 			});
-			debug!("About to spawn child");
-			let child = cmd.spawn().map_err(TurnstileTracerError::Spawn)?;
-			jh.join().expect("panic from scoped thread")?;
+			let child = match cmd.spawn() {
+				Ok(child) => child,
+				Err(e) => {
+					// Close parent_sock so the receiver thread gets EOF
+					// and unblocks, preventing a deadlock.
+					unsafe {
+						libc::close(parent_sock);
+					}
+					// Wait for the receiver thread before returning.
+					// It will get an EOF/error from unix_recv_fd.
+					let _ = jh.join();
+					return Err(TurnstileTracerError::Spawn(e));
+				}
+			};
+			jh.join().expect("receiver thread panicked")?;
+			unsafe {
+				libc::close(parent_sock);
+			}
 			Ok(child)
 		})
 	}
@@ -257,7 +298,14 @@ impl SendableContextPtr {
 	}
 }
 
-/// Send a file descriptor to another process via a Unix socket using SCM_RIGHTS.
+/// Send a file descriptor to another process via a Unix socket using
+/// SCM_RIGHTS.
+///
+/// # Safety
+///
+/// This function is called from a `pre_exec` closure (after `fork()`) and
+/// therefore must be async-signal-safe: no logging, formatting, or heap
+/// allocation beyond what is strictly necessary.
 unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
 	// Use a [u64] buffer to ensure 8-byte alignment required by cmsghdr.
 	let cmsg_space =
@@ -290,20 +338,10 @@ unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()
 			libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as libc::size_t;
 		let fd_data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
 		std::ptr::write_unaligned(fd_data, fd);
-		// debug!("cmsghdr: {:#?}", (*cmsg));
-		// debug!(
-		// 	"cmsg data: {:#?}",
-		// 	std::slice::from_raw_parts_mut(msg.msg_control as *mut u8, cmsg_space)
-		// );
 	}
 
-	debug!("sendmsg(sock={})", sock);
 	let ret = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
 	if ret < 0 {
-		error!(
-			"Failed to send notify fd via SCM_RIGHTS: {}",
-			std::io::Error::last_os_error()
-		);
 		return Err(std::io::Error::last_os_error());
 	}
 	Ok(())
@@ -315,11 +353,6 @@ fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
 	let num_u64s = (cmsg_space + 7) / 8;
 	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
-	debug!(
-		"unix_recv_fd: cmsg_space={}, buf_size={}",
-		cmsg_space,
-		cmsg_buf.len() * 8
-	);
 
 	let mut dummy: u8 = 0;
 	let mut iov = libc::iovec {
@@ -335,14 +368,9 @@ fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 
 	let ret = unsafe { libc::recvmsg(sock, &mut msg, 0) };
 	if ret < 0 {
-		error!(
-			"Failed to receive notify fd via SCM_RIGHTS: {}",
-			std::io::Error::last_os_error()
-		);
 		return Err(std::io::Error::last_os_error());
 	}
 	if ret == 0 {
-		error!("Child closed socket without sending notify fd");
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::UnexpectedEof,
 			"child closed socket without sending notify fd",
@@ -351,7 +379,6 @@ fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 
 	let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
 	if cmsg.is_null() {
-		error!("No control message received, expected notify fd via SCM_RIGHTS");
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
 			"no control message received",
