@@ -1,5 +1,5 @@
 use core::panic;
-use std::{ffi::CStr, os::unix::process::CommandExt, thread};
+use std::{ffi::CStr, os::unix::process::CommandExt, sync::OnceLock, thread};
 
 use libseccomp::{ScmpArch, ScmpFd, ScmpFilterContext, ScmpNotifReq};
 use libseccomp_sys::scmp_filter_ctx;
@@ -39,9 +39,9 @@ pub struct TurnstileTracer {
 	/// Stores the notify fd.
 	///
 	/// Seccomp only gives us the notification fd at filter load time.
-	/// Therefore this is None until a forked child process calls
+	/// Therefore this will only be set when a forked child process calls
 	/// [`Self::load_filters`].
-	pub notify_fd: Option<ScmpFd>,
+	pub notify_fd: OnceLock<ScmpFd>,
 }
 
 unsafe impl Send for TurnstileTracer {}
@@ -61,7 +61,7 @@ impl TurnstileTracer {
 
 		Ok(Self {
 			filter_ctx,
-			notify_fd: None,
+			notify_fd: OnceLock::new(),
 		})
 	}
 
@@ -82,7 +82,7 @@ impl TurnstileTracer {
 	pub fn yield_request<'a>(
 		&'a self,
 	) -> Result<Option<(AccessRequest, RequestContext<'a>)>, AccessRequestError> {
-		let notify_fd = self.notify_fd.expect("notify fd not initialized");
+		let notify_fd = *self.notify_fd.wait();
 		let req = ScmpNotifReq::receive(notify_fd).map_err(AccessRequestError::NotifyReceive)?;
 		let procmem = format!("/proc/{}/mem\0", req.pid);
 		let mut ctx = RequestContext {
@@ -144,8 +144,8 @@ impl TurnstileTracer {
 	/// Load the seccomp filter into the current thread.  Use
 	/// [`Self::run_command`] instead for loading the filter into a child
 	/// process.
-	pub fn install_filters(&mut self) -> Result<(), TurnstileTracerError> {
-		if self.notify_fd.is_some() {
+	pub fn install_filters(&self) -> Result<(), TurnstileTracerError> {
+		if self.notify_fd.get().is_some() {
 			panic!("Seccomp filters already loaded");
 		}
 
@@ -154,16 +154,19 @@ impl TurnstileTracer {
 			.filter_ctx
 			.get_notify_fd()
 			.map_err(TurnstileTracerError::NotifyFd)?;
-		self.notify_fd = Some(notify_fd);
+		if let Err(_) = self.notify_fd.set(notify_fd) {
+			// We raced with another thread also trying to load the filters
+			panic!("Seccomp filters already loaded");
+		}
 		Ok(())
 	}
 
 	/// Spawn a child process with the seccomp filters installed.
 	pub fn run_command(
-		&mut self,
+		&self,
 		cmd: &mut std::process::Command,
 	) -> Result<std::process::Child, TurnstileTracerError> {
-		if self.notify_fd.is_some() {
+		if self.notify_fd.get().is_some() {
 			panic!("Seccomp filters already loaded");
 		}
 
@@ -217,31 +220,26 @@ impl TurnstileTracer {
 			});
 		}
 
-		match thread::scope(
-			|s| -> Result<(libc::c_int, std::process::Child), TurnstileTracerError> {
-				let jh = s.spawn(|| -> Result<libc::c_int, TurnstileTracerError> {
-					let received_fd = unix_recv_fd(parent_sock)
-						.map_err(TurnstileTracerError::TransferNotifyFd)?;
-					debug!("parent thread: received notify fd {}", received_fd);
-					Ok(received_fd)
-				});
-				debug!("About to spawn child");
-				let child = cmd.spawn().map_err(TurnstileTracerError::Spawn)?;
-				debug!("Child spawned");
-				let notify_fd = jh.join().expect("panic from scoped thread")?;
-				Ok((notify_fd, child))
-			},
-		) {
-			Ok((notify_fd, child)) => {
-				self.notify_fd = Some(notify_fd);
+		thread::scope(|s| -> Result<std::process::Child, TurnstileTracerError> {
+			let jh = s.spawn(|| -> Result<(), TurnstileTracerError> {
+				let received_fd =
+					unix_recv_fd(parent_sock).map_err(TurnstileTracerError::ReceiveNotifyFd)?;
+				if let Err(_) = self.notify_fd.set(received_fd) {
+					// We raced with another thread also trying to load the filters
+					panic!("Seccomp filters already loaded");
+				}
+				debug!("self.notify_fd set to {}", received_fd);
 				unsafe {
 					libc::close(parent_sock);
 					libc::close(child_sock);
 				}
-				Ok(child)
-			}
-			Err(e) => Err(e),
-		}
+				Ok(())
+			});
+			debug!("About to spawn child");
+			let child = cmd.spawn().map_err(TurnstileTracerError::Spawn)?;
+			jh.join().expect("panic from scoped thread")?;
+			Ok(child)
+		})
 	}
 }
 
