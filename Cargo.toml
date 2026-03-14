@@ -2,6 +2,8 @@
 name = "libturnstile"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Seccomp-unotify-based access tracer"
 
 [dependencies]
 libc = "0.2.182"
@@ -10,7 +12,14 @@ libseccomp-sys = "0.3.0"
 log = "0.4.29"
 page_size = "0.6.0"
 thiserror = "2.0.18"
+clap = { version = "4.5.60", features = ["derive"], optional = true }
+env_logger = { version = "0.11.9", optional = true }
 
-[dev-dependencies]
-clap = { version = "4.5.60", features = ["derive"] }
-env_logger = "0.11.9"
+[features]
+default = []
+tools = ["clap", "env_logger"]
+
+[[bin]]
+name = "fstrace"
+path = "src/bin/fstrace.rs"
+required-features = ["tools"]
