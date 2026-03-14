@@ -53,8 +53,11 @@ fn read_sockaddr_un(
 		return Ok(None);
 	}
 
-	let mut buf: Vec<u8> = Vec::with_capacity(addrlen);
-	req.read_target_memory(addr_ptr as *const u8, buf.spare_capacity_mut())?;
+	let mut buf: Vec<u8> = Vec::with_capacity(addrlen + 1);
+	req.read_target_memory(
+		addr_ptr as *const u8,
+		&mut buf.spare_capacity_mut()[..addrlen],
+	)?;
 	unsafe { buf.set_len(addrlen) };
 
 	let family = libc::sa_family_t::from_ne_bytes(
@@ -77,9 +80,9 @@ fn read_sockaddr_un(
 		Some(nul_pos) => std::ffi::CStr::from_bytes_with_nul(&path_bytes[..nul_pos + 1])
 			.expect(".position should have ensured no NUL bytes in the middle"),
 		None => {
-			return Err(AccessRequestError::InvalidSyscallData(
-				"sun_path in sockaddr_un not NUL-terminated",
-			));
+			buf.push(0);
+			std::ffi::CStr::from_bytes_with_nul(&buf[OFFSET_PATH..])
+				.expect("we just pushed a NUL byte at the end")
 		}
 	};
 

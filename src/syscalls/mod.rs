@@ -179,9 +179,7 @@ impl<'a> RequestContext<'a> {
 		&mut self,
 		fd_arg_index: usize,
 	) -> Result<ForeignFd, AccessRequestError> {
-		let raw = self.arg(fd_arg_index) as i64;
-		let fd = libc::c_int::try_from(raw)
-			.map_err(|_| AccessRequestError::InvalidSyscallData("fd arg not a valid c_int"))?;
+		let fd = self.arg(fd_arg_index) as libc::c_int;
 		if fd == libc::AT_FDCWD {
 			let path = format!("/proc/{}/cwd\0", self.sreq.pid);
 			ForeignFd::from_path(CStr::from_bytes_with_nul(path.as_bytes()).unwrap())
@@ -209,7 +207,7 @@ impl<'a> RequestContext<'a> {
 			)
 		};
 		if ret < 0 {
-			return Err(AccessRequestError::ReadProcessMemory(
+			return Err(AccessRequestError::ReadProcessMemoryPread(
 				self.sreq.pid,
 				io::Error::last_os_error(),
 			));
