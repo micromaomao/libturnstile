@@ -4,7 +4,8 @@ use libseccomp::ScmpFilterContext;
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
-	syscalls::{RequestContext, fs::ForeignFd, fs::FsTarget, lazy_syscall_table_name_to_number},
+	access::fs::{ForeignFd, FsTarget},
+	syscalls::{RequestContext, lazy_syscall_table_name_to_number},
 };
 
 /// (name, handler, addr arg index, addrlen arg index).

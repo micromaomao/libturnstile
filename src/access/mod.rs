@@ -1,4 +1,4 @@
-pub use crate::syscalls::fs;
+pub mod fs;
 
 /// Represents a traced syscall, which may itself involve multiple
 /// operations executed atomically (e.g. an openat() with O_CREAT is
