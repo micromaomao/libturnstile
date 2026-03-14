@@ -23,7 +23,8 @@ type SyscallHandler2 = fn(
 	target2: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError>;
 
-// See https://syscalls.mebeim.net
+use crate::access::Operation::FsOperation as fsop;
+use crate::access::fs::FsOperation::*;
 
 fn handle_access_like(
 	_req: &mut RequestContext,
@@ -31,12 +32,12 @@ fn handle_access_like(
 	access_mode: u64,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	Ok((
-		Operation::FsAccess(AccessOperation {
+		fsop(FsAccess(AccessOperation {
 			target,
 			need_read: access_mode & libc::R_OK as u64 != 0,
 			need_write: access_mode & libc::W_OK as u64 != 0,
 			need_exec: access_mode & libc::X_OK as u64 != 0,
-		}),
+		})),
 		None,
 	))
 }
@@ -63,24 +64,24 @@ fn handle_open_like(
 	let creates = create_mode.is_some() && (flags & libc::O_CREAT != 0 || openat_flags.is_none());
 
 	if creates {
-		let create_op = Operation::FsCreate(CreateOperation {
+		let create_op = fsop(FsCreate(CreateOperation {
 			target: target.clone(),
 			mode: create_mode.unwrap(),
 			kind: CreateKind::File,
-		});
-		let open_op = Operation::FsOpen(OpenOperation {
+		}));
+		let open_op = fsop(FsOpen(OpenOperation {
 			target,
 			need_read,
 			need_write,
-		});
+		}));
 		Ok((create_op, Some(open_op)))
 	} else {
 		Ok((
-			Operation::FsOpen(OpenOperation {
+			fsop(FsOpen(OpenOperation {
 				target,
 				need_read,
 				need_write,
-			}),
+			})),
 			None,
 		))
 	}
@@ -105,7 +106,7 @@ fn handle_exec_like(
 	_req: &mut RequestContext,
 	target: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	Ok((Operation::FsExec(ExecOperation { target }), None))
+	Ok((fsop(FsExec(ExecOperation { target })), None))
 }
 
 fn handle_mknod_like(
@@ -113,10 +114,7 @@ fn handle_mknod_like(
 	mode: libc::mode_t,
 	kind: CreateKind,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	Ok((
-		Operation::FsCreate(crate::syscalls::fs::CreateOperation { target, mode, kind }),
-		None,
-	))
+	Ok((fsop(FsCreate(CreateOperation { target, mode, kind })), None))
 }
 
 fn handle_symlink_like(
@@ -127,11 +125,11 @@ fn handle_symlink_like(
 	let src_ptr = req.arg(src_arg_index as usize) as *const libc::c_char;
 	let src = req.cstr_from_target_memory(src_ptr)?;
 	Ok((
-		Operation::FsCreate(crate::syscalls::fs::CreateOperation {
+		fsop(FsCreate(CreateOperation {
 			target,
 			mode: 0o777,
 			kind: CreateKind::Symlink { target: src },
-		}),
+		})),
 		None,
 	))
 }
@@ -140,14 +138,14 @@ fn handle_readlink_like(
 	_req: &mut RequestContext,
 	target: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	Ok((Operation::FsReadlink(target), None))
+	Ok((fsop(FsReadlink(target)), None))
 }
 
 fn handle_chdir_like(
 	_req: &mut RequestContext,
 	target: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	Ok((Operation::FsChdir(target), None))
+	Ok((fsop(FsChdir(target)), None))
 }
 
 fn handle_stat_like(
@@ -155,7 +153,7 @@ fn handle_stat_like(
 	target: FsTarget,
 	lstat: bool,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	Ok((Operation::FsStat(StatOperation { target, lstat }), None))
+	Ok((fsop(FsStat(StatOperation { target, lstat })), None))
 }
 
 // (name, handler, arg index of the path)
@@ -185,12 +183,7 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"rmdir",
-		|_req, target| {
-			Ok((
-				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir: true }),
-				None,
-			))
-		},
+		|_req, target| Ok((fsop(FsUnlink(UnlinkOperation { target, dir: true })), None)),
 		0,
 	),
 	(
@@ -215,12 +208,7 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"unlink",
-		|_req, target| {
-			Ok((
-				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir: false }),
-				None,
-			))
-		},
+		|_req, target| Ok((fsop(FsUnlink(UnlinkOperation { target, dir: false })), None)),
 		0,
 	),
 	("execve", handle_exec_like, 0),
@@ -299,10 +287,7 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 		|req, target| {
 			let flags = req.arg(2);
 			let dir = flags & libc::AT_REMOVEDIR as u64 != 0;
-			Ok((
-				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir }),
-				None,
-			))
+			Ok((fsop(FsUnlink(UnlinkOperation { target, dir })), None))
 		},
 		0,
 		1,
@@ -358,11 +343,11 @@ const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
 		"rename",
 		|_req, target1, target2| {
 			Ok((
-				Operation::FsRename(crate::syscalls::fs::RenameOperation {
+				fsop(FsRename(RenameOperation {
 					from: target1,
 					to: target2,
 					exchange: false,
-				}),
+				})),
 				None,
 			))
 		},
@@ -373,11 +358,11 @@ const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
 		"link",
 		|_req, target1, target2| {
 			Ok((
-				Operation::FsLink(crate::syscalls::fs::LinkOperation {
+				fsop(FsLink(LinkOperation {
 					from: target1,
 					to: target2,
 					follow_src_symlink: false,
-				}),
+				})),
 				None,
 			))
 		},
@@ -391,11 +376,11 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 		"renameat",
 		|_req, target1, target2| {
 			Ok((
-				Operation::FsRename(crate::syscalls::fs::RenameOperation {
+				fsop(FsRename(RenameOperation {
 					from: target1,
 					to: target2,
 					exchange: false,
-				}),
+				})),
 				None,
 			))
 		},
@@ -410,11 +395,11 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 		|req, target1, target2| {
 			let exchange = req.arg(4) & libc::RENAME_EXCHANGE as u64 != 0;
 			Ok((
-				Operation::FsRename(crate::syscalls::fs::RenameOperation {
+				fsop(FsRename(RenameOperation {
 					from: target1,
 					to: target2,
 					exchange,
-				}),
+				})),
 				None,
 			))
 		},
@@ -430,11 +415,11 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 			let flags = req.arg(4);
 			let follow_src_symlink = flags & libc::AT_SYMLINK_FOLLOW as u64 != 0;
 			Ok((
-				Operation::FsLink(crate::syscalls::fs::LinkOperation {
+				fsop(FsLink(LinkOperation {
 					from: target1,
 					to: target2,
 					follow_src_symlink,
-				}),
+				})),
 				None,
 			))
 		},

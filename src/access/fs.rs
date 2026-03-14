@@ -447,3 +447,115 @@ pub struct StatOperation {
 	pub target: FsTarget,
 	pub lstat: bool,
 }
+
+#[derive(Debug)]
+pub enum FsOperation {
+	FsOpen(OpenOperation),
+	FsAccess(AccessOperation),
+	FsCreate(CreateOperation),
+	FsRename(RenameOperation),
+	FsUnlink(UnlinkOperation),
+	FsLink(LinkOperation),
+	FsExec(ExecOperation),
+	FsReadlink(FsTarget),
+	FsChdir(FsTarget),
+	FsStat(StatOperation),
+	UnixConnect(FsTarget),
+	UnixListen(FsTarget),
+	UnixSendto(FsTarget),
+	UnixRecvfrom(FsTarget),
+}
+
+fn write_rwx(
+	f: &mut std::fmt::Formatter<'_>,
+	need_read: bool,
+	need_write: bool,
+	need_exec: bool,
+) -> std::fmt::Result {
+	if need_read {
+		write!(f, "r")?;
+	}
+	if need_write {
+		write!(f, "w")?;
+	}
+	if need_exec {
+		write!(f, "x")?;
+	}
+	if !need_read && !need_write && !need_exec {
+		write!(f, "path")?;
+	}
+	Ok(())
+}
+
+impl std::fmt::Display for FsOperation {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::FsOpen(OpenOperation {
+				target,
+				need_read,
+				need_write,
+			}) => {
+				write!(f, "open ")?;
+				write_rwx(f, *need_read, *need_write, false)?;
+				write!(f, " {}", target)?;
+			}
+			Self::FsAccess(AccessOperation {
+				target,
+				need_read,
+				need_write,
+				need_exec,
+			}) => {
+				write!(f, "access ")?;
+				write_rwx(f, *need_read, *need_write, *need_exec)?;
+				write!(f, " {}", target)?;
+			}
+			Self::FsCreate(CreateOperation { kind, target, .. }) => {
+				write!(f, "create {} {}", kind, target)?;
+			}
+			Self::FsRename(RenameOperation { from, to, exchange }) => {
+				write!(
+					f,
+					"rename {} {} {}",
+					from,
+					if *exchange { "<->" } else { "->" },
+					to
+				)?;
+			}
+			Self::FsUnlink(UnlinkOperation { target, dir }) => {
+				let ty = match dir {
+					true => "rmdir",
+					false => "unlink",
+				};
+				write!(f, "{} {}", ty, target)?;
+			}
+			Self::FsLink(LinkOperation { from, to, .. }) => {
+				write!(f, "link {} -> {}", from, to)?;
+			}
+			Self::FsExec(ExecOperation { target, .. }) => {
+				write!(f, "exec {}", target)?;
+			}
+			Self::FsReadlink(target) => {
+				write!(f, "readlink {}", target)?;
+			}
+			Self::FsChdir(target) => {
+				write!(f, "chdir {}", target)?;
+			}
+			Self::FsStat(StatOperation { target, lstat }) => {
+				write!(f, "{} {}", if *lstat { "lstat" } else { "stat" }, target)?;
+			}
+			Self::UnixConnect(target) => {
+				write!(f, "connect unix:{}", target)?;
+			}
+			Self::UnixListen(target) => {
+				write!(f, "listen unix:{}", target)?;
+			}
+			Self::UnixSendto(target) => {
+				write!(f, "sendto unix:{}", target)?;
+			}
+			Self::UnixRecvfrom(target) => {
+				write!(f, "recvfrom unix:{}", target)?;
+			}
+		}
+		Ok(())
+	}
+}

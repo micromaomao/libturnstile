@@ -4,22 +4,22 @@ use libseccomp::ScmpFilterContext;
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
-	access::fs::{ForeignFd, FsTarget},
+	access::fs::{ForeignFd, FsOperation, FsTarget},
 	syscalls::{RequestContext, lazy_syscall_table_name_to_number},
 };
 
 /// (name, handler, addr arg index, addrlen arg index).
-const UNIX_SOCK_SYSCALLS: &[(&str, fn(FsTarget) -> Operation, u8, u8)] = &[
-	("connect", Operation::UnixConnect, 1, 2),
-	("bind", Operation::UnixListen, 1, 2),
-	("sendto", Operation::UnixSendto, 4, 5),
-	("recvfrom", Operation::UnixRecvfrom, 4, 5),
+const UNIX_SOCK_SYSCALLS: &[(&str, fn(FsTarget) -> FsOperation, u8, u8)] = &[
+	("connect", FsOperation::UnixConnect, 1, 2),
+	("bind", FsOperation::UnixListen, 1, 2),
+	("sendto", FsOperation::UnixSendto, 4, 5),
+	("recvfrom", FsOperation::UnixRecvfrom, 4, 5),
 ];
 
 lazy_syscall_table_name_to_number!(
 	UNIX_SOCK_SYSCALLS,
 	unix_sock_syscalls_table,
-	fn(FsTarget) -> Operation,
+	fn(FsTarget) -> FsOperation,
 	u8,
 	u8
 );
@@ -121,7 +121,7 @@ pub(crate) fn handle_notification<'a>(
 		{
 			let op = builder(target);
 			return Ok(Some(AccessRequest {
-				operations: vec![op],
+				operations: vec![Operation::FsOperation(op)],
 			}));
 		}
 		// Not a Unix socket or no address — let the kernel handle it.
