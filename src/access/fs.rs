@@ -147,7 +147,7 @@ impl FsTarget {
 		path_arg_index: u8,
 		at_flags: Option<u64>,
 	) -> Result<Self, AccessRequestError> {
-		let _at_empty_path = at_flags.map_or(false, |f| f & libc::AT_EMPTY_PATH as u64 != 0);
+		let at_empty_path = at_flags.map_or(false, |f| f & libc::AT_EMPTY_PATH as u64 != 0);
 		let no_follow = at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
 
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
@@ -162,7 +162,11 @@ impl FsTarget {
 			});
 		}
 
-		// ??? what happens if AT_EMPTY_PATH is not set but path is empty
+		if pathb.len() == 0 && !at_empty_path {
+			return Err(AccessRequestError::InvalidSyscallData(
+				"empty path without AT_EMPTY_PATH",
+			));
+		}
 
 		Ok(Self {
 			dfd: Some(req.arg_to_fd(dfd_arg_index as usize)?),
