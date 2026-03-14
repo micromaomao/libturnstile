@@ -11,7 +11,8 @@ use libseccomp_sys::scmp_filter_ctx;
 
 use crate::{
 	AccessRequest, AccessRequestError, TurnstileTracerError,
-	syscalls::{RequestContext, fs, net},
+	fs::ForeignFd,
+	syscalls::{self, RequestContext},
 };
 
 use log::error;
@@ -61,8 +62,8 @@ impl TurnstileTracer {
 			.add_arch(native_arch)
 			.map_err(TurnstileTracerError::AddArch)?;
 
-		fs::add_filter_rules(&mut filter_ctx)?;
-		net::add_filter_rules(&mut filter_ctx)?;
+		syscalls::fs::add_filter_rules(&mut filter_ctx)?;
+		syscalls::net::add_filter_rules(&mut filter_ctx)?;
 
 		Ok(Self {
 			filter_ctx: Mutex::new(filter_ctx),
@@ -74,16 +75,21 @@ impl TurnstileTracer {
 	/// request (or None if, for example, the syscall accesses an ignored
 	/// file).
 	///
-	/// If an [`AccessRequest`] is returned, the traced process is paused,
-	/// and the caller should respond to the request by calling either
-	/// [`AccessRequest::send_continue`] or [`AccessRequest::send_error`].
+	/// If an [`AccessRequest`](crate::AccessRequest) along with its
+	/// [`RequestContext`](crate::RequestContext) is returned, the traced
+	/// process is paused, and the caller should respond to the request by
+	/// calling either
+	/// [`RequestContext::send_continue`](crate::RequestContext::send_continue)
+	/// or
+	/// [`RequestContext::send_error`](crate::RequestContext::send_error).
 	/// If None is returned, the tracer is set to continue automatically.
 	/// The traced process is also resumed if the returned
-	/// [`AccessRequest`] is dropped.
+	/// [`RequestContext`](crate::RequestContext) is dropped.
 	///
-	/// If the caller leaks the returned [`AccessRequest`] without
-	/// responding to it, the traced process will be paused indefinitely
-	/// until it receives a signal.
+	/// If the caller leaks the returned
+	/// [`RequestContext`](crate::RequestContext) without responding to
+	/// it, the traced process will be paused indefinitely until it
+	/// receives a signal.
 	///
 	/// Blocks until the notify_fd is ready if it is not.
 	pub fn yield_request<'a>(
@@ -97,7 +103,7 @@ impl TurnstileTracer {
 			sreq: req,
 			notify_fd,
 			valid: true,
-			mem_fd: fs::ForeignFd::from_path_with_flags(
+			mem_fd: ForeignFd::from_path_with_flags(
 				CStr::from_bytes_with_nul(procmem.as_bytes()).unwrap(),
 				libc::O_RDONLY | libc::O_CLOEXEC,
 			)
@@ -143,10 +149,10 @@ impl TurnstileTracer {
 		&'a self,
 		req_ctx: &mut RequestContext<'a>,
 	) -> Result<Option<AccessRequest>, AccessRequestError> {
-		if let Some(req) = crate::syscalls::fs::handle_notification(req_ctx)? {
+		if let Some(req) = syscalls::fs::handle_notification(req_ctx)? {
 			return Ok(Some(req));
 		}
-		if let Some(req) = crate::syscalls::net::handle_notification(req_ctx)? {
+		if let Some(req) = syscalls::net::handle_notification(req_ctx)? {
 			return Ok(Some(req));
 		}
 		return Ok(None);

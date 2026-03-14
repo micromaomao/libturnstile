@@ -18,4 +18,5 @@ mod tracer;
 
 pub use crate::access::*;
 pub use crate::errors::*;
+pub use crate::syscalls::RequestContext;
 pub use crate::tracer::*;

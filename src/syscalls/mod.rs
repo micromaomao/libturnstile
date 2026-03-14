@@ -3,7 +3,7 @@ use std::{ffi::CStr, io, mem::MaybeUninit, slice};
 use libseccomp::{ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
 use log::warn;
 
-use crate::{AccessRequestError, TurnstileTracer, syscalls::fs::ForeignFd};
+use crate::{AccessRequestError, TurnstileTracer, access::fs::ForeignFd};
 use std::os::unix::io::AsRawFd;
 
 pub mod fs;

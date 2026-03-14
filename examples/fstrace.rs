@@ -65,9 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				let comm = std::fs::read(format!("/proc/{}/comm", pid))
 					.map(|r| String::from_utf8_lossy(&r).trim().to_string())
 					.unwrap_or_else(|_| String::from("???"));
-				for op in &access_request {
-					writeln!(output, "{}[{}] {}", comm, pid, op)?;
-				}
+				writeln!(output, "{}[{}] {}", comm, pid, access_request.operation())?;
 				ctx.send_continue()?;
 			}
 			Ok(None) => {
