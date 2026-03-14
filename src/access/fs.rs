@@ -383,6 +383,7 @@ pub struct OpenOperation {
 	pub target: FsTarget,
 	pub need_read: bool,
 	pub need_write: bool,
+	pub create_mode: Option<libc::mode_t>,
 }
 
 #[derive(Debug)]
@@ -493,9 +494,13 @@ impl std::fmt::Display for FsOperation {
 				target,
 				need_read,
 				need_write,
+				create_mode,
 			}) => {
 				write!(f, "open ")?;
 				write_rwx(f, *need_read, *need_write, false)?;
+				if create_mode.is_some() {
+					write!(f, "+")?;
+				}
 				write!(f, " {}", target)?;
 			}
 			Self::FsAccess(AccessOperation {

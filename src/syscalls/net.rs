@@ -23,17 +23,6 @@ lazy_syscall_table_name_to_number!(
 	u8
 );
 
-pub(crate) fn add_filter_rules(
-	filter_ctx: &mut ScmpFilterContext,
-) -> Result<(), TurnstileTracerError> {
-	for &(sys, ..) in unix_sock_syscalls_table() {
-		filter_ctx
-			.add_rule(libseccomp::ScmpAction::Notify, sys)
-			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
-	}
-	Ok(())
-}
-
 /// Try to read a Unix socket path from a sockaddr pointer in the target
 /// process.
 fn read_sockaddr_un(
@@ -106,21 +95,32 @@ fn read_sockaddr_un(
 	Ok(Some(target))
 }
 
+pub(crate) fn add_filter_rules(
+	filter_ctx: &mut ScmpFilterContext,
+) -> Result<(), TurnstileTracerError> {
+	for &(sys, ..) in unix_sock_syscalls_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	Ok(())
+}
+
 pub(crate) fn handle_notification<'a>(
 	request_ctx: &mut RequestContext<'a>,
 ) -> Result<Option<AccessRequest>, AccessRequestError> {
 	let syscall = request_ctx.sreq.data.syscall;
 
-	for &(sys, builder, addr_arg, addrlen_arg) in unix_sock_syscalls_table() {
+	for &(sys, handler, addr_arg, addrlen_arg) in unix_sock_syscalls_table() {
 		if syscall != sys {
 			continue;
 		}
 		if let Some(target) =
 			read_sockaddr_un(request_ctx, addr_arg as usize, addrlen_arg as usize)?
 		{
-			let op = builder(target);
+			let op = handler(target);
 			return Ok(Some(AccessRequest {
-				operations: vec![Operation::FsOperation(op)],
+				operation: Operation::FsOperation(op),
 			}));
 		}
 		// Not a Unix socket or no address — let the kernel handle it.
