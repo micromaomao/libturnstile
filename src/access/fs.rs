@@ -248,6 +248,9 @@ impl FsTarget {
 		if dot || dotdot {
 			dir_path = Cow::Borrowed(self.path.as_c_str());
 			filename = c".";
+			if p == b"." || p == b"" {
+				can_skip_open = true;
+			}
 		} else if let Some(last_slash) = p_with_nul.iter().rposition(|&b| b == b'/') {
 			// We have to allocate a new CString to have NUL at the end
 			dir_path = Cow::Owned(CString::new(&p_with_nul[..last_slash + 1]).unwrap());

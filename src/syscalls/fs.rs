@@ -301,7 +301,13 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	("readlinkat", handle_readlink_like, 0, 1, None),
 	(
 		"newfstatat",
-		|req, target| handle_stat_like(req, target, false),
+		|req, target| {
+			handle_stat_like(
+				req,
+				target,
+				req.arg(3) & libc::AT_SYMLINK_NOFOLLOW as u64 != 0,
+			)
+		},
 		0,
 		1,
 		Some(3),
