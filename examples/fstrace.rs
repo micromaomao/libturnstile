@@ -1,11 +1,10 @@
 use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;
-use std::thread;
+use std::time::SystemTime;
 
 use clap::Parser;
 use libturnstile::TurnstileTracer;
-use log::info;
 
 /// Trace file operations of a program using libturnstile
 #[derive(Parser)]
@@ -31,46 +30,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cli = Cli::parse();
 
 	let mut output: Box<dyn Write> = match &cli.output {
-		Some(path) => Box::new(
-			std::fs::File::create(path)
-				.map_err(|e| format!("failed to open output file '{}': {}", path, e))?,
-		),
+		Some(path) => Box::new(std::fs::File::create(path)?),
 		None => Box::new(std::io::stderr()),
 	};
 
-	let tracer_arc = Arc::new(TurnstileTracer::new()?);
+	let tracer = Arc::new(TurnstileTracer::new()?);
 
 	let program = &cli.command[0];
 	let args = &cli.command[1..];
 	let mut cmd = Command::new(program);
 	cmd.args(args);
 
-	// We need to have started monitoring and responding to events before
-	// the execve even happens, so we need to do this in a separate
-	// thread.
-	let tracer_arc_for_thread = Arc::clone(&tracer_arc);
-	let jh = thread::spawn(move || {
-		match tracer_arc_for_thread.run_command(&mut cmd) {
-			Ok(mut child) => {
-				info!("Started child process with pid {}", child.id());
-				let wait_res = child.wait().unwrap();
-				eprintln!("fstrace: child process exited with status {}", wait_res);
-				std::process::exit(wait_res.code().unwrap_or(1));
-			}
-			Err(e) => {
-				eprintln!("fstrace: error spawning child: {}", e);
-				std::process::exit(1);
-			}
-		};
-	});
+	// spawn blocks until execve succeeds, but execve is intercepted by
+	// seccomp-unotify, so we must be processing notifications on the main
+	// thread via yield_request before spawn can return.
+	let tracer_for_thread = Arc::clone(&tracer);
+	let spawn_handle = std::thread::spawn(
+		move || -> Result<std::process::Child, Box<dyn std::error::Error + Send + Sync>> {
+			let child = tracer_for_thread.run_command(&mut cmd)?;
+			Ok(child)
+		},
+	);
 
 	loop {
-		match tracer_arc.yield_request() {
+		match tracer.yield_request() {
 			Ok(Some((access_request, mut ctx))) => {
 				if cli.timestamps {
-					let now = std::time::SystemTime::now();
-					let datetime: chrono::DateTime<chrono::Local> = now.into();
-					write!(output, "[{}] ", datetime.format("%Y-%m-%d %H:%M:%S%.3f"))?;
+					let now = SystemTime::now()
+						.duration_since(SystemTime::UNIX_EPOCH)
+						.unwrap_or_default();
+					write!(output, "[{}.{:03}] ", now.as_secs(), now.subsec_millis())?;
 				}
 				let pid = ctx.sreq().pid;
 				let comm = std::fs::read(format!("/proc/{}/comm", pid))
@@ -87,8 +76,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			}
 			Err(e) => {
 				eprintln!("fstrace: error: {}", e);
-				jh.join().expect("process wait thread panicked");
+				break;
 			}
+		}
+	}
+
+	let child_result = spawn_handle.join().expect("spawn thread panicked");
+	match child_result {
+		Ok(mut child) => {
+			let status = child.wait()?;
+			eprintln!("fstrace: child process exited with status {}", status);
+			std::process::exit(status.code().unwrap_or(1));
+		}
+		Err(e) => {
+			eprintln!("fstrace: error spawning child: {}", e);
+			std::process::exit(1);
 		}
 	}
 }

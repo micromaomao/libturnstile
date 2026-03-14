@@ -1,7 +1,10 @@
 use std::{
-	ffi::{CStr, CString},
+	ffi::{CStr, CString, OsStr, OsString},
 	io,
-	os::unix::io::AsRawFd,
+	os::unix::{
+		ffi::{OsStrExt, OsStringExt},
+		io::AsRawFd,
+	},
 };
 
 use libseccomp::ScmpFilterContext;
@@ -12,7 +15,7 @@ use crate::{
 
 use super::lazy_syscall_table_name_to_number;
 
-use log::{debug, warn};
+use log::debug;
 
 /// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
 /// refers to a path in the traced process's filesystem namespace.
@@ -42,7 +45,7 @@ impl ForeignFd {
 	}
 
 	/// Read the path of an open file descriptor via /proc/self/fd.
-	pub fn readlink(&self) -> Result<CString, io::Error> {
+	pub fn readlink(&self) -> Result<OsString, io::Error> {
 		// /proc/self/fd/{fd} is always valid ASCII, so a format! string with a
 		// manual NUL terminator is safe to pass to readlink.
 		let proc_path = format!("/proc/self/fd/{}\0", self.local_fd);
@@ -58,9 +61,11 @@ impl ForeignFd {
 			return Err(io::Error::last_os_error());
 		}
 		buf.truncate(ret as usize);
-		// readlink does not include a NUL terminator and Linux paths cannot
-		// contain NUL bytes, so CString::new cannot fail here.
-		Ok(CString::new(buf).expect("readlink result should not contain NUL bytes"))
+		// readlink does not include a NUL terminator
+		if buf.len() > 1 && buf.last().copied() == Some(b'/') {
+			buf.pop();
+		}
+		Ok(OsString::from_vec(buf))
 	}
 }
 
@@ -271,7 +276,7 @@ impl FsTarget {
 	/// Return the absolute path of the target.  This requires everything
 	/// except the final component of the path to exist (which is a normal
 	/// requirement of most fs syscalls anyway).
-	pub fn realpath(&self) -> Result<CString, io::Error> {
+	pub fn realpath(&self) -> Result<OsString, io::Error> {
 		let path_bytes = self.path.to_bytes();
 
 		// AT_EMPTY_PATH: the target is the dfd itself — read its proc symlink.
@@ -289,14 +294,12 @@ impl FsTarget {
 		if file_name_bytes.is_empty() {
 			return Ok(dir_path);
 		}
-		let mut result = dir_path.into_bytes();
+		let mut result = dir_path.into_encoded_bytes();
 		if result.last().copied() != Some(b'/') {
 			result.push(b'/');
 		}
 		result.extend_from_slice(file_name_bytes);
-		// Neither readlink results nor CStr file-name bytes can contain NUL,
-		// so CString::new cannot fail here.
-		Ok(CString::new(result).expect("path components should not contain NUL bytes"))
+		Ok(OsString::from_vec(result))
 	}
 
 	pub fn dfd(&self) -> Option<&ForeignFd> {
@@ -311,21 +314,33 @@ impl FsTarget {
 impl std::fmt::Display for FsTarget {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let rp = self.realpath();
-		if let Ok(rp) = rp {
-			write!(f, "{}", rp.to_string_lossy())
-		} else {
-			debug!("realpath() on FsTarget failed: {}", rp.unwrap_err());
-			match &self.dfd {
-				Some(dfd) => {
-					let dfd_path = dfd.readlink().unwrap_or_else(|e| {
-						debug!("unable to readlink() on FsTarget's dfd: {}", e);
-						CString::from(c"???")
-					});
-					write!(f, "{}", dfd_path.to_string_lossy())?;
+		match rp {
+			Ok(rp) => {
+				write!(f, "{:?}", rp)
+			}
+			Err(rp_err) => {
+				debug!("realpath() on FsTarget failed: {}", rp_err);
+				match &self.dfd {
+					Some(dfd) => {
+						let mut dfd_path_bytes = dfd
+							.readlink()
+							.unwrap_or_else(|e| {
+								debug!("unable to readlink() on FsTarget's dfd: {}", e);
+								OsString::from("???")
+							})
+							.into_encoded_bytes();
+						if dfd_path_bytes.last().copied() != Some(b'/') {
+							dfd_path_bytes.push(b'/');
+						}
+						dfd_path_bytes.extend_from_slice(self.path.to_bytes());
+						write!(f, "{:?} (invalid)", OsString::from_vec(dfd_path_bytes))
+					}
+					None => {
+						// self.path is absolute, so already have leading '/'
+						write!(f, "{:?} (invalid)", OsStr::from_bytes(self.path.as_bytes()))
+					}
 				}
-				None => {}
-			};
-			write!(f, "{} (invalid)", self.path.to_string_lossy())
+			}
 		}
 	}
 }
@@ -894,6 +909,5 @@ pub(crate) fn handle_notification<'a>(
 		}
 	}
 
-	warn!("Unhandled syscall: {:?}", syscall);
 	Ok(None)
 }
