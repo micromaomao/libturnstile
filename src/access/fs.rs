@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	ffi::{CStr, CString, OsStr, OsString},
 	io,
 	os::unix::{
@@ -216,69 +217,85 @@ impl FsTarget {
 	/// dir fd along with the final component of the path.  This requires
 	/// everything except the final component of the path to exist (which
 	/// is a normal requirement of most fs syscalls anyway).
+	///
+	/// This function tries to be the equivalent of filename_parentat /
+	/// path_parentat in fs/namei.c, except with simplified last component
+	/// cases.  If the path ends with a ".", the returned "parent" will be
+	/// the part without the ".", and the returned "file name" will be "."
+	/// A path ending with a "/" or an empty path will be treated as if it
+	/// ended with "/.".  If the path ends with "/..", the parent of the
+	/// dfd will be returned, and the file name will be ".".
 	pub fn open_target_dir(&self) -> Result<(ForeignFd, &CStr), io::Error> {
-		let path_bytes_nul = self.path.to_bytes_with_nul();
+		let p = self.path.to_bytes();
+		let p_with_nul = self.path.to_bytes_with_nul();
+		let mut dotdot = false;
+		let mut dot = false;
+		let dir_path: Cow<'_, CStr>;
+		let filename: &CStr;
+		let mut can_skip_open = false;
+		let opened_dfd;
 
-		if let Some(last_slash) = path_bytes_nul.iter().rposition(|&b| b == b'/')
-			&& last_slash != 0
-		{
-			let dir_bytes = &path_bytes_nul[..last_slash];
-			let file_bytes_nul = &path_bytes_nul[last_slash + 1..];
-			let actual_parent_fd_raw = match &self.dfd {
+		if p.is_empty() {
+			dot = true;
+		} else if p.ends_with(b"/") {
+			dot = true;
+		} else if p.ends_with(b"/.") {
+			dot = true;
+		} else if p.ends_with(b"/..") {
+			dotdot = true;
+		}
+
+		if dot || dotdot {
+			dir_path = Cow::Borrowed(self.path.as_c_str());
+			filename = c".";
+		} else if let Some(last_slash) = p_with_nul.iter().rposition(|&b| b == b'/') {
+			// We have to allocate a new CString to have NUL at the end
+			dir_path = Cow::Owned(CString::new(&p_with_nul[..last_slash + 1]).unwrap());
+			filename = CStr::from_bytes_with_nul(&p_with_nul[last_slash + 1..]).unwrap();
+		} else {
+			if self.dfd.is_none() {
+				dir_path = Cow::Borrowed(CStr::from_bytes_with_nul(b"/\0").unwrap());
+			} else {
+				dir_path = Cow::Borrowed(CStr::from_bytes_with_nul(b"./\0").unwrap());
+				can_skip_open = true;
+			}
+			filename = CStr::from_bytes_with_nul(p_with_nul).unwrap();
+		}
+
+		// None or Some-ness of self.dfd should agree with whether the
+		// path is absolute.
+		assert_eq!(
+			dir_path.to_bytes().first().copied() == Some(b'/'),
+			self.dfd.is_none()
+		);
+
+		if can_skip_open {
+			opened_dfd = self.dfd.clone().unwrap();
+		} else {
+			let dfd_raw = match &self.dfd {
 				Some(dfd) => unsafe {
-					// We have to allocate a new CString to have NUL at the end
 					libc::openat(
 						dfd.as_raw_fd(),
-						CString::new(dir_bytes)
-							.expect("self.path should not have NUL in the middle")
-							.as_ptr(),
+						dir_path.as_ptr(),
 						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
 						0,
 					)
 				},
 				None => unsafe {
-					// We have to allocate a new CString to have NUL at the end
 					libc::open(
-						CString::new(dir_bytes)
-							.expect("self.path should not have NUL in the middle")
-							.as_ptr(),
+						dir_path.as_ptr(),
 						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
 						0,
 					)
 				},
 			};
-			if actual_parent_fd_raw < 0 {
+			if dfd_raw < 0 {
 				return Err(io::Error::last_os_error());
 			}
-			let file_name = CStr::from_bytes_with_nul(file_bytes_nul).unwrap();
-			Ok((
-				ForeignFd {
-					local_fd: actual_parent_fd_raw,
-				},
-				file_name,
-			))
-		} else {
-			let file_name = match path_bytes_nul {
-				// In the AT_EMPTY_PATH case, we can't recover the
-				// filename, so just represent it as "." to the
-				// caller.  Should it need the full path it can always
-				// realpath().
-				b"\0" => CStr::from_bytes_with_nul(b".\0").unwrap(),
-				other if other.first().copied() == Some(b'/') => {
-					// Absolute path with a single filename, remove leading /
-					CStr::from_bytes_with_nul(&other[1..]).unwrap()
-				}
-				other => CStr::from_bytes_with_nul(other).unwrap(),
-			};
-			let actual_parent_fd = match &self.dfd {
-				Some(dfd) => dfd.clone(),
-				None => {
-					// Absolute path, open root.
-					ForeignFd::from_path(CStr::from_bytes_with_nul(b"/\0").unwrap())?
-				}
-			};
-			Ok((actual_parent_fd, file_name))
+			opened_dfd = ForeignFd { local_fd: dfd_raw };
 		}
+
+		Ok((opened_dfd, filename))
 	}
 
 	/// Return the absolute path of the target.  This requires everything
