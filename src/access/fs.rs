@@ -124,7 +124,12 @@ impl FsTarget {
 		path_arg_index: u8,
 	) -> Result<Self, AccessRequestError> {
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
-		let path = req.cstr_from_target_memory(path_ptr)?;
+		let path;
+		if path_ptr.is_null() {
+			path = CString::default();
+		} else {
+			path = req.cstr_from_target_memory(path_ptr)?;
+		}
 		let pathb = path.as_bytes();
 		let absolute = pathb.len() > 0 && pathb[0] == b'/';
 		let mut ret = Self {
@@ -152,7 +157,12 @@ impl FsTarget {
 		let no_follow = at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
 
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
-		let path = req.cstr_from_target_memory(path_ptr)?;
+		let path;
+		if path_ptr.is_null() {
+			path = CString::default();
+		} else {
+			path = req.cstr_from_target_memory(path_ptr)?;
+		}
 		let pathb = path.as_bytes();
 
 		if pathb.len() > 0 && pathb[0] == b'/' {
