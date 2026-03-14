@@ -340,6 +340,14 @@ impl std::fmt::Display for FsTarget {
 }
 
 #[derive(Debug)]
+pub struct AccessOperation {
+	pub target: FsTarget,
+	pub need_read: bool,
+	pub need_write: bool,
+	pub need_exec: bool,
+}
+
+#[derive(Debug)]
 pub struct OpenOperation {
 	pub target: FsTarget,
 	pub need_read: bool,

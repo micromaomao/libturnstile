@@ -13,6 +13,7 @@ pub struct AccessRequest {
 #[non_exhaustive]
 pub enum Operation {
 	FsOpen(fs::OpenOperation),
+	FsAccess(fs::AccessOperation),
 	FsCreate(fs::CreateOperation),
 	FsRename(fs::RenameOperation),
 	FsUnlink(fs::UnlinkOperation),
@@ -33,6 +34,27 @@ impl<'a> IntoIterator for &'a AccessRequest {
 	}
 }
 
+fn write_rwx(
+	f: &mut std::fmt::Formatter<'_>,
+	need_read: bool,
+	need_write: bool,
+	need_exec: bool,
+) -> std::fmt::Result {
+	if need_read {
+		write!(f, "r")?;
+	}
+	if need_write {
+		write!(f, "w")?;
+	}
+	if need_exec {
+		write!(f, "x")?;
+	}
+	if !need_read && !need_write && !need_exec {
+		write!(f, "path")?;
+	}
+	Ok(())
+}
+
 impl std::fmt::Display for Operation {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
@@ -42,15 +64,17 @@ impl std::fmt::Display for Operation {
 				need_write,
 			}) => {
 				write!(f, "open ")?;
-				if *need_read {
-					write!(f, "r")?;
-				}
-				if *need_write {
-					write!(f, "w")?;
-				}
-				if !*need_read && !*need_write {
-					write!(f, "path")?;
-				}
+				write_rwx(f, *need_read, *need_write, false)?;
+				write!(f, " {}", target)?;
+			}
+			Operation::FsAccess(fs::AccessOperation {
+				target,
+				need_read,
+				need_write,
+				need_exec,
+			}) => {
+				write!(f, "access ")?;
+				write_rwx(f, *need_read, *need_write, *need_exec)?;
 				write!(f, " {}", target)?;
 			}
 			Operation::FsCreate(fs::CreateOperation { kind, target, .. }) => {

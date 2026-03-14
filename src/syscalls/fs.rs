@@ -6,6 +6,7 @@ use crate::{
 		CreateKind, CreateOperation, ExecOperation, FsTarget, LinkOperation, OpenOperation,
 		RenameOperation, UnlinkOperation,
 	},
+	fs::AccessOperation,
 	syscalls::RequestContext,
 };
 
@@ -29,14 +30,12 @@ fn handle_access_like(
 	target: FsTarget,
 	access_mode: u64,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	if access_mode == libc::X_OK as u64 {
-		return Ok((Operation::FsExec(ExecOperation { target }), None));
-	}
 	Ok((
-		Operation::FsOpen(OpenOperation {
+		Operation::FsAccess(AccessOperation {
 			target,
 			need_read: access_mode & libc::R_OK as u64 != 0,
 			need_write: access_mode & libc::W_OK as u64 != 0,
+			need_exec: access_mode & libc::X_OK as u64 != 0,
 		}),
 		None,
 	))
@@ -100,6 +99,13 @@ fn handle_openat2(
 		Some(open_how.flags),
 		Some(open_how.resolve),
 	)
+}
+
+fn handle_exec_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	Ok((Operation::FsExec(ExecOperation { target }), None))
 }
 
 fn handle_mknod_like(
@@ -195,11 +201,7 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 		},
 		0,
 	),
-	(
-		"execve",
-		|req, target| handle_access_like(req, target, libc::X_OK as u64),
-		0,
-	),
+	("execve", |req, target| handle_exec_like(req, target), 0),
 	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
 	(
 		"symlink",
@@ -288,7 +290,7 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	),
 	(
 		"execveat",
-		|req, target| handle_access_like(req, target, libc::X_OK as u64),
+		|req, target| handle_exec_like(req, target),
 		0,
 		1,
 		Some(4),
