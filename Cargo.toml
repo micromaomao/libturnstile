@@ -12,6 +12,7 @@ libseccomp-sys = "0.3.0"
 log = "0.4.29"
 page_size = "0.6.0"
 thiserror = "2.0.18"
+smallvec = "1.15.1"
 clap = { version = "4.5.60", features = ["derive"], optional = true }
 env_logger = { version = "0.11.9", optional = true }
 

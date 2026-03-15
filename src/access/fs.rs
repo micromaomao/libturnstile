@@ -10,6 +10,8 @@ use std::{
 
 use crate::{AccessRequestError, syscalls::RequestContext};
 
+use smallvec::{SmallVec, smallvec};
+
 use log::debug;
 
 /// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
@@ -631,7 +633,7 @@ impl std::fmt::Display for FsOperation {
 impl FsOperation {
 	/// Simplify the operation into a list (up to two entries) of
 	/// effective r/w/x permissions needed.
-	pub fn as_rwx_permissions(&self) -> Vec<RwxPermission> {
+	pub fn as_rwx_permissions(&self) -> SmallVec<[RwxPermission; 2]> {
 		match self {
 			Self::FsOpen(OpenOperation {
 				target,
@@ -649,7 +651,7 @@ impl FsOperation {
 				if create_mode.is_some() {
 					p.is_dir_op = true;
 				}
-				vec![p]
+				smallvec![p]
 			}
 			Self::FsAccess(AccessOperation {
 				target,
@@ -667,46 +669,46 @@ impl FsOperation {
 				if *need_exec {
 					p.exec = true;
 				}
-				vec![p]
+				smallvec![p]
 			}
 			Self::FsCreate(CreateOperation { target, .. }) => {
-				vec![make_rwx!(target.clone(), write, is_dir_op)]
+				smallvec![make_rwx!(target.clone(), write, is_dir_op)]
 			}
 			Self::FsRename(RenameOperation { from, to, .. }) => {
-				vec![
+				smallvec![
 					make_rwx!(from.clone(), write, is_dir_op),
 					make_rwx!(to.clone(), write, is_dir_op),
 				]
 			}
 			Self::FsUnlink(UnlinkOperation { target, .. }) => {
-				vec![make_rwx!(target.clone(), write, is_dir_op)]
+				smallvec![make_rwx!(target.clone(), write, is_dir_op)]
 			}
 			Self::FsLink(LinkOperation { from, to, .. }) => {
-				vec![
+				smallvec![
 					make_rwx!(from.clone(), read),
 					make_rwx!(to.clone(), write, is_dir_op),
 				]
 			}
 			Self::FsExec(ExecOperation { target, .. }) => {
-				vec![make_rwx!(target.clone(), exec)]
+				smallvec![make_rwx!(target.clone(), exec)]
 			}
 			Self::FsReadlink(target) => {
-				vec![make_rwx!(target.clone(), read)]
+				smallvec![make_rwx!(target.clone(), read)]
 			}
 			Self::FsChdir(target) => {
-				vec![make_rwx!(target.clone(),)]
+				smallvec![make_rwx!(target.clone(),)]
 			}
 			Self::FsStat(StatOperation { target, .. }) => {
-				vec![make_rwx!(target.clone(), metadata_read)]
+				smallvec![make_rwx!(target.clone(), metadata_read)]
 			}
 			Self::UnixConnect(target) => {
-				vec![make_rwx!(target.clone(), read, write)]
+				smallvec![make_rwx!(target.clone(), read, write)]
 			}
 			Self::UnixBind(UnixBindOperation { target }) => {
-				vec![make_rwx!(target.clone(), read, write)]
+				smallvec![make_rwx!(target.clone(), read, write)]
 			}
 			Self::UnixSendto(target) => {
-				vec![make_rwx!(target.clone(), read, write)]
+				smallvec![make_rwx!(target.clone(), read, write)]
 			}
 		}
 	}
