@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use clap::Parser;
-use libturnstile::TurnstileTracer;
+use libturnstile::{AccessRequestError, TurnstileTracer};
 
 /// Trace file operations of a program using libturnstile
 #[derive(Parser)]
@@ -114,6 +114,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 						if status_contents.contains("State:\tZ") {
 							break;
 						}
+					}
+					if let AccessRequestError::InvalidSyscallData(_) = e {
+						continue;
 					}
 					error!("yield_request: {}", e);
 				}

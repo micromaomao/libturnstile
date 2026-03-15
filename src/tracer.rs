@@ -15,7 +15,7 @@ use crate::{
 	syscalls::{self, RequestContext},
 };
 
-use log::error;
+use log::{error, warn};
 
 fn dump_seccomp_request(req: &ScmpNotifReq) -> String {
 	let comm = std::fs::read_to_string(format!("/proc/{}/comm", req.pid))
@@ -131,11 +131,19 @@ impl TurnstileTracer {
 					Ok(None)
 				} else {
 					let cont_err = ctx.send_continue();
-					error!(
-						"Error while handling seccomp notification:\nRequest: \n{}\nError: {:#?}",
-						dump_seccomp_request(&ctx.sreq),
-						e
-					);
+					if let AccessRequestError::InvalidSyscallData(s) = e {
+						warn!(
+							"Got invalid syscall for request:\n{}\nError: {}",
+							dump_seccomp_request(&ctx.sreq),
+							s
+						);
+					} else {
+						error!(
+							"Error while handling seccomp notification:\nRequest: \n{}\nError: {:#?}",
+							dump_seccomp_request(&ctx.sreq),
+							e
+						);
+					}
 					if let Err(e) = cont_err {
 						error!("failed to send continue response: {:#?}", e);
 					}
