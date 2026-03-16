@@ -322,6 +322,37 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 		1,
 		Some(2),
 	),
+	// open_tree() without OPEN_TREE_CLONE behaves like openat() with
+	// O_PATH.  We don't handle privileged operations, so we pretend that
+	// it's just openat().
+	(
+		"open_tree",
+		|_req, target| {
+			Ok(fsop(FsOpen(OpenOperation {
+				target,
+				need_read: false,
+				need_write: false,
+				create_mode: None,
+			})))
+		},
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"open_tree_attr",
+		|_req, target| {
+			Ok(fsop(FsOpen(OpenOperation {
+				target,
+				need_read: false,
+				need_write: false,
+				create_mode: None,
+			})))
+		},
+		0,
+		1,
+		Some(2),
+	),
 ];
 // (name, handler, arg index of the first path, arg index of the second path)
 const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
