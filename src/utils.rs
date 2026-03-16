@@ -1,3 +1,5 @@
+use log::{debug, error};
+
 /// Send a file descriptor to another process via a Unix socket using
 /// SCM_RIGHTS.  This function can safely be used in pre_exec context
 pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
@@ -81,4 +83,53 @@ pub fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 	let received_fd =
 		unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::c_int) };
 	Ok(received_fd)
+}
+
+pub unsafe fn fork_wait<F: FnOnce() -> libc::c_int + Send>(f: F) -> std::io::Result<libc::c_int> {
+	unsafe {
+		match libc::fork() {
+			-1 => {
+				let err = std::io::Error::last_os_error();
+				error!("fork failed: {}", err);
+				Err(err)
+			}
+			0 => {
+				// In child process
+				let exit_code = f();
+				libc::_exit(exit_code)
+			}
+			pid => {
+				let mut wstatus: libc::c_int = 0;
+				loop {
+					match libc::waitpid(pid, &mut wstatus, 0) {
+						-1 => {
+							if libc::__errno_location().read() == libc::EINTR {
+								continue;
+							}
+							let err = std::io::Error::last_os_error();
+							error!("waitpid failed: {}", err);
+							break Err(err);
+						}
+						_ => {
+							if libc::WIFEXITED(wstatus) {
+								let exit_code = libc::WEXITSTATUS(wstatus);
+								debug!("Forked child exited with code {}", exit_code);
+								break Ok(exit_code);
+							} else if libc::WIFSIGNALED(wstatus) {
+								let signal = libc::WTERMSIG(wstatus);
+								error!("Forked child killed by signal {}", signal);
+								break Err(std::io::Error::from_raw_os_error(libc::EINTR));
+							} else {
+								error!("Unknown return from waitpid");
+								break Err(std::io::Error::new(
+									std::io::ErrorKind::Other,
+									"Unknown return from waitpid",
+								));
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }

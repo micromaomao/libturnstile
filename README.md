@@ -2,23 +2,16 @@
 
 Turnstile implements a
 [seccomp-unotify](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html)-based
-access tracer, which may be used together with other sandboxing mechanisms
-(like mount namespaces or Landlock) to find out what accesses are
-attempted.
+access tracer, and a namespace / bind-mount based sandbox that can be used
+with the tracer to dynamically find out about access requests and allow
+them.
+
+The tracer may be used together with other sandboxing mechanisms (like
+Landlock), or used on its own for non-security scenarios to find out what
+files are used by a program.
 
 > [!WARNING]
 > **Work in progress**. API will not be stable at all.
-
-> [!WARNING]
-> Seccomp-unotify is not a sandboxing solution on its own due to the
-limitations of syscall-based filtering (such as TOCTOU problems with
-memory references).  This crate does not provide any security when used
-alone.
-
-> [!NOTE]
-> There is plan to turn this library into a full-fledged sandboxing tool
-using, for now, namespace and bind-mount, and eventually Landlock with
-mutable rulesets.
 
 ## Features
 
