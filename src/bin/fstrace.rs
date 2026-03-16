@@ -48,7 +48,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cli = Cli::parse();
 
 	let mut output: Box<dyn Write + Send> = match &cli.output {
-		Some(path) => Box::new(std::fs::File::create(path)?),
+		Some(path) => Box::new(
+			std::fs::File::options()
+				.create(true)
+				.append(true)
+				.open(path)?,
+		),
 		None => Box::new(std::io::stderr()),
 	};
 
