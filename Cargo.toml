@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Seccomp-unotify-based access tracer"
+autobins = false
 
 [dependencies]
 libc = "0.2.182"
