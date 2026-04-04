@@ -118,8 +118,6 @@ Executed in    1.43 secs    fish           external
 ## TODO
 
 - Improve API for performance and ergonomics
-- Exec handling - merge with `OpenOperation`??
-- Don't print `fstrace: error: seccomp_notify_receive: There was a system failure beyond the control of libseccomp` when the child process exits
 - sendmm?msg, recvmm?sg handling (hard to do without deadlocking at the start)
 - io_uring (very hard to do properly, but maybe we can just disable)
 - Landlock support to restrict the tracer itself
