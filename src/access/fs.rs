@@ -18,7 +18,7 @@ use log::debug;
 /// so the duplicate always has the close-on-exec flag set.
 #[derive(Debug)]
 pub struct ForeignFd {
-	local_fd: libc::c_int,
+	pub(crate) local_fd: libc::c_int,
 }
 
 impl ForeignFd {

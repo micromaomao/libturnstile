@@ -25,3 +25,8 @@ tools = ["clap", "env_logger"]
 name = "fstrace"
 path = "src/bin/fstrace.rs"
 required-features = ["tools"]
+
+[[bin]]
+name = "turnstile-sandbox"
+path = "src/bin/turnstile-sandbox.rs"
+required-features = ["tools"]
