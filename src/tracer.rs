@@ -330,19 +330,21 @@ impl TurnstileTracer {
 		Ok(())
 	}
 
-	/// Receive the notify fd from a child process via the internal
-	/// socket pair.  This should be called in the parent process
-	/// after the child has called [`Self::install_filters`] with
+	/// Receive the notify fd from a child process via the internal socket
+	/// pair.  This should be called in the parent process *after* forking
+	/// a child that will call [`Self::install_filters`] with
 	/// `send_to_parent` set to `true`.
 	///
 	/// This function can only be called once, and is also mutually
 	/// exclusive with [`Self::run_command`].
 	pub fn receive_notify_fd(&self) -> Result<(), TurnstileTracerError> {
 		let [parent_sock, child_sock] = self.notify_fd_state.take_sock_pair();
+		unsafe {
+			libc::close(child_sock);
+		}
 		let received_fd = unix_recv_fd(parent_sock);
 		unsafe {
 			libc::close(parent_sock);
-			libc::close(child_sock);
 		}
 		let received_fd = received_fd.map_err(TurnstileTracerError::ReceiveNotifyFd)?;
 		self.notify_fd_state.store_notify_fd(received_fd);
