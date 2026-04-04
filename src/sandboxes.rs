@@ -574,6 +574,32 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 	}
 }
 
+fn restrict_self_impl<F: FnOnce() -> Result<(), std::io::Error>>(
+	nsenter_fn: F,
+	new_cwd_cstr: &CStr,
+) -> Result<(), std::io::Error> {
+	match nsenter_fn() {
+		Ok(()) => (),
+		Err(e) => {
+			if ENABLE_LOG_IN_FORK {
+				error!("Failed to enter namespaces: {}", e);
+			}
+			return Err(e);
+		}
+	}
+	unsafe {
+		let chdir = libc::chdir(new_cwd_cstr.as_ptr());
+		if chdir != 0 {
+			let err = perror!("chdir");
+			if ENABLE_LOG_IN_FORK {
+				error!("Failed to chdir to {:?}: errno {}", new_cwd_cstr, err);
+			}
+			return Err(io::Error::from_raw_os_error(err));
+		}
+	}
+	Ok(())
+}
+
 impl BindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
 		let namespaces = ManagedNamespaces::new(disable_userns)?;
@@ -944,6 +970,14 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
+	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, true) };
+		let new_cwd = std::env::current_dir().map_err(BindMountSandboxError::Getcwd)?;
+		let new_cwd_cstr = std::ffi::CString::new(new_cwd.as_os_str().as_encoded_bytes())
+			.expect("current directory path contains NUL byte");
+		restrict_self_impl(nsenter_fn, &new_cwd_cstr).map_err(BindMountSandboxError::RestrictSelf)
+	}
+
 	pub fn run_command(
 		&self,
 		cmd: &mut std::process::Command,
@@ -957,24 +991,8 @@ impl BindMountSandbox {
 		unsafe {
 			let nsenter_fn = self.namespaces.nsenter_fn(true, true, true, true);
 			cmd.pre_exec(move || {
-				match nsenter_fn() {
-					Ok(()) => (),
-					Err(e) => {
-						if ENABLE_LOG_IN_FORK {
-							error!("Failed to enter namespaces: {}", e);
-						}
-						return Err(e);
-					}
-				}
-				let chdir = libc::chdir(new_cwd_cstr.as_ptr());
-				if chdir != 0 {
-					let err = perror!("chdir");
-					if ENABLE_LOG_IN_FORK {
-						error!("Failed to chdir to {:?}: errno {}", new_cwd_cstr, err);
-					}
-					return Err(io::Error::from_raw_os_error(err));
-				}
-				Ok(())
+				restrict_self_impl(&nsenter_fn, &new_cwd_cstr)
+					.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 			})
 		};
 		let child = cmd.spawn().map_err(BindMountSandboxError::Spawn)?;

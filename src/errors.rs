@@ -73,8 +73,10 @@ pub enum BindMountSandboxError {
 	UserNsNotAllowed,
 	#[error("Failed to receive namespace fd from child: {0}")]
 	ReceiveNamespaceFd(std::io::Error),
+	#[error("Failed to restrict self to sandbox: {0}")]
+	RestrictSelf(#[source] std::io::Error),
 	#[error("failed to spawn child process: {0}")]
-	Spawn(std::io::Error),
+	Spawn(#[source] std::io::Error),
 	#[error("Failed to make detached tmpfs mount: errno {0}")]
 	MakeDetachedTmpfsMountFailed(libc::c_int),
 	#[error("Failed to receive mount object fd from child: {0}")]
