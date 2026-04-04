@@ -6,9 +6,9 @@ access tracer, and a namespace / bind-mount based sandbox that can be used
 with the tracer to dynamically find out about access requests and allow
 them.
 
-The tracer may be used together with other sandboxing mechanisms (like
-Landlock), or used on its own for non-security scenarios to find out what
-files are used by a program.
+The tracer may also be used together with other sandboxing mechanisms
+(like Landlock), or used on its own for non-security scenarios to find out
+what files are used by a program.
 
 > [!WARNING]
 > **Work in progress**. API will not be stable at all.
@@ -16,13 +16,16 @@ files are used by a program.
 ## Features
 
 - Supports most non-metadata fs accesses, including Unix socket connects
-- API is designed to be maximally data-preserving: files are identified by their original path as passed from the application, possibly with a dir fd for *at() operations.
+- API is designed to be maximally data-preserving: files are identified by
+  their original path as passed from the application, possibly with a dir
+  fd for *at() operations.
 
 ## Goals
 
 - Completely unprivileged
 - The library itself should be non-opinionated
-- (Eventually) supports a batteries-included, fully dynamic and inspectable sandbox, as an extension of this library
+- The library will support building a batteries-included, fully dynamic
+  and inspectable sandbox
 
 ## Example
 
