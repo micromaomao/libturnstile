@@ -10,6 +10,10 @@ pub enum TurnstileTracerError {
 	AddArch(#[source] libseccomp::error::SeccompError),
 	#[error("seccomp_load failed with error code {0}")]
 	Load(libc::c_int),
+	#[error("seccomp_set_ctl_tsync : {0}")]
+	SetCtlTsync(#[source] libseccomp::error::SeccompError),
+	#[error("seccomp_set_ctl_no_new_privs : {0}")]
+	SetCtlNoNewPrivs(#[source] libseccomp::error::SeccompError),
 	#[error("seccomp_notify_fd failed with error code {0}")]
 	NotifyFd(libc::c_int),
 	#[error("socketpair: {0}")]

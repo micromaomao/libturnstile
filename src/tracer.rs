@@ -302,7 +302,28 @@ impl TurnstileTracer {
 		return Ok(None);
 	}
 
-	/// Load the seccomp filter into the current thread.
+	/// Set the tsync flag on the seccomp filter.  This means that if
+	/// [`Self::install_filters`] is called from the current thread
+	/// instead of a fork, the filters will be applied to all threads in
+	/// this process.
+	pub fn set_tsync(&mut self, value: bool) -> Result<(), TurnstileTracerError> {
+		self.filter_ctx
+			.set_ctl_tsync(value)
+			.map_err(TurnstileTracerError::SetCtlTsync)
+			.map(|_| {})
+	}
+
+	/// Set the no_new_privs flag on the seccomp filter.  Setting this to
+	/// false will require CAP_SYS_ADMIN to load the filters.
+	pub fn set_no_new_privs(&mut self, value: bool) -> Result<(), TurnstileTracerError> {
+		self.filter_ctx
+			.set_ctl_nnp(value)
+			.map_err(TurnstileTracerError::SetCtlNoNewPrivs)
+			.map(|_| {})
+	}
+
+	/// Load the seccomp filter into the current thread, or process if
+	/// tsync is set.
 	///
 	/// This function is safe to call from a pre_exec hook, but in such
 	/// cases one may wish to use [`Self::run_command`] instead.
