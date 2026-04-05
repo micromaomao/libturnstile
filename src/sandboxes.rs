@@ -1012,7 +1012,9 @@ impl BindMountSandbox {
 		}
 	}
 
-	pub fn set_mount_attr_within_ns(
+	/// Update the attributes of an existing mount within the sandbox.
+	/// Symlinks are not followed.
+	pub fn set_mount_attr(
 		&self,
 		ns_path: &CStr,
 		attrs: MountAttributes,
