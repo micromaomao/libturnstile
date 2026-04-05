@@ -1297,10 +1297,7 @@ impl BindMountSandbox {
 			.expect("current directory path contains NUL byte");
 		unsafe {
 			let nsenter_fn = self.namespaces.nsenter_fn(true, true, true, true);
-			cmd.pre_exec(move || {
-				restrict_self_impl(&nsenter_fn, &new_cwd_cstr)
-					.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-			})
+			cmd.pre_exec(move || restrict_self_impl(&nsenter_fn, &new_cwd_cstr))
 		};
 		let child = cmd.spawn().map_err(BindMountSandboxError::Spawn)?;
 		Ok(child)
