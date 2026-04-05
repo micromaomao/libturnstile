@@ -73,8 +73,10 @@ pub enum BindMountSandboxError {
 	UserNsNotAllowed,
 	#[error("Failed to receive namespace fd from child: {0}")]
 	ReceiveNamespaceFd(std::io::Error),
+	#[error("Failed to restrict self to sandbox: {0}")]
+	RestrictSelf(#[source] std::io::Error),
 	#[error("failed to spawn child process: {0}")]
-	Spawn(std::io::Error),
+	Spawn(#[source] std::io::Error),
 	#[error("Failed to make detached tmpfs mount: errno {0}")]
 	MakeDetachedTmpfsMountFailed(libc::c_int),
 	#[error("Failed to receive mount object fd from child: {0}")]
@@ -83,12 +85,16 @@ pub enum BindMountSandboxError {
 	MountFailed(libc::c_int),
 	#[error("Failed to open path within sandbox: {0}")]
 	ResolveSandboxPath(#[source] std::io::Error),
+	#[error("Failed to open directory within sandbox: {0}")]
+	OpenSandboxDir(#[source] std::io::Error),
 	#[error("Failed to open path on host: {0:?}: {1}")]
 	ResolveHostPath(CString, #[source] std::io::Error),
 	#[error("Failed to mkdir within sandbox: {0}")]
 	Mkdir(#[source] std::io::Error),
 	#[error("Failed to create file for mountpoint within sandbox: {0}")]
 	Mkfile(#[source] std::io::Error),
+	#[error("Failed to create symlink within sandbox: {0}")]
+	Symlinkat(#[source] std::io::Error),
 	#[error("Failed to set attribute on mountpoint within sandbox: {0}")]
 	MountSetAttrsFailed(libc::c_int),
 	#[error("Failed to stat path on host: {0:?}: {1}")]
@@ -97,4 +103,6 @@ pub enum BindMountSandboxError {
 	StatSandboxPath(#[source] std::io::Error),
 	#[error("Failed to remove path within sandbox: {0}")]
 	RemoveSandboxPath(#[source] std::io::Error),
+	#[error("Invalid sandbox path: {0}: {1:?}")]
+	InvalidSandboxPath(&'static str, CString),
 }

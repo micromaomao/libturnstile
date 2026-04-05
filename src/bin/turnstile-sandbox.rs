@@ -88,11 +88,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		sleep(Duration::from_secs(10));
 
 		eprintln!("Now allowing write access on {:?}", pwd);
-		if let Err(e) = context.sandbox.set_mount_attr_within_ns(
-			&pwd,
-			MountAttributes::rw(),
-			MountAttributes::ro(),
-		) {
+		if let Err(e) =
+			context
+				.sandbox
+				.set_mount_attr(&pwd, MountAttributes::rw(), MountAttributes::ro())
+		{
 			error!("Failed to set mount attributes: {e}");
 		}
 
@@ -100,11 +100,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		sleep(Duration::from_secs(10));
 
 		eprintln!("Now taking away write access on {:?}", pwd);
-		if let Err(e) = context.sandbox.set_mount_attr_within_ns(
-			&pwd,
-			MountAttributes::ro(),
-			MountAttributes::rw(),
-		) {
+		if let Err(e) =
+			context
+				.sandbox
+				.set_mount_attr(&pwd, MountAttributes::ro(), MountAttributes::rw())
+		{
 			error!("Failed to set mount attributes: {e}");
 		}
 	});

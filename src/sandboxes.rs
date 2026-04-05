@@ -1,7 +1,7 @@
 use std::{
 	borrow::Cow,
 	ffi::{CStr, CString, OsStr},
-	io,
+	io, mem,
 	os::{fd::AsRawFd, unix::process::CommandExt},
 	thread,
 };
@@ -321,7 +321,7 @@ impl ManagedNamespaces {
 }
 
 #[derive(Debug)]
-pub struct MountObj(ForeignFd);
+struct MountObj(ForeignFd);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MountAttributes {
@@ -461,10 +461,6 @@ impl MountObj {
 		}
 	}
 
-	/// When updating the attributes on an existing mount, pass in the
-	/// existing attributes to avoid EPERM errors caused by trying to
-	/// clear attributes that we didn't set ourselves (and thus have no
-	/// rights to clear).
 	pub fn setattr(
 		&self,
 		attrs: MountAttributes,
@@ -529,6 +525,40 @@ impl MountObj {
 	}
 }
 
+fn validate_sandbox_path(path: &CStr) -> Result<(), BindMountSandboxError> {
+	let bytes = path.to_bytes();
+	if !bytes.starts_with(b"/") {
+		return Err(BindMountSandboxError::InvalidSandboxPath(
+			"path must be absolute",
+			path.to_owned(),
+		));
+	}
+	if bytes == b"/" {
+		return Ok(());
+	}
+	if bytes.ends_with(b"/") {
+		return Err(BindMountSandboxError::InvalidSandboxPath(
+			"path must not have a trailing '/'",
+			path.to_owned(),
+		));
+	}
+	for component in bytes[1..].split(|&b| b == b'/') {
+		if component.is_empty() {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"path must not contain consecutive '/'",
+				path.to_owned(),
+			));
+		}
+		if component == b"." || component == b".." {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"path must not contain '.' or '..' components",
+				path.to_owned(),
+			));
+		}
+	}
+	Ok(())
+}
+
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	namespaces: ManagedNamespaces,
@@ -541,7 +571,7 @@ pub struct MountBuilder<'a, 'b> {
 	sandbox_path: &'a CStr,
 	attrs: MountAttributes,
 	follow_host_symlinks: bool,
-	follow_sandbox_symlinks: bool,
+	// follow_sandbox_symlinks: bool,
 	sandbox: &'b BindMountSandbox,
 }
 
@@ -552,16 +582,18 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 	}
 
 	/// If host path points into a location controllable or writable by
-	/// the sandboxed process, this must not be used.
+	/// the sandboxed process, this must not be used.  This only affects
+	/// the path resolution for the "source" side - symlinks are still not
+	/// followed when resolving the mount destination.
 	pub fn follow_host_symlinks(&mut self, follow: bool) -> &mut Self {
 		self.follow_host_symlinks = follow;
 		self
 	}
 
-	pub fn follow_sandbox_symlinks(&mut self, follow: bool) -> &mut Self {
-		self.follow_sandbox_symlinks = follow;
-		self
-	}
+	// pub fn follow_sandbox_symlinks(&mut self, follow: bool) -> &mut Self {
+	// 	self.follow_sandbox_symlinks = follow;
+	// 	self
+	// }
 
 	pub fn mount(self) -> Result<(), BindMountSandboxError> {
 		self.sandbox._mount_host_into_sandbox(
@@ -569,9 +601,38 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 			self.sandbox_path,
 			self.attrs,
 			self.follow_host_symlinks,
-			self.follow_sandbox_symlinks,
+			// self.follow_sandbox_symlinks,
+			false,
 		)
 	}
+}
+
+fn restrict_self_impl<F: FnOnce() -> Result<(), std::io::Error>>(
+	nsenter_fn: F,
+	new_cwd_cstr: Option<&CStr>,
+) -> Result<(), std::io::Error> {
+	match nsenter_fn() {
+		Ok(()) => (),
+		Err(e) => {
+			if ENABLE_LOG_IN_FORK {
+				error!("Failed to enter namespaces: {}", e);
+			}
+			return Err(e);
+		}
+	}
+	if let Some(new_cwd_cstr) = new_cwd_cstr {
+		unsafe {
+			let chdir = libc::chdir(new_cwd_cstr.as_ptr());
+			if chdir != 0 {
+				let err = perror!("chdir");
+				if ENABLE_LOG_IN_FORK {
+					error!("Failed to chdir to {:?}: errno {}", new_cwd_cstr, err);
+				}
+				return Err(io::Error::from_raw_os_error(err));
+			}
+		}
+	}
+	Ok(())
 }
 
 impl BindMountSandbox {
@@ -661,11 +722,22 @@ impl BindMountSandbox {
 		Ok(s)
 	}
 
-	pub fn create_hierarchy_within_ns(
+	/// Create either a file or directory at the given absolute path
+	/// within the sandbox's backing tmpfs.  This makes a new empty file
+	/// or directory appear within the sandbox, unless the path or any of
+	/// its parent directories is already bind-mounted to some other host
+	/// path, in which case the new file or directory will not be visible.
+	///
+	/// If any of the path's parent doesn't exist or is not a directory, a
+	/// directory is created in its place (overriding any existing files,
+	/// which is sensible since this is a placeholder fs)
+	pub fn create_placeholder_hierarchy(
 		&self,
 		path: &CStr,
 		leaf_is_dir: bool,
 	) -> Result<ForeignFd, BindMountSandboxError> {
+		validate_sandbox_path(path)?;
+
 		let mut fd = self.root_tmpfs.0.clone();
 		let components = path
 			.to_bytes()
@@ -678,11 +750,19 @@ impl BindMountSandbox {
 			let is_leaf = i == len - 1;
 			let newfd = loop {
 				unsafe {
-					let newfd = libc::openat(
+					let mut openhow: libc::open_how = mem::zeroed();
+					openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+					openhow.resolve = libc::RESOLVE_NO_SYMLINKS;
+					if i == 0 {
+						openhow.resolve |= libc::RESOLVE_IN_ROOT;
+					}
+					let newfd = libc::syscall(
+						libc::SYS_openat2,
 						fd.as_raw_fd(),
 						comp.as_ptr(),
-						libc::O_PATH | libc::O_CLOEXEC,
-					);
+						&openhow as *const _,
+						std::mem::size_of::<libc::open_how>(),
+					) as libc::c_int;
 					if newfd < 0 {
 						let err = io::Error::last_os_error();
 						if err.kind() == io::ErrorKind::NotFound {
@@ -702,7 +782,7 @@ impl BindMountSandbox {
 									let ret = libc::openat(
 										fd.as_raw_fd(),
 										comp.as_ptr(),
-										libc::O_CREAT | libc::O_WRONLY,
+										libc::O_CREAT | libc::O_WRONLY | libc::O_NOFOLLOW,
 										0o644,
 									);
 									if ret < 0 {
@@ -728,8 +808,12 @@ impl BindMountSandbox {
 							return Err(BindMountSandboxError::StatSandboxPath(err));
 						}
 						let is_dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
+						let is_regular_file = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
 						let expect_is_dir = !is_leaf || leaf_is_dir;
-						if is_dir == expect_is_dir {
+						if expect_is_dir && is_dir {
+							break newfd;
+						}
+						if !expect_is_dir && is_regular_file {
 							break newfd;
 						}
 						let ret = libc::unlinkat(
@@ -750,8 +834,259 @@ impl BindMountSandbox {
 		Ok(fd)
 	}
 
-	/// If host_path points into a place controllable by the sandboxed
-	/// process, follow_host_symlinks must be false.
+	/// Create a symlink within the sandbox's backing tmpfs, which will
+	/// appear within the sandbox unless the location is already within a
+	/// bind-mount.  linkpath must be absolute, but target need not be (as
+	/// it usually is, relative paths are interpreted relative to the
+	/// symlink's parent directory).
+	pub fn create_placeholder_symlink(
+		&self,
+		linkpath: &CStr,
+		target: &CStr,
+	) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(linkpath)?;
+		let bytes = linkpath.to_bytes_with_nul();
+		let last_slash = bytes
+			.iter()
+			.rposition(|&b| b == b'/')
+			.expect("linkpath is absolute so should have /");
+		let mut parent = CString::new(&bytes[..last_slash]).unwrap();
+		if parent.is_empty() {
+			parent = CString::new("/").unwrap();
+		}
+		let child = CStr::from_bytes_with_nul(&bytes[last_slash + 1..]).unwrap();
+		let parent_fd = self.create_placeholder_hierarchy(&parent, true)?;
+		unsafe {
+			loop {
+				let res = libc::symlinkat(target.as_ptr(), parent_fd.as_raw_fd(), child.as_ptr());
+				if res != 0 {
+					let err = io::Error::last_os_error();
+					if err.kind() == io::ErrorKind::AlreadyExists {
+						let mut stat: libc::stat = std::mem::zeroed();
+						if libc::fstatat(
+							parent_fd.as_raw_fd(),
+							child.as_ptr(),
+							&mut stat,
+							libc::AT_SYMLINK_NOFOLLOW,
+						) != 0
+						{
+							let err = io::Error::last_os_error();
+							return Err(BindMountSandboxError::StatSandboxPath(err));
+						}
+						let flag = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+							libc::AT_REMOVEDIR
+						} else {
+							0
+						};
+						// unlinkat never follows symlink on the final
+						// path component
+						let res = libc::unlinkat(parent_fd.as_raw_fd(), child.as_ptr(), flag);
+						if res != 0 {
+							let err = io::Error::last_os_error();
+							return Err(BindMountSandboxError::RemoveSandboxPath(err));
+						}
+						continue;
+					}
+					return Err(BindMountSandboxError::Symlinkat(err));
+				}
+				debug!("Created symlink {:?} -> {:?} in sandbox", linkpath, target);
+				return Ok(());
+			}
+		}
+	}
+
+	/// Remove the given sandbox path from the backing tmpfs, removing
+	/// files within the pointed to directory recursively if it's a
+	/// directory.  Nothing is done if the path, or any of its parent
+	/// components, doesn't exist.
+	pub fn remove_placeholder(&self, path: &CStr) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(path)?;
+
+		let bytes = path.to_bytes_with_nul();
+		let last_slash = bytes
+			.iter()
+			.rposition(|&b| b == b'/')
+			.expect("path is absolute so should have /");
+		let parent_path_buf;
+		let parent_path: &CStr = if last_slash == 0 {
+			c"/"
+		} else {
+			parent_path_buf = CString::new(&bytes[..last_slash]).unwrap();
+			&parent_path_buf
+		};
+		let leaf = CStr::from_bytes_with_nul(&bytes[last_slash + 1..]).unwrap();
+		if leaf.to_bytes().is_empty() {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"cannot remove root",
+				path.to_owned(),
+			));
+		}
+
+		let parent_fd = unsafe {
+			let mut openhow: libc::open_how = mem::zeroed();
+			openhow.flags =
+				(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64;
+			// RESOLVE_IN_ROOT and RESOLVE_NO_XDEV are not technically
+			// necessary in our setup, but adding for safety.
+			openhow.resolve =
+				libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_XDEV;
+			let fd = libc::syscall(
+				libc::SYS_openat2,
+				self.root_tmpfs.0.as_raw_fd(),
+				parent_path.as_ptr(),
+				&openhow as *const _,
+				std::mem::size_of::<libc::open_how>(),
+			) as libc::c_int;
+			if fd < 0 {
+				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
+				return Err(BindMountSandboxError::ResolveSandboxPath(err));
+			}
+			ForeignFd { local_fd: fd }
+		};
+
+		unsafe {
+			let mut stat: libc::stat = std::mem::zeroed();
+			if libc::fstatat(
+				parent_fd.as_raw_fd(),
+				leaf.as_ptr(),
+				&mut stat,
+				libc::AT_SYMLINK_NOFOLLOW,
+			) != 0
+			{
+				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
+				return Err(BindMountSandboxError::StatSandboxPath(err));
+			}
+
+			if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+				self.remove_dir_recursive(parent_fd.as_raw_fd(), leaf)?;
+			} else {
+				let res = libc::unlinkat(parent_fd.as_raw_fd(), leaf.as_ptr(), 0);
+				if res != 0 {
+					let err = io::Error::last_os_error();
+					if err.kind() == io::ErrorKind::NotFound {
+						return Ok(());
+					}
+					return Err(BindMountSandboxError::RemoveSandboxPath(err));
+				}
+			}
+		}
+
+		debug!("Removed {:?} from sandbox tmpfs", path);
+		Ok(())
+	}
+
+	fn remove_dir_recursive(
+		&self,
+		parent_fd: libc::c_int,
+		name: &CStr,
+	) -> Result<(), BindMountSandboxError> {
+		unsafe {
+			let mut openhow: libc::open_how = mem::zeroed();
+			openhow.flags =
+				(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
+			openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_XDEV;
+			let dir_fd = libc::syscall(
+				libc::SYS_openat2,
+				parent_fd,
+				name.as_ptr(),
+				&openhow as *const _,
+				std::mem::size_of::<libc::open_how>(),
+			) as libc::c_int;
+			if dir_fd < 0 {
+				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
+				return Err(BindMountSandboxError::OpenSandboxDir(err));
+			}
+			// dup because fdopendir takes ownership
+			let dir_fd_dup = libc::fcntl(dir_fd, libc::F_DUPFD_CLOEXEC, 0);
+			if dir_fd_dup < 0 {
+				libc::close(dir_fd);
+				let err = io::Error::last_os_error();
+				return Err(BindMountSandboxError::OpenSandboxDir(err));
+			}
+
+			let dir = libc::fdopendir(dir_fd);
+			if dir.is_null() {
+				libc::close(dir_fd);
+				libc::close(dir_fd_dup);
+				let err = io::Error::last_os_error();
+				return Err(BindMountSandboxError::OpenSandboxDir(err));
+			}
+			// dir_fd is now owned by dir
+
+			loop {
+				*libc::__errno_location() = 0;
+				let entry = libc::readdir(dir);
+				if entry.is_null() {
+					let errno = *libc::__errno_location();
+					if errno != 0 {
+						libc::closedir(dir);
+						libc::close(dir_fd_dup);
+						return Err(BindMountSandboxError::OpenSandboxDir(
+							io::Error::from_raw_os_error(errno),
+						));
+					}
+					break;
+				}
+
+				let entry_name = CStr::from_ptr((*entry).d_name.as_ptr());
+				if entry_name == c"." || entry_name == c".." {
+					continue;
+				}
+
+				let mut stat: libc::stat = std::mem::zeroed();
+				if libc::fstatat(
+					dir_fd_dup,
+					entry_name.as_ptr(),
+					&mut stat,
+					libc::AT_SYMLINK_NOFOLLOW,
+				) != 0
+				{
+					let err = io::Error::last_os_error();
+					libc::closedir(dir);
+					libc::close(dir_fd_dup);
+					return Err(BindMountSandboxError::StatSandboxPath(err));
+				}
+
+				if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+					self.remove_dir_recursive(dir_fd_dup, entry_name)?;
+				} else {
+					let res = libc::unlinkat(dir_fd_dup, entry_name.as_ptr(), 0);
+					if res != 0 {
+						let err = io::Error::last_os_error();
+						libc::closedir(dir);
+						libc::close(dir_fd_dup);
+						return Err(BindMountSandboxError::RemoveSandboxPath(err));
+					}
+				}
+			}
+
+			libc::closedir(dir);
+			libc::close(dir_fd_dup);
+
+			let res = libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR);
+			if res != 0 {
+				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
+				return Err(BindMountSandboxError::RemoveSandboxPath(err));
+			}
+		}
+		Ok(())
+	}
+
+	// todo: the semantic of follow_ns_symlinks is ill-defined due to use
+	// of create_hierarchy, which has no visibility into bind-mounted
+	// symlinks
 	pub(self) fn _mount_host_into_sandbox(
 		&self,
 		host_path: &CStr,
@@ -760,9 +1095,7 @@ impl BindMountSandbox {
 		follow_host_symlinks: bool,
 		follow_ns_symlinks: bool,
 	) -> Result<(), BindMountSandboxError> {
-		if !ns_path.to_bytes().starts_with(b"/") {
-			panic!("ns_path must be an absolute path");
-		}
+		validate_sandbox_path(ns_path)?;
 		let mut open_how: libc::open_how = unsafe { std::mem::zeroed() };
 		open_how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
 		if !follow_host_symlinks {
@@ -799,7 +1132,7 @@ impl BindMountSandbox {
 			}
 		}
 
-		self.create_hierarchy_within_ns(ns_path, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
+		self.create_placeholder_hierarchy(ns_path, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
 
 		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
 		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
@@ -890,20 +1223,23 @@ impl BindMountSandbox {
 			sandbox_path,
 			attrs: MountAttributes::default(),
 			follow_host_symlinks: false,
-			follow_sandbox_symlinks: false,
+			// follow_sandbox_symlinks: false,
 			sandbox: self,
 		}
 	}
 
-	pub fn set_mount_attr_within_ns(
+	/// Update the attributes of an existing mount within the sandbox.
+	/// Symlinks are not followed.  Caller should store and pass in the
+	/// existing attributes to avoid EPERM errors caused by trying to
+	/// clear attributes that we didn't previously set (and thus have no
+	/// rights to clear).
+	pub fn set_mount_attr(
 		&self,
 		ns_path: &CStr,
 		attrs: MountAttributes,
 		existing_attrs: MountAttributes,
 	) -> Result<(), BindMountSandboxError> {
-		if !ns_path.to_bytes().starts_with(b"/") {
-			panic!("ns_path must be an absolute path");
-		}
+		validate_sandbox_path(ns_path)?;
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
 		let fork_res = unsafe {
 			fork_wait(|| {
@@ -920,7 +1256,16 @@ impl BindMountSandbox {
 				if res != 0 {
 					return perror!("chdir");
 				}
-				let fd = libc::open(ns_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC);
+				let mut openhow: libc::open_how = mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				let fd = libc::syscall(
+					libc::SYS_openat2,
+					libc::AT_FDCWD,
+					ns_path.as_ptr(),
+					&openhow,
+					std::mem::size_of_val(&openhow),
+				) as libc::c_int;
 				if fd < 0 {
 					return perror!("open");
 				}
@@ -944,6 +1289,18 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
+	/// Join the current thread into the sandbox.  This can be used
+	/// instead of [`Self::run_command`], most likely within a pre_exec
+	/// hook or after fork()ing.  This cannot be used if the current
+	/// process contains more than one threads.
+	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, true) };
+		restrict_self_impl(nsenter_fn, None).map_err(BindMountSandboxError::RestrictSelf)
+	}
+
+	/// Run a command within the sandbox.  Can be called more than once
+	/// (unlike
+	/// [`TurnstileTracer::run_command`](crate::tracer::TurnstileTracer::run_command))
 	pub fn run_command(
 		&self,
 		cmd: &mut std::process::Command,
@@ -956,28 +1313,46 @@ impl BindMountSandbox {
 			.expect("current directory path contains NUL byte");
 		unsafe {
 			let nsenter_fn = self.namespaces.nsenter_fn(true, true, true, true);
-			cmd.pre_exec(move || {
-				match nsenter_fn() {
-					Ok(()) => (),
-					Err(e) => {
-						if ENABLE_LOG_IN_FORK {
-							error!("Failed to enter namespaces: {}", e);
-						}
-						return Err(e);
-					}
-				}
-				let chdir = libc::chdir(new_cwd_cstr.as_ptr());
-				if chdir != 0 {
-					let err = perror!("chdir");
-					if ENABLE_LOG_IN_FORK {
-						error!("Failed to chdir to {:?}: errno {}", new_cwd_cstr, err);
-					}
-					return Err(io::Error::from_raw_os_error(err));
-				}
-				Ok(())
-			})
+			cmd.pre_exec(move || restrict_self_impl(&nsenter_fn, Some(&new_cwd_cstr)))
 		};
 		let child = cmd.spawn().map_err(BindMountSandboxError::Spawn)?;
 		Ok(child)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_validate_sandbox_path() {
+		// Valid paths
+		assert!(validate_sandbox_path(c"/").is_ok());
+		assert!(validate_sandbox_path(c"/a").is_ok());
+		assert!(validate_sandbox_path(c"/a/b").is_ok());
+		assert!(validate_sandbox_path(c"/a/b/c").is_ok());
+		assert!(validate_sandbox_path(c"/usr/lib").is_ok());
+
+		// Not absolute
+		assert!(validate_sandbox_path(c"a").is_err());
+		assert!(validate_sandbox_path(c"a/b").is_err());
+		assert!(validate_sandbox_path(c"").is_err());
+
+		// Trailing slash
+		assert!(validate_sandbox_path(c"/a/").is_err());
+		assert!(validate_sandbox_path(c"/a/b/").is_err());
+
+		// Consecutive slashes
+		assert!(validate_sandbox_path(c"//").is_err());
+		assert!(validate_sandbox_path(c"//a").is_err());
+		assert!(validate_sandbox_path(c"/a//b").is_err());
+		assert!(validate_sandbox_path(c"/a/b//").is_err());
+
+		// Dot components
+		assert!(validate_sandbox_path(c"/.").is_err());
+		assert!(validate_sandbox_path(c"/..").is_err());
+		assert!(validate_sandbox_path(c"/a/..").is_err());
+		assert!(validate_sandbox_path(c"/a/./b").is_err());
+		assert!(validate_sandbox_path(c"/a/../b").is_err());
 	}
 }
