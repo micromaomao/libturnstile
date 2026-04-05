@@ -146,7 +146,7 @@ impl<T> FsTree<T> {
 	/// predicate, or the closest parent matching the predicate (called on
 	/// all components).
 	pub fn find<'a, P: FnMut(&'a OsStr, &T) -> bool>(
-		&mut self,
+		&self,
 		path: &'a OsStr,
 		mut predicate: P,
 	) -> Option<(&'a OsStr, &T)> {

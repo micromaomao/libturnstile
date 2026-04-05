@@ -2,7 +2,10 @@ use std::{
 	borrow::Cow,
 	ffi::{CStr, CString, OsStr},
 	io, mem,
-	os::{fd::AsRawFd, unix::process::CommandExt},
+	os::{
+		fd::AsRawFd,
+		unix::{ffi::OsStrExt, process::CommandExt},
+	},
 	thread,
 };
 
@@ -1039,5 +1042,41 @@ impl ManagedBindMountSandbox {
 			Some(e) => Err(e),
 			None => Ok(()),
 		}
+	}
+
+	pub fn check_covered(
+		&self,
+		path: &CStr,
+		need_write: bool,
+		need_exec: bool,
+	) -> Result<bool, BindMountSandboxError> {
+		validate_sandbox_path(path)?;
+		match self
+			.current_mount_tree
+			.find(OsStr::from_bytes(path.to_bytes()), |_, x| x.is_some())
+		{
+			None => return Ok(false),
+			Some((_, mnt)) => {
+				let mnt = mnt.as_ref().unwrap();
+				if need_write && mnt.attrs.readonly {
+					return Ok(false);
+				}
+				if need_exec && mnt.attrs.noexec {
+					return Ok(false);
+				}
+				Ok(true)
+			}
+		}
+	}
+
+	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
+		self.sandbox.restrict_self()
+	}
+
+	pub fn run_command(
+		&self,
+		cmd: &mut std::process::Command,
+	) -> Result<std::process::Child, BindMountSandboxError> {
+		self.sandbox.run_command(cmd)
 	}
 }
