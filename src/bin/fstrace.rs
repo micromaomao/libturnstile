@@ -1,4 +1,6 @@
-use libturnstile::fs::{ForeignFd, FsOperation, FsTarget, RwxPermission};
+use clap::Parser;
+use libturnstile::access::fs::{ForeignFd, FsOperation, FsTarget, RwxPermission};
+use libturnstile::{AccessRequestError, TurnstileTracer, access::Operation};
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -9,9 +11,6 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use std::{env, io};
-
-use clap::Parser;
-use libturnstile::{AccessRequestError, Operation, TurnstileTracer};
 
 use crate::common::{ProcPidFd, handle_child_result};
 
