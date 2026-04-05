@@ -1305,3 +1305,40 @@ impl BindMountSandbox {
 		Ok(child)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_validate_sandbox_path() {
+		// Valid paths
+		assert!(validate_sandbox_path(c"/").is_ok());
+		assert!(validate_sandbox_path(c"/a").is_ok());
+		assert!(validate_sandbox_path(c"/a/b").is_ok());
+		assert!(validate_sandbox_path(c"/a/b/c").is_ok());
+		assert!(validate_sandbox_path(c"/usr/lib").is_ok());
+
+		// Not absolute
+		assert!(validate_sandbox_path(c"a").is_err());
+		assert!(validate_sandbox_path(c"a/b").is_err());
+		assert!(validate_sandbox_path(c"").is_err());
+
+		// Trailing slash
+		assert!(validate_sandbox_path(c"/a/").is_err());
+		assert!(validate_sandbox_path(c"/a/b/").is_err());
+
+		// Consecutive slashes
+		assert!(validate_sandbox_path(c"//").is_err());
+		assert!(validate_sandbox_path(c"//a").is_err());
+		assert!(validate_sandbox_path(c"/a//b").is_err());
+		assert!(validate_sandbox_path(c"/a/b//").is_err());
+
+		// Dot components
+		assert!(validate_sandbox_path(c"/.").is_err());
+		assert!(validate_sandbox_path(c"/..").is_err());
+		assert!(validate_sandbox_path(c"/a/..").is_err());
+		assert!(validate_sandbox_path(c"/a/./b").is_err());
+		assert!(validate_sandbox_path(c"/a/../b").is_err());
+	}
+}
