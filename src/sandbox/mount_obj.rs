@@ -1,7 +1,7 @@
 use std::{ffi::CStr, io, os::fd::AsRawFd};
 
 use super::{ENABLE_LOG_IN_FORK, MountAttributes};
-use crate::fs::ForeignFd;
+use crate::access::fs::ForeignFd;
 use log::error;
 
 #[derive(Debug)]

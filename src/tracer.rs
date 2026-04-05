@@ -14,8 +14,8 @@ use libseccomp::{ScmpArch, ScmpFd, ScmpFilterContext, ScmpNotifReq};
 use libseccomp_sys::scmp_filter_ctx;
 
 use crate::{
-	AccessRequest, AccessRequestError, TurnstileTracerError,
-	fs::ForeignFd,
+	AccessRequestError, TurnstileTracerError,
+	access::{AccessRequest, fs::ForeignFd},
 	syscalls::{self, RequestContext},
 	utils::{unix_recv_fd, unix_send_fd},
 };
@@ -211,10 +211,10 @@ impl TurnstileTracer {
 	/// request (or None if, for example, the syscall accesses an ignored
 	/// file).
 	///
-	/// If an [`AccessRequest`](crate::AccessRequest) along with its
-	/// [`RequestContext`](crate::RequestContext) is returned, the traced
-	/// process is paused, and the caller should respond to the request by
-	/// calling either
+	/// If an [`AccessRequest`](crate::access::AccessRequest) along with
+	/// its [`RequestContext`](crate::RequestContext) is returned, the
+	/// traced process is paused, and the caller should respond to the
+	/// request by calling either
 	/// [`RequestContext::send_continue`](crate::RequestContext::send_continue)
 	/// or
 	/// [`RequestContext::send_error`](crate::RequestContext::send_error).

@@ -1,12 +1,15 @@
 use libseccomp::ScmpFilterContext;
 
 use crate::{
-	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
+	AccessRequestError, TurnstileTracerError,
 	access::fs::{
 		CreateKind, CreateOperation, ExecOperation, FsTarget, LinkOperation, OpenOperation,
 		RenameOperation, UnlinkOperation,
 	},
-	fs::{AccessOperation, StatOperation},
+	access::{
+		AccessRequest, Operation,
+		fs::{AccessOperation, StatOperation},
+	},
 	syscalls::RequestContext,
 };
 

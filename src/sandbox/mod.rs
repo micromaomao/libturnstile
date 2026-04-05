@@ -10,7 +10,7 @@ use log::{debug, error, info};
 
 use crate::{
 	BindMountSandboxError,
-	fs::ForeignFd,
+	access::fs::ForeignFd,
 	utils::{fork_wait, unix_recv_fd, unix_send_fd},
 };
 

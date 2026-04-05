@@ -8,14 +8,13 @@
 //! (like Landlock), or used on its own for non-security scenarios to find out
 //! what files are used by a program.
 
-mod access;
+pub mod access;
 mod errors;
 mod sandbox;
 mod syscalls;
 mod tracer;
 mod utils;
 
-pub use crate::access::*;
 pub use crate::errors::*;
 pub use crate::sandbox::*;
 pub use crate::syscalls::RequestContext;

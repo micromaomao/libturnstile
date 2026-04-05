@@ -3,9 +3,11 @@ use std::mem::offset_of;
 use libseccomp::ScmpFilterContext;
 
 use crate::{
-	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
-	access::fs::{FsOperation, FsTarget},
-	fs::UnixBindOperation,
+	AccessRequestError, TurnstileTracerError,
+	access::{
+		AccessRequest, Operation,
+		fs::{FsOperation, FsTarget, UnixBindOperation},
+	},
 	syscalls::{RequestContext, lazy_syscall_table_name_to_number},
 };
 

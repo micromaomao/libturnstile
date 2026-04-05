@@ -1,7 +1,7 @@
 use super::{ENABLE_LOG_IN_FORK, write_to_path};
 use crate::{
 	BindMountSandboxError,
-	fs::ForeignFd,
+	access::fs::ForeignFd,
 	utils::{fork_wait, unix_recv_fd, unix_send_fd},
 };
 use log::{debug, error};
