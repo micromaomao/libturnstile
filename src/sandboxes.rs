@@ -695,7 +695,7 @@ impl BindMountSandbox {
 	/// If any of the path's parent doesn't exist or is not a directory, a
 	/// directory is created in its place (overriding any existing files,
 	/// which is sensible since this is a placeholder fs)
-	pub fn create_hierarchy(
+	pub fn create_placeholder_hierarchy(
 		&self,
 		path: &CStr,
 		leaf_is_dir: bool,
@@ -805,7 +805,7 @@ impl BindMountSandbox {
 	/// bind-mount.  linkpath must be absolute, but target need not be (as
 	/// it usually is, relative paths are interpreted relative to the
 	/// symlink's parent directory).
-	pub fn create_symlink(
+	pub fn create_placeholder_symlink(
 		&self,
 		linkpath: &CStr,
 		target: &CStr,
@@ -823,7 +823,7 @@ impl BindMountSandbox {
 			parent = CString::new("/").unwrap();
 		}
 		let child = CStr::from_bytes_with_nul(&bytes[last_slash..]).unwrap();
-		let parent_fd = self.create_hierarchy(&parent, true)?;
+		let parent_fd = self.create_placeholder_hierarchy(&parent, true)?;
 		unsafe {
 			loop {
 				let res = libc::symlinkat(target.as_ptr(), parent_fd.as_raw_fd(), child.as_ptr());
@@ -912,7 +912,7 @@ impl BindMountSandbox {
 			}
 		}
 
-		self.create_hierarchy(ns_path, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
+		self.create_placeholder_hierarchy(ns_path, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
 
 		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
 		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
