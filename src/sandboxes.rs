@@ -525,6 +525,23 @@ impl MountObj {
 	}
 }
 
+/// Split a validated absolute path into (parent, leaf).
+fn split_parent_leaf(path: &CStr) -> (CString, &CStr) {
+	let bytes = path.to_bytes_with_nul();
+	let last_slash = bytes
+		.iter()
+		.rposition(|&b| b == b'/')
+		.expect("path is absolute so should have /");
+	let parent = if last_slash == 0 {
+		CString::new("/").unwrap()
+	} else {
+		CString::new(&bytes[..last_slash]).unwrap()
+	};
+	let leaf = CStr::from_bytes_with_nul(&bytes[last_slash + 1..])
+		.expect("original path is nul-terminated");
+	(parent, leaf)
+}
+
 fn validate_sandbox_path(path: &CStr) -> Result<(), BindMountSandboxError> {
 	let bytes = path.to_bytes();
 	if !bytes.starts_with(b"/") {
@@ -845,16 +862,13 @@ impl BindMountSandbox {
 		target: &CStr,
 	) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(linkpath)?;
-		let bytes = linkpath.to_bytes_with_nul();
-		let last_slash = bytes
-			.iter()
-			.rposition(|&b| b == b'/')
-			.expect("linkpath is absolute so should have /");
-		let mut parent = CString::new(&bytes[..last_slash]).unwrap();
-		if parent.is_empty() {
-			parent = CString::new("/").unwrap();
+		if linkpath.to_bytes() == b"/" {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"cannot create symlink at root",
+				linkpath.to_owned(),
+			));
 		}
-		let child = CStr::from_bytes_with_nul(&bytes[last_slash + 1..]).unwrap();
+		let (parent, child) = split_parent_leaf(linkpath);
 		let parent_fd = self.create_placeholder_hierarchy(&parent, true)?;
 		unsafe {
 			loop {
@@ -902,25 +916,13 @@ impl BindMountSandbox {
 	pub fn remove_placeholder(&self, path: &CStr) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(path)?;
 
-		let bytes = path.to_bytes_with_nul();
-		let last_slash = bytes
-			.iter()
-			.rposition(|&b| b == b'/')
-			.expect("path is absolute so should have /");
-		let parent_path_buf;
-		let parent_path: &CStr = if last_slash == 0 {
-			c"/"
-		} else {
-			parent_path_buf = CString::new(&bytes[..last_slash]).unwrap();
-			&parent_path_buf
-		};
-		let leaf = CStr::from_bytes_with_nul(&bytes[last_slash + 1..]).unwrap();
-		if leaf.to_bytes().is_empty() {
+		if path.to_bytes() == b"/" {
 			return Err(BindMountSandboxError::InvalidSandboxPath(
 				"cannot remove root",
 				path.to_owned(),
 			));
 		}
+		let (parent_path, leaf) = split_parent_leaf(path);
 
 		let parent_fd = unsafe {
 			let mut openhow: libc::open_how = mem::zeroed();
@@ -1226,6 +1228,71 @@ impl BindMountSandbox {
 			// follow_sandbox_symlinks: false,
 			sandbox: self,
 		}
+	}
+
+	/// Unmount the bind mount at the given absolute path within the
+	/// sandbox.  Symlinks are not followed.  The path must not be "/".
+	/// The path must have been previously bind-mounted with
+	/// [`Self::mount_host_into_sandbox`].
+	pub fn unmount(&self, ns_path: &CStr) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(ns_path)?;
+		if ns_path.to_bytes() == b"/" {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"cannot unmount root",
+				ns_path.to_owned(),
+			));
+		}
+		let (parent_path, leaf) = split_parent_leaf(ns_path);
+
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
+		let fork_res = unsafe {
+			fork_wait(|| {
+				match nsenter_fn() {
+					Ok(()) => (),
+					Err(e) => {
+						if ENABLE_LOG_IN_FORK {
+							error!("Failed to enter namespaces: {}", e);
+						}
+						return e.raw_os_error().unwrap_or(libc::EIO);
+					}
+				}
+				let res = libc::chdir(c"/".as_ptr());
+				if res != 0 {
+					return perror!("chdir");
+				}
+				let mut openhow: libc::open_how = mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				let parent_fd = libc::syscall(
+					libc::SYS_openat2,
+					libc::AT_FDCWD,
+					parent_path.as_ptr(),
+					&openhow as *const _,
+					std::mem::size_of::<libc::open_how>(),
+				) as libc::c_int;
+				if parent_fd < 0 {
+					return perror!("openat2(parent)");
+				}
+				let res = libc::fchdir(parent_fd);
+				libc::close(parent_fd);
+				if res != 0 {
+					return perror!("fchdir");
+				}
+				let res = libc::umount2(leaf.as_ptr(), libc::MNT_DETACH | libc::UMOUNT_NOFOLLOW);
+				if res != 0 {
+					return perror!("umount2");
+				}
+				0
+			})
+		}
+		.map_err(BindMountSandboxError::ForkError)?;
+		if fork_res != 0 {
+			error!("Failed to unmount {:?}: errno {}", ns_path, fork_res);
+			return Err(BindMountSandboxError::UnmountFailed(fork_res));
+		} else {
+			info!("Unmounted {:?}", ns_path);
+		}
+		Ok(())
 	}
 
 	/// Update the attributes of an existing mount within the sandbox.

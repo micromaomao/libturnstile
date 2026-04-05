@@ -105,4 +105,6 @@ pub enum BindMountSandboxError {
 	RemoveSandboxPath(#[source] std::io::Error),
 	#[error("Invalid sandbox path: {0}: {1:?}")]
 	InvalidSandboxPath(&'static str, CString),
+	#[error("unmount failed: errno {0}")]
+	UnmountFailed(libc::c_int),
 }
