@@ -533,7 +533,10 @@ fn validate_sandbox_path(path: &CStr) -> Result<(), BindMountSandboxError> {
 			path.to_owned(),
 		));
 	}
-	if bytes.len() > 1 && bytes.ends_with(b"/") {
+	if bytes == b"/" {
+		return Ok(());
+	}
+	if bytes.ends_with(b"/") {
 		return Err(BindMountSandboxError::InvalidSandboxPath(
 			"path must not have a trailing '/'",
 			path.to_owned(),
