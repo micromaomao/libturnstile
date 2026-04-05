@@ -968,7 +968,7 @@ impl ManagedBindMountSandbox {
 		}
 		let mut new_tree_state = self.current_mount_tree.clone();
 		let mut err: Option<BindMountSandboxError> = None;
-		self.current_mount_tree.diff_bottom_up_filtered(
+		self.current_mount_tree.diff(
 			&desired_tree,
 			|sandbox_path, diff| {
 				if err.is_some() {

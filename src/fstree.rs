@@ -268,8 +268,92 @@ impl<T> FsTree<T> {
 		other: &FsTree<T2>,
 		mut f: F,
 		mut split_on: S,
+		path: &mut Vec<u8>,
+		node_left: &FsTreeNode<T>,
+		node_right: &FsTreeNode<T2>,
 	) {
-		unimplemented!()
+		let should_split = split_on(
+			OsStr::from_bytes(path),
+			&node_left.target,
+			&node_right.target,
+		);
+		if should_split {
+			self.walk_impl(
+				|path, left| f(path, Some(left), None),
+				false,
+				path,
+				node_left,
+			);
+			other.walk_impl(
+				|path, right| f(path, None, Some(right)),
+				true,
+				path,
+				node_right,
+			);
+			return;
+		}
+		f(
+			OsStr::from_bytes(path),
+			Some(&node_left.target),
+			Some(&node_right.target),
+		);
+		let left_names = node_left
+			.children
+			.keys()
+			.map(|x| x.as_os_str())
+			.collect::<std::collections::HashSet<_>>();
+		let right_names = node_right
+			.children
+			.keys()
+			.map(|x| x.as_os_str())
+			.collect::<std::collections::HashSet<_>>();
+		let left_only = left_names.difference(&right_names);
+		let common = left_names.intersection(&right_names);
+		let right_only = right_names.difference(&left_names);
+		for &name in left_only {
+			let orig_path_len = path.len();
+			if !path.is_empty() {
+				path.push(b'/');
+			}
+			path.extend_from_slice(name.as_bytes());
+			self.walk_impl(
+				|path, left| f(path, Some(left), None),
+				false,
+				path,
+				&node_left.children[name],
+			);
+			path.truncate(orig_path_len);
+		}
+		for &name in common {
+			let orig_path_len = path.len();
+			if !path.is_empty() {
+				path.push(b'/');
+			}
+			path.extend_from_slice(name.as_bytes());
+			self.diff_impl(
+				other,
+				&mut f,
+				&mut split_on,
+				path,
+				&node_left.children[name],
+				&node_right.children[name],
+			);
+			path.truncate(orig_path_len);
+		}
+		for &name in right_only {
+			let orig_path_len = path.len();
+			if !path.is_empty() {
+				path.push(b'/');
+			}
+			path.extend_from_slice(name.as_bytes());
+			other.walk_impl(
+				|path, right| f(path, None, Some(right)),
+				true,
+				path,
+				&node_right.children[name],
+			);
+			path.truncate(orig_path_len);
+		}
 	}
 
 	/// Produce the difference between two trees.  self is considered the
@@ -282,11 +366,7 @@ impl<T> FsTree<T> {
 	/// For trees removed, the iteration order is bottom-up, e.g.
 	/// /foo/bar, /foo, /baz, /.  For trees added or updated, the
 	/// iteration order is top-down, e.g. /, /foo, /foo/bar.
-	pub fn diff_bottom_up_filtered<
-		T2,
-		F: FnMut(&OsStr, DiffTree<T, T2>),
-		S: FnMut(&OsStr, &T, &T2) -> bool,
-	>(
+	pub fn diff<T2, F: FnMut(&OsStr, DiffTree<T, T2>), S: FnMut(&OsStr, &T, &T2) -> bool>(
 		&self,
 		other: &FsTree<T2>,
 		mut f: F,
@@ -304,6 +384,9 @@ impl<T> FsTree<T> {
 				f(path, diff);
 			},
 			&mut split_on,
+			&mut Vec::new(),
+			&self.root,
+			&other.root,
 		);
 	}
 }
