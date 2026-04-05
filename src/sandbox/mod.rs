@@ -933,7 +933,7 @@ impl BindMountSandbox {
 					return perror!("open");
 				}
 				let mnt = MountObj::new_from_fd(fd);
-				match mnt.setattr(attrs, existing_attrs) {
+				match mnt.setattr(attrs, existing_attrs, 0) {
 					Ok(()) => 0,
 					Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
 				}
