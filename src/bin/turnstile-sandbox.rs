@@ -1,6 +1,6 @@
 use std::{
 	env,
-	ffi::{CStr, CString},
+	ffi::{CStr, CString, OsString},
 	process::Command,
 	sync::{Arc, OnceLock},
 	thread::{self, sleep},
@@ -27,7 +27,7 @@ struct Cli {
 
 	/// Program to run and its arguments
 	#[arg(required = true)]
-	command: Vec<String>,
+	command: Vec<OsString>,
 }
 
 #[derive(Debug)]
