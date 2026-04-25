@@ -940,8 +940,8 @@ impl BindMountSandbox {
 
 #[derive(Debug, Clone)]
 pub struct ManagedMountPoint {
-	host_path: CString,
-	attrs: MountAttributes,
+	pub host_path: CString,
+	pub attrs: MountAttributes,
 }
 
 /// Implements a bind-mount based sandbox that automatically mount and
@@ -949,14 +949,14 @@ pub struct ManagedMountPoint {
 #[derive(Debug)]
 pub struct ManagedBindMountSandbox {
 	sandbox: BindMountSandbox,
-	current_mount_tree: FsTree<Option<ManagedMountPoint>>,
+	current_mount_tree: FsTree<ManagedMountPoint>,
 }
 
 impl ManagedBindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
 		Ok(Self {
 			sandbox: BindMountSandbox::new(disable_userns)?,
-			current_mount_tree: FsTree::new(None),
+			current_mount_tree: FsTree::new(),
 		})
 	}
 
@@ -964,10 +964,16 @@ impl ManagedBindMountSandbox {
 		&mut self,
 		desired_mounts: impl IntoIterator<Item = (&'a OsStr, ManagedMountPoint)>,
 	) -> Result<(), BindMountSandboxError> {
-		let mut desired_tree = FsTree::new(None);
+		let mut desired_tree = FsTree::new();
 		for (path, mnt) in desired_mounts {
-			let e = desired_tree.insert(path, |_| None);
-			*e = Some(mnt);
+			if path.as_encoded_bytes().contains(&0) {
+				return Err(BindMountSandboxError::InvalidSandboxPath(
+					"path contains NUL byte",
+					CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
+						.expect("debug format should not contain NUL byte"),
+				));
+			}
+			desired_tree.insert(path, mnt);
 		}
 		let mut new_tree_state = self.current_mount_tree.clone();
 		let mut err: Option<BindMountSandboxError> = None;
@@ -977,65 +983,46 @@ impl ManagedBindMountSandbox {
 				if err.is_some() {
 					return;
 				}
-				let ns_path =
-					CString::new(sandbox_path.as_encoded_bytes()).expect("path contains NUL byte");
+				let ns_path = CString::new(sandbox_path.as_encoded_bytes())
+					.expect("we checked for NUL bytes earlier");
 				match diff {
-					crate::fstree::DiffTree::Removed(old) => {
-						if old.is_some() {
-							if let Err(e) = self.sandbox.unmount(&ns_path) {
-								err = Some(e);
-								return;
-							}
-							*new_tree_state
-								.get_mut(sandbox_path)
-								.expect("we have not removed it yet") = None;
-						}
-						if let Err(e) = self.sandbox.remove_placeholder(&ns_path) {
+					crate::fstree::DiffTree::Removed(_) => {
+						if let Err(e) = self.sandbox.unmount(&ns_path) {
 							err = Some(e);
 							return;
 						}
 						new_tree_state.remove(sandbox_path);
+						if let Err(e) = self.sandbox.remove_placeholder(&ns_path) {
+							err = Some(e);
+							return;
+						}
 					}
 					crate::fstree::DiffTree::Added(new) => {
-						if let Some(new) = new {
-							let mut b = self
-								.sandbox
-								.mount_host_into_sandbox(&new.host_path, &ns_path);
-							b.attributes(new.attrs);
-							if let Err(e) = b.mount() {
-								err = Some(e);
-								return;
-							}
-							*new_tree_state.insert(sandbox_path, |_| None) = Some(new.clone());
-						} else {
-							// placeholder dir - we will create it later
-							// when we walk to the mount
+						let mut b = self
+							.sandbox
+							.mount_host_into_sandbox(&new.host_path, &ns_path);
+						b.attributes(new.attrs);
+						if let Err(e) = b.mount() {
+							err = Some(e);
+							return;
 						}
+						new_tree_state.insert(sandbox_path, new.clone());
 					}
-					crate::fstree::DiffTree::Updated(old, new) => match (old, new) {
-						(Some(old), Some(new)) => {
-							assert_eq!(old.host_path, new.host_path);
-							if let Err(e) =
-								self.sandbox.set_mount_attr(&ns_path, new.attrs, old.attrs)
-							{
-								err = Some(e);
-								return;
-							}
-							*new_tree_state
-								.get_mut(sandbox_path)
-								.expect("we must have it from before") = Some(new.clone());
+					crate::fstree::DiffTree::Updated(old, new) => {
+						assert_eq!(old.host_path, new.host_path);
+						if let Err(e) = self.sandbox.set_mount_attr(&ns_path, new.attrs, old.attrs)
+						{
+							err = Some(e);
+							return;
 						}
-						(None, None) => (),
-						_ => unreachable!(),
-					},
+						*new_tree_state
+							.get_mut(sandbox_path)
+							.expect("we must have it from before") = new.clone();
+					}
 				}
 			},
-			|_, old, new| match (old, new) {
-				(Some(old), Some(new)) => old.host_path != new.host_path,
-				(Some(_), None) => true,
-				(None, Some(_)) => true,
-				(None, None) => false,
-			},
+			|_, old, new| old.host_path != new.host_path,
+			true,
 		);
 		self.current_mount_tree = new_tree_state;
 		match err {
@@ -1053,11 +1040,10 @@ impl ManagedBindMountSandbox {
 		validate_sandbox_path(path)?;
 		match self
 			.current_mount_tree
-			.find(OsStr::from_bytes(path.to_bytes()), |_, x| x.is_some())
+			.find(OsStr::from_bytes(path.to_bytes()), |_, _| true)
 		{
 			None => return Ok(false),
 			Some((_, mnt)) => {
-				let mnt = mnt.as_ref().unwrap();
 				if need_write && mnt.attrs.readonly {
 					return Ok(false);
 				}
