@@ -983,8 +983,9 @@ impl ManagedBindMountSandbox {
 				if err.is_some() {
 					return;
 				}
-				let ns_path = CString::new(sandbox_path.as_encoded_bytes())
-					.expect("we checked for NUL bytes earlier");
+				let mut ns_path = vec![b'/'];
+				ns_path.extend_from_slice(sandbox_path.as_encoded_bytes());
+				let ns_path = CString::new(ns_path).expect("we checked for NUL bytes earlier");
 				match diff {
 					crate::fstree::DiffTree::Removed(_) => {
 						if let Err(e) = self.sandbox.unmount(&ns_path) {

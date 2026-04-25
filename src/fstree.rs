@@ -124,32 +124,42 @@ fn test_path_to_components() {
 				}
 				let expected_is_last = i == expected.len() - 1;
 				assert_eq!(component.is_last(), expected_is_last);
-				assert_eq!(
-					component.remaining,
-					OsStr::new(&test_path[component.path_from_root.len()..])
-				);
+				if !expected_is_last {
+					assert_eq!(
+						component.remaining,
+						OsStr::new(&test_path[component.path_from_root.len() + 1..])
+					);
+				} else {
+					assert!(
+						component
+							.remaining
+							.as_encoded_bytes()
+							.iter()
+							.all(|&b| b == b'/')
+					);
+				}
 			}
 		}
 	}
 
 	test_case(&["", "/", "//", "///", "////"], &[], &[]);
+	test_case(&["foo", "foo/", "foo//"], &["foo"], &["foo"]);
+	test_case(&["/foo"], &["foo"], &["/foo"]);
+	test_case(&["//foo/", "//foo//"], &["foo"], &["//foo"]);
 	test_case(
-		&[
-			"foo", "/foo", "foo/", "/foo/", "/foo//", "//foo/", "//foo", "foo//",
-		],
-		&["foo"],
-		&["foo"],
-	);
-	test_case(
-		&[
-			"foo/bar",
-			"/foo/bar",
-			"foo/bar/",
-			"/foo/bar/",
-			"//foo//bar//",
-		],
+		&["foo/bar", "foo/bar/"],
 		&["foo", "bar"],
 		&["foo", "foo/bar"],
+	);
+	test_case(
+		&["/foo/bar", "/foo/bar/", "/foo/bar//"],
+		&["foo", "bar"],
+		&["/foo", "/foo/bar"],
+	);
+	test_case(
+		&["/foo//bar", "/foo//bar//"],
+		&["foo", "bar"],
+		&["/foo", "/foo//bar"],
 	);
 }
 
@@ -171,10 +181,21 @@ pub struct FsTree<T> {
 	root: FsTreeNode<T>,
 }
 
-pub enum DiffTree<'a, T1, T2> {
-	Updated(&'a T1, &'a T2),
-	Added(&'a T2),
-	Removed(&'a T1),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiffTree<T1, T2> {
+	Updated(T1, T2),
+	Added(T2),
+	Removed(T1),
+}
+
+impl<'a, 'b, T1: Clone, T2: Clone> DiffTree<&'a T1, &'b T2> {
+	pub fn cloned(&self) -> DiffTree<T1, T2> {
+		match self {
+			&DiffTree::Updated(t1, t2) => DiffTree::Updated(t1.clone(), t2.clone()),
+			&DiffTree::Added(t2) => DiffTree::Added(t2.clone()),
+			&DiffTree::Removed(t1) => DiffTree::Removed(t1.clone()),
+		}
+	}
 }
 
 impl<T> FsTree<T> {
@@ -221,9 +242,13 @@ impl<T> FsTree<T> {
 	/// the last level for which the predicate returned true, or None if
 	/// the predicate returns false for all levels of the path.
 	///
-	/// For each level, the predicate is given an absolute path and a
-	/// reference to the data stored for the path corresponding to the
-	/// current level.
+	/// For each level, the predicate is given a prefix extracted from the
+	/// `path` argument, and a reference to the data stored for the path
+	/// corresponding to the current level.
+	///
+	/// If the path given starts with a slash, the path given to the
+	/// predicate and the return value will both have a leading slash,
+	/// otherwise, neither will have a leading slash.
 	pub fn find<'a, P: FnMut(&'a OsStr, &T) -> bool>(
 		&self,
 		path: &'a OsStr,
@@ -231,10 +256,15 @@ impl<T> FsTree<T> {
 	) -> Option<(&'a OsStr, &T)> {
 		let mut current = &self.root;
 		let mut last_matching: Option<(&'a OsStr, &T)> = None;
+		let root = if path.as_encoded_bytes().get(0).copied() == Some(b'/') {
+			OsStr::new("/")
+		} else {
+			OsStr::new("")
+		};
 		if let Some(root_data) = &current.data
-			&& predicate(OsStr::new(""), root_data)
+			&& predicate(root, root_data)
 		{
-			last_matching = Some((OsStr::new(""), root_data));
+			last_matching = Some((root, root_data));
 		}
 		for comp in path_to_components(path) {
 			if let Some(v) = current.children.get(comp.name) {
@@ -312,22 +342,73 @@ impl<T> FsTree<T> {
 	/// Walks the tree in top-down order, e.g. /, /foo, /foo/bar, /baz,
 	/// calling the given function for any paths that exists in the tree.
 	/// Iteration order for entries of the same directory is arbitrary.
-	pub fn walk_top_down<F: FnMut(&OsStr, &T)>(&self, f: F) {
-		self.walk_impl(f, true, &mut Vec::new(), &self.root);
+	///
+	/// ## Example
+	///
+	/// ```
+	/// use libturnstile::fstree::FsTree;
+	/// use std::ffi::{OsStr, OsString};
+	/// let mut tree = FsTree::new();
+	/// tree.insert(OsStr::new("/foo"), 1);
+	/// tree.insert(OsStr::new("/foo/bar"), 2);
+	/// tree.insert(OsStr::new("/dev/baz"), 3);
+	/// let mut result = Vec::new();
+	/// tree.walk_top_down(|path, data| result.push(path.to_str().unwrap().to_string()));
+	/// if result[0] == "/foo" {
+	///     assert_eq!(result, &[
+	///         "/foo",
+	///         "/foo/bar",
+	///         "/dev/baz",
+	///     ]);
+	/// } else {
+	///     assert_eq!(result, &[
+	///         "/dev/baz",
+	///         "/foo",
+	///         "/foo/bar",
+	///     ]);
+	/// }
+	/// ```
+	pub fn walk_top_down<F: FnMut(&OsStr, &T)>(&self, mut f: F) {
+		self.walk_impl(&mut f, true, &mut vec![b'/'], &self.root);
 	}
 
 	/// Walks the tree in bottom-up order, e.g. /foo/bar, /foo, /baz, /,
 	/// calling the given function for any paths that exists in the tree.
 	/// Iteration order for entries of the same directory is arbitrary.
-	pub fn walk_bottom_up<F: FnMut(&OsStr, &T)>(&self, f: F) {
-		self.walk_impl(f, false, &mut Vec::new(), &self.root);
+	///
+	/// ## Example
+	///
+	/// ```
+	/// use libturnstile::fstree::FsTree;
+	/// use std::ffi::OsStr;
+	/// let mut tree = FsTree::new();
+	/// tree.insert(OsStr::new("/foo"), 1);
+	/// tree.insert(OsStr::new("/foo/bar"), 2);
+	/// tree.insert(OsStr::new("/dev/baz"), 3);
+	/// let mut result = Vec::new();
+	/// tree.walk_bottom_up(|path, data| result.push(path.to_str().unwrap().to_string()));
+	/// if result[0] == "/foo/bar" {
+	///     assert_eq!(result, &[
+	///         "/foo/bar",
+	///         "/foo",
+	///         "/dev/baz",
+	///     ]);
+	/// } else {
+	///     assert_eq!(result, &[
+	///         "/dev/baz",
+	///         "/foo/bar",
+	///         "/foo",
+	///     ]);
+	/// }
+	pub fn walk_bottom_up<F: FnMut(&OsStr, &T)>(&self, mut f: F) {
+		self.walk_impl(&mut f, false, &mut vec![b'/'], &self.root);
 	}
 
 	/// path is a scratch buffer that this function can change, but must
 	/// restore to the original data on return.
 	fn walk_impl<F: FnMut(&OsStr, &T)>(
 		&self,
-		mut f: F,
+		f: &mut F,
 		top_down: bool,
 		path: &mut Vec<u8>,
 		node: &FsTreeNode<T>,
@@ -336,23 +417,14 @@ impl<T> FsTree<T> {
 			f(OsStr::from_bytes(path), data);
 		}
 
-		#[cfg(debug_assertions)]
-		let mut sorted_vec = node.children.iter().collect::<Vec<_>>();
-		#[cfg(debug_assertions)]
-		sorted_vec.sort_unstable_by_key(|(k, _)| *k);
-		#[cfg(debug_assertions)]
-		let iter = sorted_vec.iter();
-
-		#[cfg(not(debug_assertions))]
 		let iter = node.children.iter();
-
 		for (comp, child) in iter {
 			let orig_path_len = path.len();
-			if !path.is_empty() {
+			if path.last().copied() != Some(b'/') {
 				path.push(b'/');
 			}
 			path.extend_from_slice(comp.as_bytes());
-			self.walk_impl(&mut f, top_down, path, child);
+			self.walk_impl(f, top_down, path, child);
 			path.truncate(orig_path_len);
 		}
 		if !top_down && let Some(data) = &node.data {
@@ -382,7 +454,37 @@ impl<T> FsTree<T> {
 	/// the two sides are treated as completely separate paths and no
 	/// [`DiffTree::Updated`] entries are produced for any children of the
 	/// parent in question,
-	pub fn diff<T2, F: FnMut(&OsStr, DiffTree<T, T2>), S: FnMut(&OsStr, &T, &T2) -> bool>(
+	///
+	/// ## Example
+	///
+	/// ```
+	/// use libturnstile::fstree::{DiffTree, FsTree};
+	/// use std::collections::HashSet;
+	/// use std::ffi::OsStr;
+	/// let mut tree1 = FsTree::new();
+	/// tree1.insert(OsStr::new("/foo"), 1);
+	/// tree1.insert(OsStr::new("/foo/bar"), 2);
+	/// tree1.insert(OsStr::new("/dev/baz"), 3);
+	/// let mut tree2 = FsTree::new();
+	/// tree2.insert(OsStr::new("/foo"), 1);
+	/// tree2.insert(OsStr::new("/dev/null"), 4);
+	///
+	/// let mut added = HashSet::new();
+	/// let mut removed = HashSet::new();
+	/// let mut updated = HashSet::new();
+	/// tree1.diff(&tree2, |path, diff| {
+	///   let p = path.to_str().unwrap().to_string();
+	///   match diff {
+	///     DiffTree::Added(_) => { added.insert(p); },
+	///     DiffTree::Removed(_) => { removed.insert(p); },
+	///     DiffTree::Updated(_, _) => { updated.insert(p); },
+	///   }
+	/// }, |_, _, _| false, false);
+	/// assert_eq!(added, HashSet::from(["/dev/null".to_string()]));
+	/// assert_eq!(removed, HashSet::from(["/foo/bar".to_string(), "/dev/baz".to_string()]));
+	/// assert_eq!(updated, HashSet::from(["/foo".to_string()]));
+	/// ```
+	pub fn diff<T2, F: FnMut(&OsStr, DiffTree<&T, &T2>), S: FnMut(&OsStr, &T, &T2) -> bool>(
 		&self,
 		other: &FsTree<T2>,
 		mut f: F,
@@ -391,7 +493,7 @@ impl<T> FsTree<T> {
 	) {
 		self.diff_impl(
 			other,
-			|path, t1, t2| {
+			&mut |path, t1, t2| {
 				let diff = match (t1, t2) {
 					(Some(t1), Some(t2)) => DiffTree::Updated(t1, t2),
 					(Some(t1), None) => DiffTree::Removed(t1),
@@ -400,7 +502,7 @@ impl<T> FsTree<T> {
 				};
 				f(path, diff);
 			},
-			|path, t1, t2| {
+			&mut |path, t1, t2| {
 				if let Some(t1) = t1
 					&& let Some(t2) = t2
 				{
@@ -409,7 +511,7 @@ impl<T> FsTree<T> {
 					split_on_one_side
 				}
 			},
-			&mut Vec::new(),
+			&mut vec![b'/'],
 			&self.root,
 			&other.root,
 		);
@@ -424,8 +526,8 @@ impl<T> FsTree<T> {
 	>(
 		&self,
 		other: &FsTree<T2>,
-		mut f: F,
-		mut split_on: S,
+		f: &mut F,
+		split_on: &mut S,
 		path: &mut Vec<u8>,
 		node_left: &FsTreeNode<T>,
 		node_right: &FsTreeNode<T2>,
@@ -437,13 +539,13 @@ impl<T> FsTree<T> {
 		);
 		if should_split {
 			self.walk_impl(
-				|path, left| f(path, Some(left), None),
+				&mut |path, left| f(path, Some(left), None),
 				false,
 				path,
 				node_left,
 			);
 			other.walk_impl(
-				|path, right| f(path, None, Some(right)),
+				&mut |path, right| f(path, None, Some(right)),
 				true,
 				path,
 				node_right,
@@ -473,12 +575,12 @@ impl<T> FsTree<T> {
 			// common paths under them, therefore we use walk_impl to do a
 			// one-sided walk.
 			let orig_path_len = path.len();
-			if !path.is_empty() {
+			if path.last().copied() != Some(b'/') {
 				path.push(b'/');
 			}
 			path.extend_from_slice(name.as_bytes());
 			self.walk_impl(
-				|path, left| f(path, Some(left), None),
+				&mut |path, left| f(path, Some(left), None),
 				false,
 				path,
 				&node_left.children[name],
@@ -487,14 +589,14 @@ impl<T> FsTree<T> {
 		}
 		for &name in common {
 			let orig_path_len = path.len();
-			if !path.is_empty() {
+			if path.last().copied() != Some(b'/') {
 				path.push(b'/');
 			}
 			path.extend_from_slice(name.as_bytes());
 			self.diff_impl(
 				other,
-				&mut f,
-				&mut split_on,
+				f,
+				split_on,
 				path,
 				&node_left.children[name],
 				&node_right.children[name],
@@ -506,12 +608,12 @@ impl<T> FsTree<T> {
 			// common paths under them, therefore we use walk_impl to do a
 			// one-sided walk.
 			let orig_path_len = path.len();
-			if !path.is_empty() {
+			if path.last().copied() != Some(b'/') {
 				path.push(b'/');
 			}
 			path.extend_from_slice(name.as_bytes());
 			other.walk_impl(
-				|path, right| f(path, None, Some(right)),
+				&mut |path, right| f(path, None, Some(right)),
 				true,
 				path,
 				&node_right.children[name],
