@@ -341,7 +341,18 @@ impl TurnstileTracer {
 	/// This function can only be called once, and is also mutually
 	/// exclusive with [`Self::run_command`].
 	pub fn install_filters(&self, send_to_parent: bool) -> Result<(), TurnstileTracerError> {
-		let [parent_sock, child_sock] = self.notify_fd_state.take_sock_pair();
+		// FIXME:
+		// ideally the following line should say:
+		//
+		// let [parent_sock, child_sock] = self.notify_fd_state.take_sock_pair();
+		//
+		// however, this makes it impractical to use this interface with
+		// std::process::Command, because the caller would have to call
+		// Self::receive_notify_fd() on another thread before calling
+		// Command::spawn(), but if the other thread takes the sock_pair
+		// away from self.notify_fd_state before the fork is done,
+		// install_filters() (in the pre_exec) would no longer work.
+		let [parent_sock, child_sock] = self.notify_fd_state.sock_pair.get();
 		let ctx_ptr = self.filter_ctx.as_ptr();
 		unsafe {
 			let notify_fd = install_filters_impl(ctx_ptr, parent_sock, child_sock, send_to_parent)?;
@@ -360,11 +371,14 @@ impl TurnstileTracer {
 	/// This function can only be called once, and is also mutually
 	/// exclusive with [`Self::run_command`].
 	pub fn receive_notify_fd(&self) -> Result<(), TurnstileTracerError> {
-		let [parent_sock, child_sock] = self.notify_fd_state.take_sock_pair();
+		// Ideally this will use take_sock_pair(), but due to the issue
+		// commented in install_filters() above, doing so doesn't work.
+		let [parent_sock, child_sock] = self.notify_fd_state.sock_pair.get();
 		unsafe {
 			libc::close(child_sock);
 		}
 		let received_fd = unix_recv_fd(parent_sock);
+		self.notify_fd_state.take_sock_pair();
 		unsafe {
 			libc::close(parent_sock);
 		}
