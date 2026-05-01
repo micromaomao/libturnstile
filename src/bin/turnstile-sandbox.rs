@@ -395,7 +395,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		});
 	}
 	let tracing_thread = thread::spawn(|| tracing_thread(context));
-	let mut res = match context.sandbox.run_command(&mut cmd) {
+	let res = context.sandbox.run_command(&mut cmd);
+	context.tracer.close_child_sock();
+	let mut res = match res {
 		Ok(child) => child,
 		Err(e) => {
 			error!("error running command: {}", e);
