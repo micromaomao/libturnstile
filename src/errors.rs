@@ -55,6 +55,8 @@ pub enum AccessRequestError {
 	OpenFd(String, std::io::Error),
 	#[error("Short read from /proc/{0}/mem: expected {1} bytes, got {2}")]
 	ShortReadProcessMemory(u32, usize, usize),
+	#[error("Read from /proc/{0}/comm failed: {1}")]
+	ReadPidComm(u32, std::io::Error),
 }
 
 #[derive(Error, Debug)]

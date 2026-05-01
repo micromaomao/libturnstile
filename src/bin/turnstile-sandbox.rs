@@ -156,12 +156,17 @@ fn tracing_thread(context: &'static Context) {
 							{
 								Ok((true, _)) => {}
 								Ok((false, mut existing_mnt)) => {
-									debug!(
-										"need fs permission {}{}{} on {}",
+									info!(
+										"{}[{}] need fs permission {}{}{} on {}",
+										req_ctx
+											.comm()
+											.unwrap_or_else(|_| OsString::from("???"))
+											.to_string_lossy(),
+										req_ctx.pid(),
 										if rwxp.read { "r" } else { "-" },
 										if rwxp.write { "w" } else { "-" },
 										if rwxp.exec { "x" } else { "-" },
-										t_local
+										t_local,
 									);
 									let d = denials.get_mut_or_insert(
 										OsStr::from_bytes(abspath.as_bytes()),
