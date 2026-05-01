@@ -1,17 +1,17 @@
-use libturnstile::fs::{ForeignFd, FsOperation, FsTarget, RwxPermission};
+use clap::Parser;
+use libturnstile::access::fs::{ForeignFd, FsOperation, FsTarget, RwxPermission};
+use libturnstile::{AccessRequestError, TurnstileTracer, access::Operation};
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use std::{env, io};
-
-use clap::Parser;
-use libturnstile::{AccessRequestError, Operation, TurnstileTracer};
 
 use crate::common::{ProcPidFd, handle_child_result};
 
@@ -24,7 +24,7 @@ mod common;
 struct Cli {
 	/// Write output to a file instead of stderr
 	#[arg(short = 'o', value_name = "FILE")]
-	output: Option<String>,
+	output: Option<PathBuf>,
 
 	/// Add timestamps to each output line
 	#[arg(short = 't', long = "timestamps")]
@@ -65,7 +65,7 @@ struct Cli {
 
 	/// Program to trace and its arguments
 	#[arg(required = true)]
-	command: Vec<String>,
+	command: Vec<OsString>,
 }
 
 impl Cli {
