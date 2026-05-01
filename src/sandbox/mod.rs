@@ -361,7 +361,7 @@ impl BindMountSandbox {
 										if err.kind() == io::ErrorKind::AlreadyExists {
 											continue;
 										}
-										return Err(BindMountSandboxError::Mkdir(err));
+										return Err(BindMountSandboxError::Mkdir(comp, err));
 									}
 									debug!("Created directory {:?} in sandbox", comp);
 								}
@@ -377,7 +377,7 @@ impl BindMountSandbox {
 										if err.kind() == io::ErrorKind::IsADirectory {
 											continue;
 										}
-										return Err(BindMountSandboxError::Mkfile(err));
+										return Err(BindMountSandboxError::Mkfile(comp, err));
 									}
 									libc::close(ret);
 									debug!("Created file {:?} in sandbox", comp);
@@ -471,7 +471,11 @@ impl BindMountSandbox {
 						}
 						continue;
 					}
-					return Err(BindMountSandboxError::Symlinkat(err));
+					return Err(BindMountSandboxError::Symlinkat(
+						linkpath.to_owned(),
+						target.to_owned(),
+						err,
+					));
 				}
 				debug!("Created symlink {:?} -> {:?} in sandbox", linkpath, target);
 				return Ok(());
