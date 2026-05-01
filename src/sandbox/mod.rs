@@ -335,86 +335,29 @@ impl BindMountSandbox {
 		for (i, comp) in components.into_iter().enumerate() {
 			let comp = CString::new(comp).unwrap();
 			let is_leaf = i == len - 1;
-			let newfd = loop {
-				unsafe {
-					let mut openhow: libc::open_how = mem::zeroed();
-					openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-					openhow.resolve = libc::RESOLVE_NO_SYMLINKS;
-					if i == 0 {
-						openhow.resolve |= libc::RESOLVE_IN_ROOT;
-					}
-					let newfd = libc::syscall(
-						libc::SYS_openat2,
-						fd.as_raw_fd(),
-						comp.as_ptr(),
-						&openhow as *const _,
-						std::mem::size_of::<libc::open_how>(),
-					) as libc::c_int;
-					if newfd < 0 {
-						let err = io::Error::last_os_error();
-						if err.kind() == io::ErrorKind::NotFound {
-							match !is_leaf || leaf_is_dir {
-								true => {
-									let ret = libc::mkdirat(fd.as_raw_fd(), comp.as_ptr(), 0o755);
-									if ret != 0 {
-										let err = io::Error::last_os_error();
-										if err.kind() == io::ErrorKind::AlreadyExists {
-											continue;
-										}
-										return Err(BindMountSandboxError::Mkdir(comp, err));
-									}
-									debug!("Created directory {:?} in sandbox", comp);
-								}
-								false => {
-									let ret = libc::openat(
-										fd.as_raw_fd(),
-										comp.as_ptr(),
-										libc::O_CREAT | libc::O_WRONLY | libc::O_NOFOLLOW,
-										0o644,
-									);
-									if ret < 0 {
-										let err = io::Error::last_os_error();
-										if err.kind() == io::ErrorKind::IsADirectory {
-											continue;
-										}
-										return Err(BindMountSandboxError::Mkfile(comp, err));
-									}
-									libc::close(ret);
-									debug!("Created file {:?} in sandbox", comp);
-								}
-							};
-							continue;
-						} else {
-							return Err(BindMountSandboxError::ResolveSandboxPath(err));
-						}
-					} else {
-						let newfd = ForeignFd { local_fd: newfd };
-						let mut stat: libc::stat = std::mem::zeroed();
-						if libc::fstat(newfd.as_raw_fd(), &mut stat) != 0 {
-							let err = io::Error::last_os_error();
-							return Err(BindMountSandboxError::StatSandboxPath(err));
-						}
-						let is_dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
-						let is_regular_file = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
-						let expect_is_dir = !is_leaf || leaf_is_dir;
-						if expect_is_dir && is_dir {
-							break newfd;
-						}
-						if !expect_is_dir && is_regular_file {
-							break newfd;
-						}
-						let ret = libc::unlinkat(
-							fd.as_raw_fd(),
-							comp.as_ptr(),
-							if is_dir { libc::AT_REMOVEDIR } else { 0 },
-						);
-						if ret != 0 {
-							let err = io::Error::last_os_error();
-							return Err(BindMountSandboxError::RemoveSandboxPath(err));
-						}
-						continue;
-					}
+			let want_dir = !is_leaf || leaf_is_dir;
+			let placeholder = placeholder_default_no_metadata(want_dir);
+			create_or_update_placeholder(fd.as_raw_fd(), &comp, &placeholder)?;
+			let newfd = unsafe {
+				let mut openhow: libc::open_how = mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS;
+				if i == 0 {
+					openhow.resolve |= libc::RESOLVE_IN_ROOT;
 				}
+				let raw = libc::syscall(
+					libc::SYS_openat2,
+					fd.as_raw_fd(),
+					comp.as_ptr(),
+					&openhow as *const _,
+					std::mem::size_of::<libc::open_how>(),
+				) as libc::c_int;
+				if raw < 0 {
+					return Err(BindMountSandboxError::ResolveSandboxPath(
+						io::Error::last_os_error(),
+					));
+				}
+				ForeignFd { local_fd: raw }
 			};
 			fd = newfd;
 		}
@@ -440,47 +383,10 @@ impl BindMountSandbox {
 		}
 		let (parent, child) = split_parent_leaf(linkpath);
 		let parent_fd = self.create_placeholder_hierarchy(&parent, true)?;
-		unsafe {
-			loop {
-				let res = libc::symlinkat(target.as_ptr(), parent_fd.as_raw_fd(), child.as_ptr());
-				if res != 0 {
-					let err = io::Error::last_os_error();
-					if err.kind() == io::ErrorKind::AlreadyExists {
-						let mut stat: libc::stat = std::mem::zeroed();
-						if libc::fstatat(
-							parent_fd.as_raw_fd(),
-							child.as_ptr(),
-							&mut stat,
-							libc::AT_SYMLINK_NOFOLLOW,
-						) != 0
-						{
-							let err = io::Error::last_os_error();
-							return Err(BindMountSandboxError::StatSandboxPath(err));
-						}
-						let flag = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-							libc::AT_REMOVEDIR
-						} else {
-							0
-						};
-						// unlinkat never follows symlink on the final
-						// path component
-						let res = libc::unlinkat(parent_fd.as_raw_fd(), child.as_ptr(), flag);
-						if res != 0 {
-							let err = io::Error::last_os_error();
-							return Err(BindMountSandboxError::RemoveSandboxPath(err));
-						}
-						continue;
-					}
-					return Err(BindMountSandboxError::Symlinkat(
-						linkpath.to_owned(),
-						target.to_owned(),
-						err,
-					));
-				}
-				debug!("Created symlink {:?} -> {:?} in sandbox", linkpath, target);
-				return Ok(());
-			}
-		}
+		let placeholder = placeholder_default_symlink(target.to_owned());
+		create_or_update_placeholder(parent_fd.as_raw_fd(), child, &placeholder)?;
+		debug!("Created symlink {:?} -> {:?} in sandbox", linkpath, target);
+		Ok(())
 	}
 
 	/// Remove the given sandbox path from the backing tmpfs, removing
@@ -523,140 +429,9 @@ impl BindMountSandbox {
 			ForeignFd { local_fd: fd }
 		};
 
-		unsafe {
-			let mut stat: libc::stat = std::mem::zeroed();
-			if libc::fstatat(
-				parent_fd.as_raw_fd(),
-				leaf.as_ptr(),
-				&mut stat,
-				libc::AT_SYMLINK_NOFOLLOW,
-			) != 0
-			{
-				let err = io::Error::last_os_error();
-				if err.kind() == io::ErrorKind::NotFound {
-					return Ok(());
-				}
-				return Err(BindMountSandboxError::StatSandboxPath(err));
-			}
-
-			if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-				self.remove_dir_recursive(parent_fd.as_raw_fd(), leaf)?;
-			} else {
-				let res = libc::unlinkat(parent_fd.as_raw_fd(), leaf.as_ptr(), 0);
-				if res != 0 {
-					let err = io::Error::last_os_error();
-					if err.kind() == io::ErrorKind::NotFound {
-						return Ok(());
-					}
-					return Err(BindMountSandboxError::RemoveSandboxPath(err));
-				}
-			}
-		}
+		remove_entry_at(parent_fd.as_raw_fd(), leaf)?;
 
 		debug!("Removed {:?} from sandbox tmpfs", path);
-		Ok(())
-	}
-
-	fn remove_dir_recursive(
-		&self,
-		parent_fd: libc::c_int,
-		name: &CStr,
-	) -> Result<(), BindMountSandboxError> {
-		unsafe {
-			let mut openhow: libc::open_how = mem::zeroed();
-			openhow.flags =
-				(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
-			openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_XDEV;
-			let dir_fd = libc::syscall(
-				libc::SYS_openat2,
-				parent_fd,
-				name.as_ptr(),
-				&openhow as *const _,
-				std::mem::size_of::<libc::open_how>(),
-			) as libc::c_int;
-			if dir_fd < 0 {
-				let err = io::Error::last_os_error();
-				if err.kind() == io::ErrorKind::NotFound {
-					return Ok(());
-				}
-				return Err(BindMountSandboxError::OpenSandboxDir(err));
-			}
-			// dup because fdopendir takes ownership
-			let dir_fd_dup = libc::fcntl(dir_fd, libc::F_DUPFD_CLOEXEC, 0);
-			if dir_fd_dup < 0 {
-				libc::close(dir_fd);
-				let err = io::Error::last_os_error();
-				return Err(BindMountSandboxError::OpenSandboxDir(err));
-			}
-
-			let dir = libc::fdopendir(dir_fd);
-			if dir.is_null() {
-				libc::close(dir_fd);
-				libc::close(dir_fd_dup);
-				let err = io::Error::last_os_error();
-				return Err(BindMountSandboxError::OpenSandboxDir(err));
-			}
-			// dir_fd is now owned by dir
-
-			loop {
-				*libc::__errno_location() = 0;
-				let entry = libc::readdir(dir);
-				if entry.is_null() {
-					let errno = *libc::__errno_location();
-					if errno != 0 {
-						libc::closedir(dir);
-						libc::close(dir_fd_dup);
-						return Err(BindMountSandboxError::OpenSandboxDir(
-							io::Error::from_raw_os_error(errno),
-						));
-					}
-					break;
-				}
-
-				let entry_name = CStr::from_ptr((*entry).d_name.as_ptr());
-				if entry_name == c"." || entry_name == c".." {
-					continue;
-				}
-
-				let mut stat: libc::stat = std::mem::zeroed();
-				if libc::fstatat(
-					dir_fd_dup,
-					entry_name.as_ptr(),
-					&mut stat,
-					libc::AT_SYMLINK_NOFOLLOW,
-				) != 0
-				{
-					let err = io::Error::last_os_error();
-					libc::closedir(dir);
-					libc::close(dir_fd_dup);
-					return Err(BindMountSandboxError::StatSandboxPath(err));
-				}
-
-				if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-					self.remove_dir_recursive(dir_fd_dup, entry_name)?;
-				} else {
-					let res = libc::unlinkat(dir_fd_dup, entry_name.as_ptr(), 0);
-					if res != 0 {
-						let err = io::Error::last_os_error();
-						libc::closedir(dir);
-						libc::close(dir_fd_dup);
-						return Err(BindMountSandboxError::RemoveSandboxPath(err));
-					}
-				}
-			}
-
-			libc::closedir(dir);
-			libc::close(dir_fd_dup);
-
-			let res = libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR);
-			if res != 0 {
-				let err = io::Error::last_os_error();
-				if err.kind() == io::ErrorKind::NotFound {
-					return Ok(());
-				}
-				return Err(BindMountSandboxError::RemoveSandboxPath(err));
-			}
-		}
 		Ok(())
 	}
 
@@ -991,6 +766,476 @@ impl BindMountSandbox {
 pub struct ManagedMountPoint {
 	pub host_path: CString,
 	pub attrs: MountAttributes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedTreeEntry {
+	Placeholder(ManagedPlaceholder),
+	BindMount(ManagedMountPoint),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedPlaceholder {
+	PlaceholderDir(PlaceholderDirData),
+	PlaceholderFile(PlaceholderFileData),
+	PlaceholderSymlink(PlaceholderSymlinkData),
+}
+
+#[derive(Debug, Clone)]
+pub struct CommonPlaceholderData {
+	pub atime: libc::timespec,
+	pub mtime: libc::timespec,
+}
+
+impl PartialEq for CommonPlaceholderData {
+	fn eq(&self, other: &Self) -> bool {
+		self.atime.tv_sec == other.atime.tv_sec
+			&& self.atime.tv_nsec == other.atime.tv_nsec
+			&& self.mtime.tv_sec == other.mtime.tv_sec
+			&& self.mtime.tv_nsec == other.mtime.tv_nsec
+	}
+}
+
+impl Eq for CommonPlaceholderData {}
+
+impl CommonPlaceholderData {
+	pub fn from_stat(stat: &libc::stat) -> Self {
+		Self {
+			atime: libc::timespec {
+				tv_sec: stat.st_atime,
+				tv_nsec: stat.st_atime_nsec as _,
+			},
+			mtime: libc::timespec {
+				tv_sec: stat.st_mtime,
+				tv_nsec: stat.st_mtime_nsec as _,
+			},
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceholderDirData {
+	pub common: CommonPlaceholderData,
+	pub mode: u32,
+}
+
+/// Recursively remove a directory entry, ignoring ENOENT.  Used as the
+/// underlying implementation of [`remove_entry_at`].
+fn remove_dir_recursive_at(
+	parent_fd: libc::c_int,
+	name: &CStr,
+) -> Result<(), BindMountSandboxError> {
+	unsafe {
+		let mut openhow: libc::open_how = mem::zeroed();
+		openhow.flags =
+			(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
+		openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_XDEV;
+		let dir_fd = libc::syscall(
+			libc::SYS_openat2,
+			parent_fd,
+			name.as_ptr(),
+			&openhow as *const _,
+			std::mem::size_of::<libc::open_how>(),
+		) as libc::c_int;
+		if dir_fd < 0 {
+			let err = io::Error::last_os_error();
+			if err.kind() == io::ErrorKind::NotFound {
+				return Ok(());
+			}
+			return Err(BindMountSandboxError::OpenSandboxDir(err));
+		}
+		// dup because fdopendir takes ownership
+		let dir_fd_dup = libc::fcntl(dir_fd, libc::F_DUPFD_CLOEXEC, 0);
+		if dir_fd_dup < 0 {
+			libc::close(dir_fd);
+			let err = io::Error::last_os_error();
+			return Err(BindMountSandboxError::OpenSandboxDir(err));
+		}
+
+		let dir = libc::fdopendir(dir_fd);
+		if dir.is_null() {
+			libc::close(dir_fd);
+			libc::close(dir_fd_dup);
+			let err = io::Error::last_os_error();
+			return Err(BindMountSandboxError::OpenSandboxDir(err));
+		}
+		// dir_fd is now owned by dir
+
+		loop {
+			*libc::__errno_location() = 0;
+			let entry = libc::readdir(dir);
+			if entry.is_null() {
+				let errno = *libc::__errno_location();
+				if errno != 0 {
+					libc::closedir(dir);
+					libc::close(dir_fd_dup);
+					return Err(BindMountSandboxError::OpenSandboxDir(
+						io::Error::from_raw_os_error(errno),
+					));
+				}
+				break;
+			}
+
+			let entry_name = CStr::from_ptr((*entry).d_name.as_ptr());
+			if entry_name == c"." || entry_name == c".." {
+				continue;
+			}
+
+			let mut stat: libc::stat = std::mem::zeroed();
+			if libc::fstatat(
+				dir_fd_dup,
+				entry_name.as_ptr(),
+				&mut stat,
+				libc::AT_SYMLINK_NOFOLLOW,
+			) != 0
+			{
+				let err = io::Error::last_os_error();
+				libc::closedir(dir);
+				libc::close(dir_fd_dup);
+				return Err(BindMountSandboxError::StatSandboxPath(err));
+			}
+
+			if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+				if let Err(e) = remove_dir_recursive_at(dir_fd_dup, entry_name) {
+					libc::closedir(dir);
+					libc::close(dir_fd_dup);
+					return Err(e);
+				}
+			} else {
+				let res = libc::unlinkat(dir_fd_dup, entry_name.as_ptr(), 0);
+				if res != 0 {
+					let err = io::Error::last_os_error();
+					if err.kind() != io::ErrorKind::NotFound {
+						libc::closedir(dir);
+						libc::close(dir_fd_dup);
+						return Err(BindMountSandboxError::RemoveSandboxPath(err));
+					}
+				}
+			}
+		}
+
+		libc::closedir(dir);
+		libc::close(dir_fd_dup);
+
+		let res = libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR);
+		if res != 0 {
+			let err = io::Error::last_os_error();
+			if err.kind() == io::ErrorKind::NotFound {
+				return Ok(());
+			}
+			return Err(BindMountSandboxError::RemoveSandboxPath(err));
+		}
+	}
+	Ok(())
+}
+
+/// Remove an entry at (`parent_fd`, `name`) regardless of its type.
+/// Directories are removed recursively.  Returns `Ok(())` if the entry
+/// (or any intermediate child) is already gone.  Symlinks are never
+/// followed.
+fn remove_entry_at(parent_fd: libc::c_int, name: &CStr) -> Result<(), BindMountSandboxError> {
+	unsafe {
+		let mut stat: libc::stat = mem::zeroed();
+		if libc::fstatat(
+			parent_fd,
+			name.as_ptr(),
+			&mut stat,
+			libc::AT_SYMLINK_NOFOLLOW,
+		) != 0
+		{
+			let err = io::Error::last_os_error();
+			if err.kind() == io::ErrorKind::NotFound {
+				return Ok(());
+			}
+			return Err(BindMountSandboxError::StatSandboxPath(err));
+		}
+		if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+			remove_dir_recursive_at(parent_fd, name)
+		} else {
+			let res = libc::unlinkat(parent_fd, name.as_ptr(), 0);
+			if res != 0 {
+				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
+				return Err(BindMountSandboxError::RemoveSandboxPath(err));
+			}
+			Ok(())
+		}
+	}
+}
+
+/// Create or update a single placeholder entry at (`dirfd`, `name`).
+///
+/// If nothing exists at the path, the entry is created with the
+/// requested type.  If something exists with the wrong type (or, for
+/// symlinks, a wrong target), it is removed (recursively for
+/// directories) and recreated.
+///
+/// After the entry exists with the correct type, its mode is updated
+/// via `fchmodat` (skipped for symlinks since Linux does not allow
+/// changing symlink modes), and timestamps are updated via `utimensat`.
+/// Set both `atime.tv_nsec` and `mtime.tv_nsec` to `UTIME_OMIT` to skip
+/// the timestamp update entirely (useful when this function is used
+/// just to ensure the entry exists with reasonable defaults).
+///
+/// Symlinks are never followed for any operation.
+fn create_or_update_placeholder(
+	dirfd: libc::c_int,
+	name: &CStr,
+	placeholder_data: &ManagedPlaceholder,
+) -> Result<(), BindMountSandboxError> {
+	const MAX_ATTEMPTS: u32 = 2;
+
+	let (common, expected_kind, mode_perms): (
+		&CommonPlaceholderData,
+		libc::mode_t,
+		Option<libc::mode_t>,
+	) = match placeholder_data {
+		ManagedPlaceholder::PlaceholderDir(d) => (
+			&d.common,
+			libc::S_IFDIR,
+			Some((d.mode & 0o7777) as libc::mode_t),
+		),
+		ManagedPlaceholder::PlaceholderFile(f) => (
+			&f.common,
+			libc::S_IFREG,
+			Some((f.mode & 0o7777) as libc::mode_t),
+		),
+		ManagedPlaceholder::PlaceholderSymlink(s) => (&s.common, libc::S_IFLNK, None),
+	};
+
+	let mut attempts: u32 = 0;
+	loop {
+		attempts += 1;
+		if attempts > MAX_ATTEMPTS {
+			return Err(BindMountSandboxError::SandboxPlaceholderConflict(
+				name.to_owned(),
+			));
+		}
+
+		let create_res: libc::c_int;
+		let create_err: io::Error;
+		unsafe {
+			let res = match placeholder_data {
+				ManagedPlaceholder::PlaceholderDir(_) => {
+					libc::mkdirat(dirfd, name.as_ptr(), mode_perms.unwrap())
+				}
+				ManagedPlaceholder::PlaceholderFile(_) => {
+					let fd = libc::openat(
+						dirfd,
+						name.as_ptr(),
+						libc::O_CREAT
+							| libc::O_EXCL | libc::O_WRONLY
+							| libc::O_NOFOLLOW | libc::O_CLOEXEC,
+						mode_perms.unwrap() as libc::c_uint,
+					);
+					if fd < 0 {
+						-1
+					} else {
+						libc::close(fd);
+						0
+					}
+				}
+				ManagedPlaceholder::PlaceholderSymlink(s) => {
+					libc::symlinkat(s.target.as_ptr(), dirfd, name.as_ptr())
+				}
+			};
+			create_res = res;
+			create_err = if res != 0 {
+				io::Error::last_os_error()
+			} else {
+				io::Error::from_raw_os_error(0)
+			};
+		}
+
+		if create_res == 0 {
+			break;
+		}
+
+		if create_err.kind() != io::ErrorKind::AlreadyExists {
+			return Err(match placeholder_data {
+				ManagedPlaceholder::PlaceholderDir(_) => {
+					BindMountSandboxError::Mkdir(name.to_owned(), create_err)
+				}
+				ManagedPlaceholder::PlaceholderFile(_) => {
+					BindMountSandboxError::Mkfile(name.to_owned(), create_err)
+				}
+				ManagedPlaceholder::PlaceholderSymlink(s) => {
+					BindMountSandboxError::Symlinkat(name.to_owned(), s.target.clone(), create_err)
+				}
+			});
+		}
+
+		// EEXIST: stat the existing entry and decide what to do.
+		let mut stat: libc::stat = unsafe { mem::zeroed() };
+		let stat_res =
+			unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
+		if stat_res != 0 {
+			let err = io::Error::last_os_error();
+			if err.kind() == io::ErrorKind::NotFound {
+				// raced; just retry
+				continue;
+			}
+			return Err(BindMountSandboxError::StatSandboxPath(err));
+		}
+
+		let existing_kind = stat.st_mode & libc::S_IFMT;
+		if existing_kind != expected_kind {
+			// wrong type: remove (recursively if dir) and retry.
+			remove_entry_at(dirfd, name)?;
+			continue;
+		}
+
+		// Right type.  For symlinks, also verify the target.
+		if let ManagedPlaceholder::PlaceholderSymlink(s) = placeholder_data {
+			let mut buf = vec![0u8; libc::PATH_MAX as usize];
+			let n = unsafe {
+				libc::readlinkat(dirfd, name.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
+			};
+			if n < 0 {
+				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					continue;
+				}
+				return Err(BindMountSandboxError::Readlink(name.to_owned(), err));
+			}
+			let existing_target = &buf[..n as usize];
+			if existing_target != s.target.to_bytes() {
+				// Wrong target: must unlink (symlinkat is not atomic-replace)
+				// before retrying.  ENOENT is fine (race).
+				let res = unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) };
+				if res != 0 {
+					let err = io::Error::last_os_error();
+					if err.kind() != io::ErrorKind::NotFound {
+						return Err(BindMountSandboxError::RemoveSandboxPath(err));
+					}
+				}
+				continue;
+			}
+		}
+
+		break;
+	}
+
+	// Update mode.  Skipped for symlinks: Linux does not support changing
+	// symlink modes (fchmodat with AT_SYMLINK_NOFOLLOW returns ENOTSUP)
+	// and symlink permissions are meaningless on Linux anyway.
+	if let Some(mode_perms) = mode_perms {
+		let res = unsafe { libc::fchmodat(dirfd, name.as_ptr(), mode_perms, 0) };
+		if res != 0 {
+			return Err(BindMountSandboxError::Chmod(
+				name.to_owned(),
+				io::Error::last_os_error(),
+			));
+		}
+	}
+
+	// Update timestamps unless both are UTIME_OMIT (caller's signal to
+	// leave timestamps untouched).
+	if common.atime.tv_nsec != libc::UTIME_OMIT || common.mtime.tv_nsec != libc::UTIME_OMIT {
+		let times = [common.atime, common.mtime];
+		let res = unsafe {
+			libc::utimensat(
+				dirfd,
+				name.as_ptr(),
+				times.as_ptr(),
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
+		};
+		if res != 0 {
+			return Err(BindMountSandboxError::Utimens(
+				name.to_owned(),
+				io::Error::last_os_error(),
+			));
+		}
+	}
+
+	Ok(())
+}
+
+/// Convenience for callers that just need to ensure an entry exists
+/// with sensible default mode and without touching timestamps.
+fn placeholder_default_no_metadata(kind_is_dir: bool) -> ManagedPlaceholder {
+	let common = CommonPlaceholderData {
+		atime: libc::timespec {
+			tv_sec: 0,
+			tv_nsec: libc::UTIME_OMIT,
+		},
+		mtime: libc::timespec {
+			tv_sec: 0,
+			tv_nsec: libc::UTIME_OMIT,
+		},
+	};
+	if kind_is_dir {
+		ManagedPlaceholder::PlaceholderDir(PlaceholderDirData {
+			common,
+			mode: 0o755,
+		})
+	} else {
+		ManagedPlaceholder::PlaceholderFile(PlaceholderFileData {
+			common,
+			mode: 0o644,
+			len: 0,
+		})
+	}
+}
+
+fn placeholder_default_symlink(target: CString) -> ManagedPlaceholder {
+	ManagedPlaceholder::PlaceholderSymlink(PlaceholderSymlinkData {
+		common: CommonPlaceholderData {
+			atime: libc::timespec {
+				tv_sec: 0,
+				tv_nsec: libc::UTIME_OMIT,
+			},
+			mtime: libc::timespec {
+				tv_sec: 0,
+				tv_nsec: libc::UTIME_OMIT,
+			},
+		},
+		target,
+	})
+}
+
+impl PlaceholderDirData {
+	pub fn from_stat(stat: &libc::stat) -> Self {
+		Self {
+			common: CommonPlaceholderData::from_stat(stat),
+			mode: stat.st_mode,
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceholderFileData {
+	pub common: CommonPlaceholderData,
+	pub mode: u32,
+	pub len: u64,
+}
+
+impl PlaceholderFileData {
+	pub fn from_stat(stat: &libc::stat) -> Self {
+		Self {
+			common: CommonPlaceholderData::from_stat(stat),
+			mode: stat.st_mode,
+			len: stat.st_size as u64,
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceholderSymlinkData {
+	pub common: CommonPlaceholderData,
+	pub target: CString,
+}
+
+impl PlaceholderSymlinkData {
+	pub fn from_stat(stat: &libc::stat, target: CString) -> Self {
+		Self {
+			common: CommonPlaceholderData::from_stat(stat),
+			target,
+		}
+	}
 }
 
 /// Implements a bind-mount based sandbox that automatically mount and
