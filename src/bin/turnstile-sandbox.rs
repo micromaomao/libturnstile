@@ -102,11 +102,24 @@ fn tracing_thread(context: &'static Context) {
 				match request.operation() {
 					Operation::FsOperation(fsop) => {
 						let rwxps = fsop.as_rwx_permissions();
+						if req_ctx.still_valid().ok() != Some(true) {
+							debug!("request is no longer valid");
+							continue;
+						}
 						for rwxp in rwxps {
+							macro_rules! check_req_valid {
+								() => {
+									if req_ctx.still_valid().ok() != Some(true) {
+										debug!("request is no longer valid");
+										break;
+									}
+								};
+							}
 							let t_local =
 								match rwxp.target.in_root(resolve_sandbox_root.as_raw_fd()) {
 									Ok(t) => t,
 									Err(e) => {
+										check_req_valid!();
 										error!(
 											"error reopening target dfd in real root for {}: {}",
 											rwxp, e
@@ -119,6 +132,7 @@ fn tracing_thread(context: &'static Context) {
 							} else {
 								t_local.open_target()
 							};
+							check_req_valid!();
 							if let Err(e) = target_fd {
 								match e.kind() {
 									io::ErrorKind::NotFound => {
@@ -146,6 +160,7 @@ fn tracing_thread(context: &'static Context) {
 									CString::from_vec_with_nul(bytes).unwrap()
 								}
 								Err(e) => {
+									check_req_valid!();
 									error!("error reading link for {}: {}", rwxp, e);
 									break;
 								}
@@ -156,6 +171,7 @@ fn tracing_thread(context: &'static Context) {
 							{
 								Ok((true, _)) => {}
 								Ok((false, mut existing_mnt)) => {
+									check_req_valid!();
 									info!(
 										"{}[{}] need fs permission {}{}{} on {}",
 										req_ctx
@@ -216,6 +232,7 @@ fn tracing_thread(context: &'static Context) {
 									}
 								}
 								Err(e) => {
+									check_req_valid!();
 									error!("error checking if {} is covered: {}", rwxp, e);
 								}
 							}
@@ -225,11 +242,19 @@ fn tracing_thread(context: &'static Context) {
 				}
 				if send_eperm {
 					req_ctx.send_error(-libc::EPERM).unwrap_or_else(|e| {
-						error!("error sending EPERM: {}", e);
+						if req_ctx.still_valid().ok() == Some(true) {
+							error!("error sending EPERM: {}", e);
+						} else {
+							debug!("request is no longer valid");
+						}
 					});
 				} else {
 					req_ctx.send_continue().unwrap_or_else(|e| {
-						error!("error continuing request: {}", e);
+						if req_ctx.still_valid().ok() == Some(true) {
+							error!("error continuing request: {}", e);
+						} else {
+							debug!("request is no longer valid");
+						}
 					});
 				}
 			}
