@@ -120,7 +120,23 @@ fn tracing_thread(context: &'static Context) {
 								t_local.open_target()
 							};
 							if let Err(e) = target_fd {
-								error!("error opening target in real root for {}: {}", rwxp, e);
+								match e.kind() {
+									io::ErrorKind::NotFound => {
+										debug!("target not found for {}: {}", rwxp, e);
+									}
+									io::ErrorKind::PermissionDenied => {
+										debug!(
+											"permission denied opening target for {}: {}",
+											rwxp, e
+										);
+									}
+									_ => {
+										error!(
+											"error opening target in real root for {}: {}",
+											rwxp, e
+										);
+									}
+								}
 								break;
 							}
 							let abspath = match target_fd.unwrap().readlink() {
