@@ -99,6 +99,14 @@ pub enum BindMountSandboxError {
 	Mkfile(CString, #[source] std::io::Error),
 	#[error("Failed to create symlink {0:?} -> {1:?} within sandbox: {2}")]
 	Symlinkat(CString, CString, #[source] std::io::Error),
+	#[error("Failed to chmod {0:?} within sandbox: {1}")]
+	Chmod(CString, #[source] std::io::Error),
+	#[error("Failed to set timestamps on {0:?} within sandbox: {1}")]
+	Utimens(CString, #[source] std::io::Error),
+	#[error("readlink {0:?} within sandbox: {1}")]
+	Readlink(CString, #[source] std::io::Error),
+	#[error("Conflicting concurrent modification while creating placeholder {0:?} within sandbox")]
+	SandboxPlaceholderConflict(CString),
 	#[error("Failed to set attribute on mountpoint within sandbox: {0}")]
 	MountSetAttrsFailed(libc::c_int),
 	#[error("Failed to stat path on host: {0:?}: {1}")]
