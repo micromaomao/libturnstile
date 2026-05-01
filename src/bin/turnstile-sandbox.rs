@@ -57,6 +57,7 @@ struct Cli {
 
 #[derive(Debug, Default)]
 struct DenialLogNode {
+	need_read: bool,
 	need_write: bool,
 	need_exec: bool,
 }
@@ -188,6 +189,7 @@ fn tracing_thread(context: &'static Context) {
 										OsStr::from_bytes(abspath.as_bytes()),
 										DenialLogNode::default,
 									);
+									d.need_read |= rwxp.read;
 									d.need_write |= rwxp.write;
 									d.need_exec |= rwxp.exec;
 									send_eperm = true;
@@ -286,7 +288,8 @@ fn tracing_thread(context: &'static Context) {
 		denials.walk_top_down(|path, val| {
 			write!(
 				stdout,
-				"  r{}{} {:?}\n",
+				"  {}{}{} {:?}\n",
+				if val.need_read { "r" } else { "-" },
 				if val.need_write { "w" } else { "-" },
 				if val.need_exec { "x" } else { "-" },
 				path
