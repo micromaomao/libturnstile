@@ -954,6 +954,7 @@ impl BindMountSandbox {
 		};
 		let new_cwd_cstr = std::ffi::CString::new(new_cwd.as_os_str().as_encoded_bytes())
 			.expect("current directory path contains NUL byte");
+		self.create_placeholder_hierarchy(&new_cwd_cstr, true)?;
 		unsafe {
 			let nsenter_fn = self.namespaces.nsenter_fn(true, true, true, true);
 			cmd.pre_exec(move || restrict_self_impl(&nsenter_fn, Some(&new_cwd_cstr)))
