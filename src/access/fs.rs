@@ -1,15 +1,21 @@
 use std::{
 	borrow::Cow,
-	ffi::{CStr, CString, OsString},
+	ffi::{CStr, CString, OsStr, OsString},
 	io,
-	os::unix::{ffi::OsStringExt, io::AsRawFd},
+	os::{
+		fd::IntoRawFd,
+		unix::{
+			ffi::{OsStrExt, OsStringExt},
+			io::AsRawFd,
+		},
+	},
 };
 
 use crate::{AccessRequestError, syscalls::RequestContext};
 
 use smallvec::{SmallVec, smallvec};
 
-use log::debug;
+use log::{debug, error};
 
 /// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
 /// refers to a path in the traced process's filesystem namespace.
@@ -66,6 +72,14 @@ impl ForeignFd {
 impl AsRawFd for ForeignFd {
 	fn as_raw_fd(&self) -> libc::c_int {
 		self.local_fd
+	}
+}
+
+impl IntoRawFd for ForeignFd {
+	fn into_raw_fd(self) -> libc::c_int {
+		let fd = self.local_fd;
+		std::mem::forget(self);
+		fd
 	}
 }
 
@@ -246,6 +260,45 @@ impl FsTarget {
 		Ok(ForeignFd { local_fd: fd })
 	}
 
+	fn open_target_dfd_in_root(&self, root: libc::c_int) -> Result<ForeignFd, io::Error> {
+		let mut dfd_path = self.dfd.readlink()?.into_encoded_bytes();
+		dfd_path.push(b'\0');
+		if dfd_path.first().copied() != Some(b'/') {
+			error!(
+				"readlink of dfd did not return an absolute path: {:?} returned",
+				OsStr::from_bytes(&dfd_path)
+			);
+			return Err(io::Error::from_raw_os_error(libc::ENOENT));
+		}
+		let dfd_path = CString::from_vec_with_nul(dfd_path).unwrap();
+		let dfd_in_new_root = unsafe {
+			let mut openhow: libc::open_how = std::mem::zeroed();
+			openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+			openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+			libc::syscall(
+				libc::SYS_openat2,
+				root,
+				dfd_path.as_ptr(),
+				&openhow,
+				std::mem::size_of_val(&openhow),
+			)
+		} as libc::c_int;
+		if dfd_in_new_root < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(ForeignFd {
+			local_fd: dfd_in_new_root,
+		})
+	}
+
+	pub fn in_root(&self, root: libc::c_int) -> Result<Self, io::Error> {
+		Ok(Self {
+			dfd: self.open_target_dfd_in_root(root)?,
+			path: self.path.clone(),
+			no_follow: self.no_follow,
+		})
+	}
+
 	/// Opens the parent of the target path with O_PATH, and returns the
 	/// dir fd along with the final component of the path.  This requires
 	/// everything except the final component of the path to exist (which
@@ -289,7 +342,7 @@ impl FsTarget {
 			dir_path = Cow::Owned(CString::new(&p_with_nul[..last_slash + 1]).unwrap());
 			filename = CStr::from_bytes_with_nul(&p_with_nul[last_slash + 1..]).unwrap();
 		} else {
-			dir_path = Cow::Borrowed(CStr::from_bytes_with_nul(b"./\0").unwrap());
+			dir_path = Cow::Borrowed(c"./");
 			filename = CStr::from_bytes_with_nul(p_with_nul).unwrap();
 			can_skip_open = true;
 		}

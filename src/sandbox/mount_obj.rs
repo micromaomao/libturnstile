@@ -1,4 +1,8 @@
-use std::{ffi::CStr, io, os::fd::AsRawFd};
+use std::{
+	ffi::CStr,
+	io,
+	os::fd::{AsRawFd, IntoRawFd},
+};
 
 use super::{ENABLE_LOG_IN_FORK, MountAttributes};
 use crate::access::fs::ForeignFd;
@@ -93,7 +97,7 @@ impl MountObj {
 				return Err(io::Error::from_raw_os_error(err));
 			}
 			let mnt = Self(ForeignFd { local_fd: mnt });
-			mnt.setattr(attrs, MountAttributes::default())?;
+			mnt.setattr(attrs, MountAttributes::default(), libc::MS_SLAVE)?;
 			Ok(mnt)
 		}
 	}
@@ -102,6 +106,7 @@ impl MountObj {
 		&self,
 		attrs: MountAttributes,
 		existing_attr: MountAttributes,
+		propagation: u64,
 	) -> io::Result<()> {
 		unsafe {
 			let mut mount_attr = std::mem::zeroed::<libc::mount_attr>();
@@ -115,6 +120,7 @@ impl MountObj {
 			} else if !attrs.noexec && existing_attr.noexec {
 				mount_attr.attr_clr |= libc::MOUNT_ATTR_NOEXEC;
 			}
+			mount_attr.propagation = propagation;
 			let res = libc::syscall(
 				libc::SYS_mount_setattr,
 				self.0.as_raw_fd(),
@@ -159,5 +165,11 @@ impl MountObj {
 			}
 		}
 		Ok(())
+	}
+}
+
+impl IntoRawFd for MountObj {
+	fn into_raw_fd(self) -> libc::c_int {
+		self.0.into_raw_fd()
 	}
 }

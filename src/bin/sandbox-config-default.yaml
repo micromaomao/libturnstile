@@ -1,0 +1,6 @@
+rules:
+  /usr: rx
+  /bin: rx
+  /lib: rx
+  /lib64: rx
+  /proc: r

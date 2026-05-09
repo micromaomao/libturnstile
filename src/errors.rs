@@ -55,6 +55,8 @@ pub enum AccessRequestError {
 	OpenFd(String, std::io::Error),
 	#[error("Short read from /proc/{0}/mem: expected {1} bytes, got {2}")]
 	ShortReadProcessMemory(u32, usize, usize),
+	#[error("Read from /proc/{0}/comm failed: {1}")]
+	ReadPidComm(u32, std::io::Error),
 }
 
 #[derive(Error, Debug)]
@@ -81,6 +83,8 @@ pub enum BindMountSandboxError {
 	MakeDetachedTmpfsMountFailed(libc::c_int),
 	#[error("Failed to receive mount object fd from child: {0}")]
 	ReceiveMountFd(std::io::Error),
+	#[error("Failed to open root in sandbox namespace: errno {0}")]
+	OpenRootInSandboxFailed(libc::c_int),
 	#[error("mount failed: errno {0}")]
 	MountFailed(libc::c_int),
 	#[error("Failed to open path within sandbox: {0}")]
@@ -89,12 +93,20 @@ pub enum BindMountSandboxError {
 	OpenSandboxDir(#[source] std::io::Error),
 	#[error("Failed to open path on host: {0:?}: {1}")]
 	ResolveHostPath(CString, #[source] std::io::Error),
-	#[error("Failed to mkdir within sandbox: {0}")]
-	Mkdir(#[source] std::io::Error),
-	#[error("Failed to create file for mountpoint within sandbox: {0}")]
-	Mkfile(#[source] std::io::Error),
-	#[error("Failed to create symlink within sandbox: {0}")]
-	Symlinkat(#[source] std::io::Error),
+	#[error("Failed to mkdir {0:?} within sandbox: {1}")]
+	Mkdir(CString, #[source] std::io::Error),
+	#[error("Failed to create file {0:?} within sandbox: {1}")]
+	Mkfile(CString, #[source] std::io::Error),
+	#[error("Failed to create symlink {0:?} -> {1:?} within sandbox: {2}")]
+	Symlinkat(CString, CString, #[source] std::io::Error),
+	#[error("Failed to chmod {0:?} within sandbox: {1}")]
+	Chmod(CString, #[source] std::io::Error),
+	#[error("Failed to set timestamps on {0:?} within sandbox: {1}")]
+	Utimens(CString, #[source] std::io::Error),
+	#[error("readlink {0:?} within sandbox: {1}")]
+	Readlink(CString, #[source] std::io::Error),
+	#[error("Conflicting concurrent modification while creating placeholder {0:?} within sandbox")]
+	SandboxPlaceholderConflict(CString),
 	#[error("Failed to set attribute on mountpoint within sandbox: {0}")]
 	MountSetAttrsFailed(libc::c_int),
 	#[error("Failed to stat path on host: {0:?}: {1}")]

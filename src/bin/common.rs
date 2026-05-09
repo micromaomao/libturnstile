@@ -37,7 +37,7 @@ impl ProcPidFd {
 			unsafe { libc::openat(pidfd, c"status".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
 		if status_fd < 0 {
 			let errno = unsafe { libc::__errno_location().read() };
-			if errno == libc::ENOENT {
+			if errno == libc::ENOENT || errno == libc::ESRCH {
 				// The process has already exited and its pidfd is now a zombie.
 				return Ok(false);
 			} else {
