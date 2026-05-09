@@ -285,19 +285,41 @@ fn tracing_thread(context: &'static Context) {
 		}
 	}
 	if !denials.is_empty() {
-		let mut stdout = std::io::stdout().lock();
-		write!(stdout, "Denials:\n").unwrap();
+		let mut rules: std::collections::BTreeMap<String, String> =
+			std::collections::BTreeMap::new();
 		denials.walk_top_down(|path, val| {
-			write!(
-				stdout,
-				"  {}{}{} {:?}\n",
-				if val.need_read { "r" } else { "-" },
-				if val.need_write { "w" } else { "-" },
-				if val.need_exec { "x" } else { "-" },
-				path
-			)
-			.unwrap();
+			let mut perms = String::new();
+			if val.need_read {
+				perms.push('r');
+			}
+			if val.need_write {
+				perms.push('w');
+			}
+			if val.need_exec {
+				perms.push('x');
+			}
+			if perms.is_empty() {
+				// Shouldn't happen, but ensure the rule is still valid.
+				perms.push('r');
+			}
+			// Translate $ to $$ so the path round-trips through the
+			// config's path expander.  Lossy UTF-8 conversion is used for
+			// the rare case of non-UTF-8 paths since YAML strings are
+			// fundamentally Unicode; serde_yaml_ng will handle quoting and
+			// escaping the resulting string for arbitrary code points.
+			let path_str = path.to_string_lossy().replace('$', "$$");
+			rules.insert(path_str, perms);
 		});
+		// Wrap in a top-level `rules:` map so the output can be copy-pasted
+		// directly into a config file.
+		#[derive(serde::Serialize)]
+		struct DenialsConfig<'a> {
+			rules: &'a std::collections::BTreeMap<String, String>,
+		}
+		let yaml = serde_yaml_ng::to_string(&DenialsConfig { rules: &rules })
+			.expect("serializing String->String map should not fail");
+		let mut stdout = std::io::stdout().lock();
+		write!(stdout, "Denials:\n{}", yaml).unwrap();
 		stdout.flush().unwrap();
 	}
 }
