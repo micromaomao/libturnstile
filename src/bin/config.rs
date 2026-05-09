@@ -137,7 +137,6 @@ pub fn expand_path(input: &str) -> Result<Vec<u8>, ConfigError> {
 		while j < bytes.len() && is_var_char(bytes[j]) {
 			j += 1;
 		}
-		// SAFETY: var name chars are all ASCII, so this slice is valid UTF-8.
 		let name = std::str::from_utf8(&bytes[i + 1..j]).expect("ascii slice");
 		match std::env::var_os(name) {
 			Some(val) => out.extend_from_slice(val.as_bytes()),
@@ -212,10 +211,7 @@ impl Config {
 			let attrs = parse_permissions(permissions)?;
 			out.push(ResolvedMount {
 				sandbox_path: OsString::from_vec(sandbox_bytes),
-				mount: ManagedMountPoint {
-					host_path,
-					attrs,
-				},
+				mount: ManagedMountPoint { host_path, attrs },
 			});
 		}
 		Ok(out)
