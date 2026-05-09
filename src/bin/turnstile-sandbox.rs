@@ -298,10 +298,6 @@ fn tracing_thread(context: &'static Context) {
 			if val.need_exec {
 				perms.push('x');
 			}
-			if perms.is_empty() {
-				// Shouldn't happen, but ensure the rule is still valid.
-				perms.push('r');
-			}
 			// Translate $ to $$ so the path round-trips through the
 			// config's path expander.  Lossy UTF-8 conversion is used for
 			// the rare case of non-UTF-8 paths since YAML strings are
@@ -346,7 +342,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cfg = Config::load(&cli.config)?;
 	let resolved_mounts = cfg.resolve_mounts()?;
 	if resolved_mounts.is_empty() {
-		info!("config file {:?} has no rules; sandbox will start empty", cli.config);
+		info!(
+			"config file {:?} has no rules; sandbox will start empty",
+			cli.config
+		);
 	}
 	context.sandbox.update_mounts_from_list(
 		resolved_mounts
