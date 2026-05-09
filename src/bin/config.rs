@@ -87,7 +87,8 @@ pub fn parse_permissions(s: &str) -> Result<MountAttributes, ConfigError> {
 			'r' => {}
 			'w' => readonly = false,
 			'x' => noexec = false,
-			_ => return Err(ConfigError::InvalidPermission(s.to_string())),
+			// todo: remove later when we have resolve-only access
+			_ => {}
 		}
 	}
 	Ok(MountAttributes { readonly, noexec })
