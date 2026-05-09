@@ -3,6 +3,7 @@ use log::{debug, error};
 /// Send a file descriptor to another process via a Unix socket using
 /// SCM_RIGHTS.  This function can safely be used in pre_exec context
 pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
+	assert!(sock >= 0);
 	// Use a [u64] buffer to ensure 8-byte alignment required by cmsghdr.
 	const CMSG_SPACE: usize =
 		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };

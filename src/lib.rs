@@ -10,6 +10,7 @@
 
 pub mod access;
 mod errors;
+pub mod fstree;
 mod sandbox;
 mod syscalls;
 mod tracer;

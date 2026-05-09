@@ -52,6 +52,8 @@ unsafe fn install_filters_impl(
 	child_sock: libc::c_int,
 	send_to_parent: bool,
 ) -> Result<Option<ScmpFd>, TurnstileTracerError> {
+	assert!(parent_sock >= 0);
+	assert!(child_sock >= 0);
 	unsafe {
 		let rc = libseccomp_sys::seccomp_load(ctx_ptr);
 		if rc != 0 {
@@ -112,6 +114,8 @@ unsafe impl Sync for TracerNotifyFdState {}
 
 impl TracerNotifyFdState {
 	fn new(sock_pair: [libc::c_int; 2]) -> Self {
+		assert!(sock_pair[0] >= 0);
+		assert!(sock_pair[1] >= 0);
 		Self {
 			notify_fd: OnceLock::new(),
 			sock_pair: Cell::new(sock_pair),
@@ -340,8 +344,23 @@ impl TurnstileTracer {
 	///
 	/// This function can only be called once, and is also mutually
 	/// exclusive with [`Self::run_command`].
+	///
+	/// The parent should call [`Self::close_child_sock`] after forking
+	/// (or after return from
+	/// [`Command::spawn`](std::process::Command::spawn)).
 	pub fn install_filters(&self, send_to_parent: bool) -> Result<(), TurnstileTracerError> {
-		let [parent_sock, child_sock] = self.notify_fd_state.take_sock_pair();
+		// FIXME:
+		// ideally the following line should say:
+		//
+		// let [parent_sock, child_sock] = self.notify_fd_state.take_sock_pair();
+		//
+		// however, this makes it impractical to use this interface with
+		// std::process::Command, because the caller would have to call
+		// Self::receive_notify_fd() on another thread before calling
+		// Command::spawn(), but if the other thread takes the sock_pair
+		// away from self.notify_fd_state before the fork is done,
+		// install_filters() (in the pre_exec) would no longer work.
+		let [parent_sock, child_sock] = self.notify_fd_state.sock_pair.get();
 		let ctx_ptr = self.filter_ctx.as_ptr();
 		unsafe {
 			let notify_fd = install_filters_impl(ctx_ptr, parent_sock, child_sock, send_to_parent)?;
@@ -360,10 +379,13 @@ impl TurnstileTracer {
 	/// This function can only be called once, and is also mutually
 	/// exclusive with [`Self::run_command`].
 	pub fn receive_notify_fd(&self) -> Result<(), TurnstileTracerError> {
-		let [parent_sock, child_sock] = self.notify_fd_state.take_sock_pair();
-		unsafe {
-			libc::close(child_sock);
-		}
+		// Because this function can race with the child process and we
+		// may get here even before it starts, this function should not be
+		// responsible for closing the child_sock on the parent process.
+		// This is done by the user via calling Self::close_child_sock()
+		// at a point after fork returns.
+		let [parent_sock, _] = self.notify_fd_state.sock_pair.get();
+		assert!(parent_sock >= 0);
 		let received_fd = unix_recv_fd(parent_sock);
 		unsafe {
 			libc::close(parent_sock);
@@ -371,6 +393,15 @@ impl TurnstileTracer {
 		let received_fd = received_fd.map_err(TurnstileTracerError::ReceiveNotifyFd)?;
 		self.notify_fd_state.store_notify_fd(received_fd);
 		Ok(())
+	}
+
+	/// To be used with [`Self::install_filters`]
+	pub fn close_child_sock(&self) {
+		let [_, child_sock] = self.notify_fd_state.sock_pair.get();
+		assert!(child_sock >= 0);
+		unsafe {
+			libc::close(child_sock);
+		}
 	}
 
 	/// Spawn a child process with the seccomp filters installed.

@@ -1,4 +1,11 @@
-use std::{ffi::CStr, io, mem::MaybeUninit, slice};
+use std::{
+	ffi::{CStr, OsString},
+	fs::File,
+	io::{self, Read},
+	mem::MaybeUninit,
+	os::unix::ffi::OsStringExt,
+	slice,
+};
 
 use libseccomp::{ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
 use log::warn;
@@ -72,11 +79,12 @@ impl<'a> RequestContext<'a> {
 		&self.sreq
 	}
 
+	/// Get the `index+1`-th syscall argument as a raw `u64`.
 	pub fn arg(&self, index: usize) -> u64 {
 		self.sreq.data.args[index]
 	}
 
-	pub(crate) fn still_valid(&mut self) -> Result<bool, AccessRequestError> {
+	pub fn still_valid(&mut self) -> Result<bool, AccessRequestError> {
 		if !self.valid {
 			return Ok(false);
 		}
@@ -93,7 +101,7 @@ impl<'a> RequestContext<'a> {
 		}
 	}
 
-	pub(crate) fn send_response(
+	pub(crate) fn send_response_impl(
 		&mut self,
 		resp: libseccomp::ScmpNotifResp,
 	) -> Result<(), AccessRequestError> {
@@ -106,7 +114,7 @@ impl<'a> RequestContext<'a> {
 	}
 
 	pub fn send_continue(&mut self) -> Result<(), AccessRequestError> {
-		self.send_response(ScmpNotifResp::new_continue(
+		self.send_response_impl(ScmpNotifResp::new_continue(
 			self.sreq.id,
 			ScmpNotifRespFlags::empty(),
 		))
@@ -117,14 +125,16 @@ impl<'a> RequestContext<'a> {
 	/// the access would be denied should the traced process attempt to
 	/// modify any path buffers from another thread.
 	pub fn send_error(&mut self, errno: libc::c_int) -> Result<(), AccessRequestError> {
-		self.send_response(ScmpNotifResp::new_error(
+		self.send_response_impl(ScmpNotifResp::new_error(
 			self.sreq.id,
 			errno,
 			ScmpNotifRespFlags::empty(),
 		))
 	}
 
-	pub(crate) fn cstr_from_target_memory(
+	/// Read a NUL-terminated C string from the traced process's memory at
+	/// `src`.
+	pub fn cstr_from_target_memory(
 		&mut self,
 		src: *const libc::c_char,
 	) -> Result<std::ffi::CString, AccessRequestError> {
@@ -172,13 +182,10 @@ impl<'a> RequestContext<'a> {
 		))
 	}
 
-	/// Reads the syscall argument at `fd_arg_index` and opens it as a
+	/// Reads the `fd_arg_index+1`-th syscall argument and opens it as a
 	/// `ForeignFd` via `/proc/{pid}/...`.  Does error checking and
 	/// handles AT_FDCWD.
-	pub(crate) fn arg_to_fd(
-		&mut self,
-		fd_arg_index: usize,
-	) -> Result<ForeignFd, AccessRequestError> {
+	pub fn arg_to_fd(&mut self, fd_arg_index: usize) -> Result<ForeignFd, AccessRequestError> {
 		let fd = self.arg(fd_arg_index) as libc::c_int;
 		if fd == libc::AT_FDCWD {
 			let path = format!("/proc/{}/cwd\0", self.sreq.pid);
@@ -215,7 +222,9 @@ impl<'a> RequestContext<'a> {
 		Ok(ret as usize)
 	}
 
-	pub(crate) fn read_target_memory(
+	/// Reads exactly `buf.len()` bytes from the traced process's memory
+	/// at `src` into `buf`.
+	pub fn read_target_memory(
 		&mut self,
 		src: *const u8,
 		buf: &mut [MaybeUninit<u8>],
@@ -237,7 +246,9 @@ impl<'a> RequestContext<'a> {
 		Ok(())
 	}
 
-	pub(crate) fn value_from_target_memory<T: Copy>(
+	/// Reads a value of type `T` from the traced process's memory at
+	/// `src`.
+	pub fn value_from_target_memory<T: Copy>(
 		&mut self,
 		src: *const T,
 	) -> Result<T, AccessRequestError> {
@@ -250,6 +261,25 @@ impl<'a> RequestContext<'a> {
 			self.read_target_memory(src as *const u8, buf)?;
 		}
 		Ok(unsafe { val.assume_init() })
+	}
+
+	pub fn pid(&self) -> libc::pid_t {
+		libc::pid_t::try_from(self.sreq.pid).expect("PID overflowed i32")
+	}
+
+	pub fn comm(&self) -> Result<OsString, AccessRequestError> {
+		let pid = self.pid();
+		let mut f = File::open(format!("/proc/{}/comm", pid))
+			.map_err(|e| AccessRequestError::ReadPidComm(pid as u32, e))?;
+		let mut buf = Vec::new();
+		f.read_to_end(&mut buf)
+			.map_err(|e| AccessRequestError::ReadPidComm(pid as u32, e))?;
+		while let Some(b) = buf.last()
+			&& b.is_ascii_whitespace()
+		{
+			buf.pop();
+		}
+		Ok(OsString::from_vec(buf))
 	}
 }
 
