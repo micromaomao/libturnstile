@@ -482,26 +482,21 @@ impl BindMountSandbox {
 			open_how.flags |= libc::O_NOFOLLOW as u64;
 			open_how.resolve |= libc::RESOLVE_NO_SYMLINKS;
 		}
-		// openat2 ignores the dirfd when given an absolute path, so
-		// translate any leading '/' into a relative form ("/" -> ".",
-		// "/foo/bar" -> "foo/bar") so that the lookup actually starts
-		// from `host_root_fd` and inherits m0's mount namespace context.
-		let host_path_bytes = host_path.to_bytes();
-		let relative_host_path: Cow<CStr> = if host_path_bytes.starts_with(b"/") {
-			let mut stripped = &host_path_bytes[..];
-			while stripped.starts_with(b"/") {
-				stripped = &stripped[1..];
+		// openat2 ignores the dirfd when given an absolute path, so we
+		// need to remove any leading '/'.
+		let with_nul = host_path.to_bytes_with_nul();
+		let relative_host_path: &CStr = if with_nul.starts_with(b"/") {
+			let mut i = 0;
+			while i < with_nul.len() - 1 && with_nul[i] == b'/' {
+				i += 1;
 			}
-			if stripped.is_empty() {
-				Cow::Borrowed(c".")
+			if i == with_nul.len() - 1 {
+				c"."
 			} else {
-				let mut v = Vec::with_capacity(stripped.len() + 1);
-				v.extend_from_slice(stripped);
-				v.push(0);
-				Cow::Owned(CString::from_vec_with_nul(v).unwrap())
+				CStr::from_bytes_with_nul(&with_nul[i..]).unwrap()
 			}
 		} else {
-			Cow::Borrowed(host_path)
+			host_path
 		};
 		let host_fd = unsafe {
 			libc::syscall(
@@ -553,17 +548,13 @@ impl BindMountSandbox {
 				// opened inside m0), so it carries m0's mount namespace
 				// context and is acceptable to open_tree() here without
 				// needing to be reopened.
-				let source_tree = match MountObj::new_bind(
-					host_fd_raw,
-					c"",
-					attrs,
-					follow_host_symlinks,
-				) {
-					Ok(tree) => tree,
-					Err(e) => {
-						return e.raw_os_error().unwrap_or(libc::EIO);
-					}
-				};
+				let source_tree =
+					match MountObj::new_bind(host_fd_raw, c"", attrs, follow_host_symlinks) {
+						Ok(tree) => tree,
+						Err(e) => {
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+					};
 				match nsenter_fn_m1() {
 					Ok(()) => (),
 					Err(e) => {
