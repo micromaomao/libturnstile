@@ -15,6 +15,15 @@ what files are used by a program.
 > [!WARNING]
 > **Work in progress**. API will not be stable at all.
 
+> [!WARNING]
+> Using the BindMountSandbox struct on its own is likely to be insecure.
+> Also consider restricting sending signals or other actions on
+> outside-sandbox processes via Landlock, terminal escape sequences from
+> output, restricting direct access to the tty via stdin/stdout/stderr, etc.
+>
+> At this moment, the included turnstile-sandbox binary is not protected
+> against the above.
+
 ## Features
 
 ### Tracer
@@ -27,106 +36,104 @@ what files are used by a program.
 ### Sandbox
 
 - Support dynamic manipulation of the sandbox's view of the filesystem
-  using bind mounts.
+  using bind mounts or placeholder files in a tmpfs.
 
 ## Goals
 
 - Completely unprivileged
 - The library itself should be non-opinionated
 - The library will support building a batteries-included, fully dynamic
-  and inspectable sandbox
+  and inspectable sandbox.
+- The included turnstile-sandbox binary will eventually be such an implementation, ready for general use.
 
-## Example
+## Example: fstrace
 
 ```
-> target/release/examples/fstrace cargo build
-fstrace[828276] exec "/usr/local/bin/cargo"
-fstrace[828276] exec "/usr/bin/cargo"
-cargo[828276] open r "/etc/ld.so.preload"
-cargo[828276] open r "/etc/ld.so.cache"
-cargo[828276] open r "/usr/lib/liblzma.so.5"
-cargo[828276] open r "/usr/lib/libgcc_s.so.1"
+> target/release/fstrace cargo build
+fstrace[163263] exec "/home/mao/.local/qemu/bin/cargo"
+fstrace[163263] exec "/usr/local/sbin/cargo"
+fstrace[163263] exec "/usr/local/bin/cargo"
+fstrace[163263] exec "/usr/bin/cargo"
+cargo[163263] access r "/etc/ld.so.preload"
 ...
-rustc[828297] unlink "/home/mao/turnstile/target/debug/deps/libturnstile-00c39746b8f0f2b9.ehas8k75ezbnsay69cv9snhj1.0sbwwi3.rcgu.o"
-rustc[828297] unlink "/home/mao/turnstile/target/debug/deps/libturnstile-00c39746b8f0f2b9.eqlnbk1spzsmryvhy6r7il0y6.0sbwwi3.rcgu.o"
-rustc[828297] unlink "/home/mao/turnstile/target/debug/deps/libturnstile-00c39746b8f0f2b9.f0bf248u890rb6cl3b6abihvl.0sbwwi3.rcgu.o"
-cargo[828294] open r "/home/mao/turnstile/target/debug/deps/libturnstile-00c39746b8f0f2b9.d"
-cargo[828294] create file "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-00c39746b8f0f2b9/dep-lib-libturnstile"
-cargo[828294] open w "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-00c39746b8f0f2b9/dep-lib-libturnstile"
-cargo[828294] open r "/home/mao/turnstile/target/debug/deps/liblibturnstile-00c39746b8f0f2b9.rlib"
-cargo[828294] open r "/home/mao/turnstile/target/debug/liblibturnstile.rlib"
-cargo[828294] unlink "/home/mao/turnstile/target/debug/liblibturnstile.rlib"
-cargo[828294] link "/home/mao/turnstile/target/debug/deps/liblibturnstile-00c39746b8f0f2b9.rlib" -> "/home/mao/turnstile/target/debug/liblibturnstile.rlib"
-cargo[828294] create file "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-00c39746b8f0f2b9/lib-libturnstile"
-cargo[828294] open w "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-00c39746b8f0f2b9/lib-libturnstile"
-cargo[828294] create file "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-00c39746b8f0f2b9/lib-libturnstile.json"
-cargo[828294] open w "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-00c39746b8f0f2b9/lib-libturnstile.json"
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
-cargo[828276] open r "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-00c39746b8f0f2b9/dep-lib-libturnstile"
-cargo[828276] open r "/home/mao/turnstile/target/debug/liblibturnstile.d"
-cargo[828276] create file "/home/mao/turnstile/target/debug/liblibturnstile.d"
-cargo[828276] open w "/home/mao/turnstile/target/debug/liblibturnstile.d"
-fstrace: error: seccomp_notify_receive: There was a system failure beyond the control of libseccomp
-fstrace: child process exited with status exit status: 0
+cargo[163658] link "/home/mao/turnstile/target/debug/deps/liblibturnstile-63cec22bf0999bf8.rlib" -> "/home/mao/turnstile/target/debug/liblibturnstile.rlib"
+cargo[163658] stat "/home/mao/turnstile/target/debug/deps/liblibturnstile-63cec22bf0999bf8.rmeta"
+cargo[163658] open w+ "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-63cec22bf0999bf8/lib-libturnstile"
+cargo[163658] open w+ "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-63cec22bf0999bf8/lib-libturnstile.json"
+warning: `libturnstile` (lib) generated 2 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.70s
+cargo[163263] open r "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-63cec22bf0999bf8/dep-lib-libturnstile"
+cargo[163263] stat "/home/mao/turnstile/target/debug/.fingerprint/libturnstile-63cec22bf0999bf8/dep-lib-libturnstile"
+cargo[163263] open r "/home/mao/turnstile/target/debug/liblibturnstile.d"
+cargo[163263] open w+ "/home/mao/turnstile/target/debug/liblibturnstile.d"
+cargo[163263] stat "/home/mao/.cargo/.global-cache"
+cargo[163263] stat "/home/mao/.cargo/.global-cache"
+cargo[163263] stat "/home/mao/.cargo/.global-cache"
+[2026-05-09T16:35:43Z INFO  fstrace::common] child process exited with status exit status: 0
 ```
 
 ```
-> cargo clean && time cargo build
-     Removed 1697 files, 497.1MiB total
-   Compiling proc-macro2 v1.0.106
-   Compiling unicode-ident v1.0.24
-   Compiling quote v1.0.45
-   Compiling libc v0.2.183
-   Compiling libseccomp-sys v0.3.0
-   Compiling pkg-config v0.3.32
-   Compiling thiserror v2.0.18
-   Compiling bitflags v2.11.0
-   Compiling log v0.4.29
-   Compiling libseccomp v0.4.0
-   Compiling syn v2.0.117
-   Compiling page_size v0.6.0
-   Compiling thiserror-impl v2.0.18
-   Compiling libturnstile v0.1.0 (/home/mao/turnstile)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.21s
+> hyperfine --warmup 1 --prepare 'cargo clean' 'cargo build --features tools'
+Benchmark 1: cargo build --features tools
+  Time (mean ± σ):      3.466 s ±  0.023 s    [User: 19.449 s, System: 1.700 s]
+  Range (min … max):    3.422 s …  3.500 s    10 runs
 
-________________________________________________________
-Executed in    1.24 secs    fish           external
-   usr time    2.64 secs  391.00 micros    2.64 secs
-   sys time    0.44 secs   46.00 micros    0.44 secs
+> hyperfine --warmup 1 --prepare 'cargo clean' '/tmp/fstrace -o /tmp/fstrace.log cargo build --features tools'
+Benchmark 1: /tmp/fstrace -o /tmp/fstrace.log cargo build --features tools
+  Time (mean ± σ):      3.751 s ±  0.035 s    [User: 19.223 s, System: 2.140 s]
+  Range (min … max):    3.689 s …  3.797 s    10 runs
 
-> cargo clean && time /tmp/fstrace -o fstrace.log cargo build
-     Removed 333 files, 90.2MiB total
-   Compiling proc-macro2 v1.0.106
-   Compiling quote v1.0.45
-   Compiling unicode-ident v1.0.24
-   Compiling libc v0.2.183
-   Compiling libseccomp-sys v0.3.0
-   Compiling pkg-config v0.3.32
-   Compiling thiserror v2.0.18
-   Compiling bitflags v2.11.0
-   Compiling log v0.4.29
-   Compiling libseccomp v0.4.0
-   Compiling syn v2.0.117
-   Compiling page_size v0.6.0
-   Compiling thiserror-impl v2.0.18
-   Compiling libturnstile v0.1.0 (/home/mao/turnstile)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.40s
-fstrace: error: seccomp_notify_receive: There was a system failure beyond the control of libseccomp
-fstrace: child process exited with status exit status: 0
+> wc -l /tmp/fstrace.log
+802098 /tmp/fstrace.log
+```
 
-________________________________________________________
-Executed in    1.43 secs    fish           external
-   usr time    2.70 secs    3.51 millis    2.69 secs
-   sys time    0.62 secs    0.05 millis    0.62 secs
+## Example: turnstile-sandbox
 
-> wc -l fstrace.log
-7377 fstrace.log
+```
+> cat /tmp/sandbox-config.yaml
+rules:
+  /usr: rx
+  /bin: rx
+  /lib: rx
+  /lib64: rx
+  /proc: r
+  /home: r
+  /home/mao/turnstile: rwx
+  /home/mao/.rustup: rx
 
+> target/debug/turnstile-sandbox /tmp/sandbox-config.yaml --permissive cargo build --features tools
+...
+[2026-05-09T17:37:23Z INFO  turnstile_sandbox] rust-lld[226136] need fs permission r-- on "/sys/devices/system/cpu/online"
+[2026-05-09T17:37:23Z INFO  libturnstile::sandbox] Mount bind "/sys/devices/system/cpu/online" "/sys/devices/system/cpu/online" ro,noexec
+warning: `libturnstile` (bin "turnstile-sandbox") generated 5 warnings (run `cargo fix --bin "turnstile-sandbox" -p libturnstile` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s
+[2026-05-09T17:37:23Z INFO  turnstile_sandbox] Child process exited successfully
+Denials:
+rules:
+  /: rw
+  /dev/null: r
+  /dev/urandom: r
+  /etc/ca-certificates/extracted/tls-ca-bundle.pem: ''
+  /etc/ld.so.cache: r
+  /etc/ssl: ''
+  /home/mao/.cache/ccache/4/b: w
+  /home/mao/.cargo: rw
+  /run/user/1000: ''
+  /run/user/1000/ccache-tmp: w
+  /sys/devices/system/cpu/online: r
+  /sys/fs/cgroup/user.slice/cpu.max: r
+  /sys/fs/cgroup/user.slice/user-1000.slice/cpu.max: r
+  /sys/fs/cgroup/user.slice/user-1000.slice/session-27.scope/cgroup.controllers: ''
+  /sys/fs/cgroup/user.slice/user-1000.slice/session-27.scope/cpu.max: r
+  /sys/kernel/mm/transparent_hugepage/enabled: r
+  /tmp: rwx
 ```
 
 ## TODO
 
+- Rework sandbox to move child mount into new parent mount when parent needs to be remounted, e.g. allowing /home/mao when /home/mao/turnstile is already allowed, without breaking existing fds / cwd to /home/mao/turnstile
+- Rework sandbox to support resolve-only permissions (with placeholders)
 - Improve API for performance and ergonomics
 - sendmm?msg, recvmm?sg handling (hard to do without deadlocking at the start)
 - io_uring (very hard to do properly, but maybe we can just disable)
-- Landlock support to restrict the tracer itself
+- Landlock support to restrict fstrace itself

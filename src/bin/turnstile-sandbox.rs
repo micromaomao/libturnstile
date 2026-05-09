@@ -27,8 +27,10 @@ use libturnstile::{
 use log::{debug, error, info};
 
 use crate::common::{ProcPidFd, handle_child_result};
+use crate::config::Config;
 
 mod common;
+mod config;
 
 /// A simple interactive sandbox using libturnstile
 #[derive(Parser)]
@@ -283,19 +285,37 @@ fn tracing_thread(context: &'static Context) {
 		}
 	}
 	if !denials.is_empty() {
-		let mut stdout = std::io::stdout().lock();
-		write!(stdout, "Denials:\n").unwrap();
+		let mut rules: std::collections::BTreeMap<String, String> =
+			std::collections::BTreeMap::new();
 		denials.walk_top_down(|path, val| {
-			write!(
-				stdout,
-				"  {}{}{} {:?}\n",
-				if val.need_read { "r" } else { "-" },
-				if val.need_write { "w" } else { "-" },
-				if val.need_exec { "x" } else { "-" },
-				path
-			)
-			.unwrap();
+			let mut perms = String::new();
+			if val.need_read {
+				perms.push('r');
+			}
+			if val.need_write {
+				perms.push('w');
+			}
+			if val.need_exec {
+				perms.push('x');
+			}
+			// Translate $ to $$ so the path round-trips through the
+			// config's path expander.  Lossy UTF-8 conversion is used for
+			// the rare case of non-UTF-8 paths since YAML strings are
+			// fundamentally Unicode; serde_yaml_ng will handle quoting and
+			// escaping the resulting string for arbitrary code points.
+			let path_str = path.to_string_lossy().replace('$', "$$");
+			rules.insert(path_str, perms);
 		});
+		// Wrap in a top-level `rules:` map so the output can be copy-pasted
+		// directly into a config file.
+		#[derive(serde::Serialize)]
+		struct DenialsConfig<'a> {
+			rules: &'a std::collections::BTreeMap<String, String>,
+		}
+		let yaml = serde_yaml_ng::to_string(&DenialsConfig { rules: &rules })
+			.expect("serializing String->String map should not fail");
+		let mut stdout = std::io::stdout().lock();
+		write!(stdout, "Denials:\n{}", yaml).unwrap();
 		stdout.flush().unwrap();
 	}
 }
@@ -317,59 +337,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		permissive: cli.permissive,
 	}));
 
-	// todo: default for now
-	context.sandbox.update_mounts_from_list([
-		(
-			OsStr::new("/usr"),
-			ManagedMountPoint {
-				host_path: CString::new("/usr").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: false,
-				},
-			},
-		),
-		(
-			OsStr::new("/bin"),
-			ManagedMountPoint {
-				host_path: CString::new("/bin").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: false,
-				},
-			},
-		),
-		(
-			OsStr::new("/lib"),
-			ManagedMountPoint {
-				host_path: CString::new("/lib").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: false,
-				},
-			},
-		),
-		(
-			OsStr::new("/lib64"),
-			ManagedMountPoint {
-				host_path: CString::new("/lib64").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: false,
-				},
-			},
-		),
-		(
-			OsStr::new("/proc"),
-			ManagedMountPoint {
-				host_path: CString::new("/proc").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: true,
-				},
-			},
-		),
-	])?;
+	// Load mounts from the user-provided config file, replacing the
+	// previously hard-coded default initial mount list.
+	let cfg = Config::load(&cli.config)?;
+	let resolved_mounts = cfg.resolve_mounts()?;
+	if resolved_mounts.is_empty() {
+		info!(
+			"config file {:?} has no rules; sandbox will start empty",
+			cli.config
+		);
+	}
+	context.sandbox.update_mounts_from_list(
+		resolved_mounts
+			.iter()
+			.map(|m| (m.sandbox_path.as_os_str(), m.mount.clone())),
+	)?;
 
 	context.path_res_sandbox.update_mounts_from_list([(
 		OsStr::new("/"),
