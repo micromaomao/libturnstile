@@ -132,6 +132,12 @@ impl std::fmt::Display for MountAttributes {
 pub struct BindMountSandbox {
 	namespaces: ManagedNamespaces,
 	root_tmpfs: MountObj,
+	/// O_PATH fd to "/" opened inside the m0 (outer) mount namespace.
+	/// Used as the dirfd when resolving caller-provided host paths so
+	/// that the resulting fd is associated with m0's mount namespace and
+	/// is therefore acceptable to `open_tree()` once the helper process
+	/// enters m0.
+	host_root_fd: ForeignFd,
 }
 
 #[derive(Debug)]
@@ -292,9 +298,32 @@ impl BindMountSandbox {
 				BindMountSandboxError::MakeDetachedTmpfsMountFailed,
 			)?)
 		};
+		// Open a fd to "/" from inside m0 so that subsequent host path
+		// lookups can be performed relative to it, yielding fds that are
+		// already associated with m0's mount namespace.
+		let host_root_fd = unsafe {
+			let nsenter_fn = namespaces.nsenter_fn(true, true, false, false);
+			let raw_fd = send_fd_from_ns(
+				nsenter_fn,
+				|| {
+					let fd = libc::open(
+						c"/".as_ptr(),
+						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+					);
+					if fd < 0 {
+						Err(io::Error::last_os_error())
+					} else {
+						Ok(fd)
+					}
+				},
+				BindMountSandboxError::OpenRootInSandboxFailed,
+			)?;
+			ForeignFd { local_fd: raw_fd }
+		};
 		let s = Self {
 			namespaces,
 			root_tmpfs,
+			host_root_fd,
 		};
 		s.mount_host_into_sandbox_impl(
 			CStr::from_bytes_with_nul(
@@ -453,11 +482,27 @@ impl BindMountSandbox {
 			open_how.flags |= libc::O_NOFOLLOW as u64;
 			open_how.resolve |= libc::RESOLVE_NO_SYMLINKS;
 		}
+		// openat2 ignores the dirfd when given an absolute path, so we
+		// need to remove any leading '/'.
+		let with_nul = host_path.to_bytes_with_nul();
+		let relative_host_path: &CStr = if with_nul.starts_with(b"/") {
+			let mut i = 0;
+			while i < with_nul.len() - 1 && with_nul[i] == b'/' {
+				i += 1;
+			}
+			if i == with_nul.len() - 1 {
+				c"."
+			} else {
+				CStr::from_bytes_with_nul(&with_nul[i..]).unwrap()
+			}
+		} else {
+			host_path
+		};
 		let host_fd = unsafe {
 			libc::syscall(
 				libc::SYS_openat2,
-				libc::AT_FDCWD,
-				host_path.as_ptr(),
+				self.host_root_fd.as_raw_fd(),
+				relative_host_path.as_ptr(),
 				&open_how,
 				std::mem::size_of_val(&open_how),
 			) as libc::c_int
@@ -487,6 +532,7 @@ impl BindMountSandbox {
 
 		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
 		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
+		let host_fd_raw = host_fd.as_raw_fd();
 		let fork_res = unsafe {
 			fork_wait(|| {
 				match nsenter_fn_m0() {
@@ -498,40 +544,17 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
-				// We can't use host_fd here because it was opened within
-				// the host namespace, and will be rejected by
-				// open_tree().  A mount namespace has its own set of
-				// mounts, let's open again within the mount namespace.
-				// TODO: ideally BindMountSandbox will save a fd to the
-				// root opened when inside m0, so we can just do this
-				// outside.
-				let host_fd = libc::syscall(
-					libc::SYS_openat2,
-					libc::AT_FDCWD,
-					host_path.as_ptr(),
-					&open_how,
-					std::mem::size_of_val(&open_how),
-				) as libc::c_int;
-				if host_fd < 0 {
-					let err = libc::__errno_location().read();
-					if ENABLE_LOG_IN_FORK {
-						error!(
-							"Failed to open host path {:?} in mount helper process: errno {}",
-							host_path, err
-						);
-					}
-					return err;
-				}
-				let host_fd = ForeignFd { local_fd: host_fd };
+				// host_fd was opened relative to host_root_fd (which was
+				// opened inside m0), so it carries m0's mount namespace
+				// context and is acceptable to open_tree() here without
+				// needing to be reopened.
 				let source_tree =
-					match MountObj::new_bind(host_fd.as_raw_fd(), c"", attrs, follow_host_symlinks)
-					{
+					match MountObj::new_bind(host_fd_raw, c"", attrs, follow_host_symlinks) {
 						Ok(tree) => tree,
 						Err(e) => {
 							return e.raw_os_error().unwrap_or(libc::EIO);
 						}
 					};
-				drop(host_fd);
 				match nsenter_fn_m1() {
 					Ok(()) => (),
 					Err(e) => {
