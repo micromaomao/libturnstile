@@ -530,6 +530,32 @@ impl<T> FsTree<T> {
 		}
 	}
 
+	/// Reports if the tree has any "incomplete parent" - any entries for
+	/// which one or more of its parent does not exist as another entry
+	/// with data in this tree.
+	///
+	/// In other words, this return whether
+	/// [`Self::fill_incomplete_parent`] would make any changes if it is
+	/// called on this tree.
+	pub fn has_incomplete_parents(&self) -> bool {
+		self.has_incomplete_parents_impl(&self.root)
+	}
+
+	fn has_incomplete_parents_impl(&self, node: &FsTreeNode<T>) -> bool {
+		// The root is allowed to both be present (it has to) and have no
+		// data or children, so this node.children.is_empty() check is
+		// necessary.
+		if node.data.is_none() && !node.children.is_empty() {
+			return true;
+		}
+		for child in node.children.values() {
+			if self.has_incomplete_parents_impl(child) {
+				return true;
+			}
+		}
+		false
+	}
+
 	/// Walks the tree in bottom-up order, e.g. /foo/bar, /foo, /baz, /,
 	/// calling the given function for any paths that exists in the tree.
 	/// Iteration order for entries of the same directory is arbitrary.
