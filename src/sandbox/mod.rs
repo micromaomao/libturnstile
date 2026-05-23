@@ -171,14 +171,17 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 	// }
 
 	pub fn mount(self) -> Result<(), BindMountSandboxError> {
-		self.sandbox.mount_host_into_sandbox_impl(
-			self.host_path,
-			self.sandbox_path,
-			self.attrs,
-			self.follow_host_symlinks,
-			// self.follow_sandbox_symlinks,
-			false,
-		)
+		self.sandbox
+			.mount_host_into_sandbox_impl(
+				self.host_path,
+				self.sandbox_path,
+				self.attrs,
+				self.follow_host_symlinks,
+				// self.follow_sandbox_symlinks,
+				false,
+				true,
+			)
+			.map(|_| ())
 	}
 }
 
@@ -334,6 +337,7 @@ impl BindMountSandbox {
 			MountAttributes::ro(),
 			true,
 			false,
+			true,
 		)?;
 		Ok(s)
 	}
@@ -474,7 +478,8 @@ impl BindMountSandbox {
 		attrs: MountAttributes,
 		follow_host_symlinks: bool,
 		follow_ns_symlinks: bool,
-	) -> Result<(), BindMountSandboxError> {
+		create_placeholders: bool,
+	) -> Result<libc::stat, BindMountSandboxError> {
 		validate_sandbox_path(ns_path)?;
 		let mut open_how: libc::open_how = unsafe { std::mem::zeroed() };
 		open_how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
@@ -528,7 +533,12 @@ impl BindMountSandbox {
 			}
 		}
 
-		self.create_placeholder_hierarchy(ns_path, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
+		if create_placeholders {
+			self.create_placeholder_hierarchy(
+				ns_path,
+				stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+			)?;
+		}
 
 		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
 		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
@@ -586,7 +596,47 @@ impl BindMountSandbox {
 			return Err(BindMountSandboxError::MountFailed(fork_res));
 		}
 		info!("Mount bind {:?} {:?} {}", host_path, ns_path, attrs,);
-		Ok(())
+		Ok(stat)
+	}
+
+	/// Open the parent directory of `sandbox_path` within the backing
+	/// tmpfs, without creating any intermediate components.  The parent
+	/// must already exist.
+	pub(self) fn open_sandbox_parent(
+		&self,
+		sandbox_path: &CStr,
+	) -> Result<ForeignFd, BindMountSandboxError> {
+		let (parent, _) = split_parent_leaf(sandbox_path);
+		if parent.as_c_str() == c"/" {
+			let dup =
+				unsafe { libc::fcntl(self.root_tmpfs.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+			if dup < 0 {
+				return Err(BindMountSandboxError::ResolveSandboxPath(
+					io::Error::last_os_error(),
+				));
+			}
+			return Ok(ForeignFd { local_fd: dup });
+		}
+		unsafe {
+			let mut openhow: libc::open_how = mem::zeroed();
+			openhow.flags =
+				(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64;
+			openhow.resolve =
+				libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_XDEV;
+			let fd = libc::syscall(
+				libc::SYS_openat2,
+				self.root_tmpfs.0.as_raw_fd(),
+				parent.as_ptr(),
+				&openhow as *const _,
+				std::mem::size_of::<libc::open_how>(),
+			) as libc::c_int;
+			if fd < 0 {
+				return Err(BindMountSandboxError::ResolveSandboxPath(
+					io::Error::last_os_error(),
+				));
+			}
+			Ok(ForeignFd { local_fd: fd })
+		}
 	}
 
 	pub fn mount_host_into_sandbox<'a, 'b>(
@@ -1177,6 +1227,27 @@ fn create_or_update_placeholder(
 	Ok(())
 }
 
+/// Stat a host path from the caller's mount namespace.  Symlinks are
+/// not followed.
+fn stat_host(host_path: &CStr) -> Result<libc::stat, BindMountSandboxError> {
+	let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+	let res = unsafe {
+		libc::fstatat(
+			libc::AT_FDCWD,
+			host_path.as_ptr(),
+			&mut stat,
+			libc::AT_SYMLINK_NOFOLLOW,
+		)
+	};
+	if res != 0 {
+		return Err(BindMountSandboxError::StatHostPath(
+			host_path.to_owned(),
+			io::Error::last_os_error(),
+		));
+	}
+	Ok(stat)
+}
+
 /// Convenience for callers that just need to ensure an entry exists
 /// with sensible default mode and without touching timestamps.
 fn placeholder_default_no_metadata(kind_is_dir: bool) -> ManagedPlaceholder {
@@ -1266,6 +1337,7 @@ impl PlaceholderSymlinkData {
 #[derive(Debug)]
 pub struct ManagedBindMountSandbox {
 	sandbox: BindMountSandbox,
+	current_placeholder_tree: Mutex<FsTree<ManagedPlaceholder>>,
 	current_mount_tree: Mutex<FsTree<ManagedMountPoint>>,
 }
 
@@ -1273,8 +1345,34 @@ impl ManagedBindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
 		Ok(Self {
 			sandbox: BindMountSandbox::new(disable_userns)?,
+			current_placeholder_tree: Mutex::new(FsTree::new()),
 			current_mount_tree: Mutex::new(FsTree::new()),
 		})
+	}
+
+	fn check_path_no_nul(path: &OsStr) -> Result<(), BindMountSandboxError> {
+		if path.as_encoded_bytes().contains(&0) {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"path contains NUL byte",
+				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
+					.expect("debug format should not contain NUL bytes"),
+			));
+		}
+		Ok(())
+	}
+
+	/// Convenience: update a single entry (placeholder or mount) and
+	/// reconcile.
+	pub fn add_or_update_entry(
+		&self,
+		path: &OsStr,
+		entry: ManagedTreeEntry,
+	) -> Result<(), BindMountSandboxError> {
+		Self::check_path_no_nul(path)?;
+		let (mut pt, mut mt) = self.lock_trees();
+		let mut desired_entries = self.entries_from_state(&pt, &mt);
+		desired_entries.insert(path, entry);
+		self.reconcile(&mut pt, &mut mt, &desired_entries)
 	}
 
 	pub fn add_or_update_mount(
@@ -1282,107 +1380,207 @@ impl ManagedBindMountSandbox {
 		path: &OsStr,
 		mp: ManagedMountPoint,
 	) -> Result<(), BindMountSandboxError> {
-		if path.as_encoded_bytes().contains(&0) {
-			return Err(BindMountSandboxError::InvalidSandboxPath(
-				"path contains NUL byte",
-				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
-					.expect("debug format should not contain NUL bytes"),
-			));
-		}
-		let mut mt = self
-			.current_mount_tree
-			.lock()
-			.expect("current_mount_tree lock poisoned");
-		let mut new_tree_state = mt.clone();
-		new_tree_state.insert(path, mp);
-		self.update_mounts_from_tree_impl(&mut mt, &new_tree_state)
+		self.add_or_update_entry(path, ManagedTreeEntry::BindMount(mp))
+	}
+
+	pub fn add_or_update_placeholder(
+		&self,
+		path: &OsStr,
+		ph: ManagedPlaceholder,
+	) -> Result<(), BindMountSandboxError> {
+		self.add_or_update_entry(path, ManagedTreeEntry::Placeholder(ph))
+	}
+
+	/// Remove either the placeholder or mount entry at the given path.
+	pub fn remove_entry(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
+		Self::check_path_no_nul(path)?;
+		let (mut pt, mut mt) = self.lock_trees();
+		let mut desired_entries = self.entries_from_state(&pt, &mt);
+		desired_entries.remove(path);
+		self.reconcile(&mut pt, &mut mt, &desired_entries)
 	}
 
 	pub fn remove_mount(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
-		if path.as_encoded_bytes().contains(&0) {
-			return Err(BindMountSandboxError::InvalidSandboxPath(
-				"path contains NUL byte",
-				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
-					.expect("debug format should not contain NUL bytes"),
-			));
+		self.remove_entry(path)
+	}
+
+	pub fn update_from_tree(
+		&self,
+		desired_tree: &FsTree<ManagedTreeEntry>,
+	) -> Result<(), BindMountSandboxError> {
+		let (mut pt, mut mt) = self.lock_trees();
+		self.reconcile(&mut pt, &mut mt, desired_tree)
+	}
+
+	pub fn update_from_list<'a>(
+		&self,
+		desired_entries: impl IntoIterator<Item = (&'a OsStr, ManagedTreeEntry)>,
+	) -> Result<(), BindMountSandboxError> {
+		let mut tree = FsTree::new();
+		for (path, entry) in desired_entries {
+			Self::check_path_no_nul(path)?;
+			tree.insert(path, entry);
 		}
-		let mut mt = self
-			.current_mount_tree
-			.lock()
-			.expect("current_mount_tree lock poisoned");
-		let mut new_tree_state = mt.clone();
-		new_tree_state.remove(path);
-		self.update_mounts_from_tree_impl(&mut mt, &new_tree_state)
+		self.update_from_tree(&tree)
 	}
 
 	pub fn update_mounts_from_tree(
 		&self,
 		desired_tree: &FsTree<ManagedMountPoint>,
 	) -> Result<(), BindMountSandboxError> {
-		let mut mt = self
-			.current_mount_tree
-			.lock()
-			.expect("current_mount_tree lock poisoned");
-		self.update_mounts_from_tree_impl(&mut mt, desired_tree)
+		let mut converted = FsTree::new();
+		desired_tree.walk_top_down(|path, mp| {
+			converted.insert(path, ManagedTreeEntry::BindMount(mp.clone()));
+		});
+		self.update_from_tree(&converted)
 	}
 
 	pub fn update_mounts_from_list<'a>(
 		&self,
 		desired_mounts: impl IntoIterator<Item = (&'a OsStr, ManagedMountPoint)>,
 	) -> Result<(), BindMountSandboxError> {
-		let mut desired_tree = FsTree::new();
-		for (path, mnt) in desired_mounts {
-			if path.as_encoded_bytes().contains(&0) {
-				return Err(BindMountSandboxError::InvalidSandboxPath(
-					"path contains NUL byte",
-					CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
-						.expect("debug format should not contain NUL byte"),
-				));
-			}
-			desired_tree.insert(path, mnt);
-		}
-		self.update_mounts_from_tree(&desired_tree)
+		self.update_from_list(
+			desired_mounts
+				.into_iter()
+				.map(|(p, m)| (p, ManagedTreeEntry::BindMount(m))),
+		)
 	}
 
-	fn update_mounts_from_tree_impl(
+	fn lock_trees(
 		&self,
-		current_tree: &mut FsTree<ManagedMountPoint>,
-		desired_tree: &FsTree<ManagedMountPoint>,
+	) -> (
+		std::sync::MutexGuard<'_, FsTree<ManagedPlaceholder>>,
+		std::sync::MutexGuard<'_, FsTree<ManagedMountPoint>>,
+	) {
+		// Always acquire in the same order to avoid deadlocks.
+		let pt = self
+			.current_placeholder_tree
+			.lock()
+			.expect("current_placeholder_tree lock poisoned");
+		let mt = self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned");
+		(pt, mt)
+	}
+
+	/// Reconstruct an entry tree from the current internal state.  Mount
+	/// entries take precedence over placeholders at the same path
+	/// (they share the path when we created a placeholder under a
+	/// mount).
+	fn entries_from_state(
+		&self,
+		pt: &FsTree<ManagedPlaceholder>,
+		mt: &FsTree<ManagedMountPoint>,
+	) -> FsTree<ManagedTreeEntry> {
+		let mut out = FsTree::new();
+		pt.walk_top_down(|path, ph| {
+			out.insert(path, ManagedTreeEntry::Placeholder(ph.clone()));
+		});
+		mt.walk_top_down(|path, mp| {
+			out.insert(path, ManagedTreeEntry::BindMount(mp.clone()));
+		});
+		out
+	}
+
+	/// Reconcile current state with `desired_entries`.  Caller locks the
+	/// two internal states.
+	///
+	/// Steps:
+	///   1. Build the desired placeholder tree from `desired_entries`,
+	///      including ancestor directories.  For each bind-mount entry,
+	///      synthesize a default placeholder (file or dir, based on the
+	///      host stat) at the mount point if one isn't already specified
+	///      by the user.
+	///   2. Build the desired mount tree.
+	///   3. Diff current_placeholder_tree -> desired_placeholder_tree
+	///      and create/update placeholders (ignoring removals).
+	///   4. Diff current_mount_tree -> desired_mount_tree and
+	///      apply unmount / mount / set_mount_attr accordingly.
+	///   5. Diff current_placeholder_tree -> desired_placeholder_tree
+	///      again and remove now-unused placeholders (ignoring adds).
+	fn reconcile(
+		&self,
+		current_pt: &mut FsTree<ManagedPlaceholder>,
+		current_mt: &mut FsTree<ManagedMountPoint>,
+		desired_entries: &FsTree<ManagedTreeEntry>,
 	) -> Result<(), BindMountSandboxError> {
-		let mut new_tree_state = current_tree.clone();
+		let (desired_pt, desired_mt) = self.build_desired_trees(desired_entries)?;
+		debug!("Current placeholder tree: {:?}", current_pt);
+		debug!("Desired placeholder tree: {:?}", desired_pt);
+		debug!("Current mount tree: {:?}", current_mt);
+		debug!("Desired mount tree: {:?}", desired_mt);
+
+		let mut new_pt = current_pt.clone();
+		let mut new_mt = current_mt.clone();
+
+		// Phase 1: create / update placeholders top-down.
 		let mut err: Option<BindMountSandboxError> = None;
-		debug!("Current tree: {:?}", current_tree);
-		debug!("Desired tree: {:?}", desired_tree);
-		current_tree.diff(
-			&desired_tree,
+		current_pt.diff(
+			&desired_pt,
 			|sandbox_path, diff| {
 				if err.is_some() {
 					return;
 				}
-				let ns_path = CString::new(sandbox_path.as_encoded_bytes())
-					.expect("caller should have checked for NUL bytes");
+				let ns_path =
+					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
+				match diff {
+					crate::fstree::DiffTree::Added(new) => {
+						if let Err(e) = self.apply_placeholder(&ns_path, new) {
+							err = Some(e);
+							return;
+						}
+						new_pt.insert(sandbox_path, new.clone());
+					}
+					crate::fstree::DiffTree::Updated(_, new) => {
+						if let Err(e) = self.apply_placeholder(&ns_path, new) {
+							err = Some(e);
+							return;
+						}
+						*new_pt.get_mut(sandbox_path).expect("must exist") = new.clone();
+					}
+					crate::fstree::DiffTree::Removed(_) => {}
+				}
+			},
+			|_, _, _| false,
+			false,
+		);
+		if let Some(e) = err {
+			*current_pt = new_pt;
+			return Err(e);
+		}
+
+		// Phase 2: mounts diff.
+		let mut err: Option<BindMountSandboxError> = None;
+		current_mt.diff(
+			&desired_mt,
+			|sandbox_path, diff| {
+				if err.is_some() {
+					return;
+				}
+				let ns_path =
+					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
 					crate::fstree::DiffTree::Removed(_) => {
 						if let Err(e) = self.sandbox.unmount(&ns_path) {
 							err = Some(e);
 							return;
 						}
-						new_tree_state.remove(sandbox_path);
-						if let Err(e) = self.sandbox.remove_placeholder(&ns_path) {
-							err = Some(e);
-							return;
-						}
+						new_mt.remove(sandbox_path);
 					}
 					crate::fstree::DiffTree::Added(new) => {
-						let mut b = self
-							.sandbox
-							.mount_host_into_sandbox(&new.host_path, &ns_path);
-						b.attributes(new.attrs);
-						if let Err(e) = b.mount() {
+						if let Err(e) = self.sandbox.mount_host_into_sandbox_impl(
+							&new.host_path,
+							&ns_path,
+							new.attrs,
+							false,
+							false,
+							false,
+						) {
 							err = Some(e);
 							return;
 						}
-						new_tree_state.insert(sandbox_path, new.clone());
+						new_mt.insert(sandbox_path, (*new).clone());
 					}
 					crate::fstree::DiffTree::Updated(old, new) => {
 						assert_eq!(old.host_path, new.host_path);
@@ -1393,9 +1591,7 @@ impl ManagedBindMountSandbox {
 								err = Some(e);
 								return;
 							}
-							*new_tree_state
-								.get_mut(sandbox_path)
-								.expect("we must have it from before") = new.clone();
+							*new_mt.get_mut(sandbox_path).expect("must exist") = (*new).clone();
 						}
 					}
 				}
@@ -1403,11 +1599,111 @@ impl ManagedBindMountSandbox {
 			|_, old, new| old.host_path != new.host_path,
 			true,
 		);
-		*current_tree = new_tree_state;
+		if let Some(e) = err {
+			*current_pt = new_pt;
+			*current_mt = new_mt;
+			return Err(e);
+		}
+
+		// Phase 3: remove placeholders no longer desired (bottom-up).
+		let mut err: Option<BindMountSandboxError> = None;
+		current_pt.diff(
+			&desired_pt,
+			|sandbox_path, diff| {
+				if err.is_some() {
+					return;
+				}
+				if matches!(diff, crate::fstree::DiffTree::Removed(_)) {
+					let ns_path = CString::new(sandbox_path.as_encoded_bytes())
+						.expect("checked for NUL byte");
+					if ns_path.as_c_str() == c"/" {
+						return;
+					}
+					if let Err(e) = self.sandbox.remove_placeholder(&ns_path) {
+						err = Some(e);
+						return;
+					}
+					new_pt.remove(sandbox_path);
+				}
+			},
+			|_, _, _| false,
+			false,
+		);
+
+		*current_pt = new_pt;
+		*current_mt = new_mt;
 		match err {
 			Some(e) => Err(e),
 			None => Ok(()),
 		}
+	}
+
+	/// Apply (create or update) a placeholder at `ns_path`.  The parent
+	/// directory must already exist in the backing tmpfs.
+	fn apply_placeholder(
+		&self,
+		ns_path: &CStr,
+		placeholder: &ManagedPlaceholder,
+	) -> Result<(), BindMountSandboxError> {
+		if ns_path == c"/" {
+			// Root is the tmpfs itself; no placeholder to manage.
+			return Ok(());
+		}
+		validate_sandbox_path(ns_path)?;
+		let (_, leaf) = split_parent_leaf(ns_path);
+		let parent_fd = self.sandbox.open_sandbox_parent(ns_path)?;
+		create_or_update_placeholder(parent_fd.as_raw_fd(), leaf, placeholder)
+	}
+
+	/// Build (desired_placeholder_tree, desired_mount_tree) from an
+	/// entry tree.  For each bind-mount entry, a default placeholder is
+	/// synthesized at the mount point if the caller didn't supply one;
+	/// missing ancestor directories are then filled in via
+	/// `FsTree::fill_incomplete_parent` so creation order naturally
+	/// flows parent-before-child.
+	fn build_desired_trees(
+		&self,
+		desired_entries: &FsTree<ManagedTreeEntry>,
+	) -> Result<(FsTree<ManagedPlaceholder>, FsTree<ManagedMountPoint>), BindMountSandboxError> {
+		let mut placeholders: FsTree<ManagedPlaceholder> = FsTree::new();
+		let mut mounts: FsTree<ManagedMountPoint> = FsTree::new();
+		let mut err: Option<BindMountSandboxError> = None;
+		desired_entries.walk_top_down(|path, entry| {
+			if err.is_some() {
+				return;
+			}
+			if path.as_encoded_bytes() == b"/" {
+				// Root: never a placeholder.  May be a mount target.
+				if let ManagedTreeEntry::BindMount(mp) = entry {
+					mounts.insert(path, mp.clone());
+				}
+				return;
+			}
+			match entry {
+				ManagedTreeEntry::Placeholder(p) => {
+					placeholders.insert(path, p.clone());
+				}
+				ManagedTreeEntry::BindMount(mp) => {
+					if placeholders.get(path).is_none() {
+						let stat = match stat_host(&mp.host_path) {
+							Ok(s) => s,
+							Err(e) => {
+								err = Some(e);
+								return;
+							}
+						};
+						let is_dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
+						placeholders.insert(path, placeholder_default_no_metadata(is_dir));
+					}
+					mounts.insert(path, mp.clone());
+				}
+			}
+		});
+		if let Some(e) = err {
+			return Err(e);
+		}
+		placeholders.fill_incomplete_parent(|_| placeholder_default_no_metadata(true));
+		Ok((placeholders, mounts))
 	}
 
 	pub fn check_covered<'a>(
