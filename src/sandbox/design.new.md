@@ -206,8 +206,12 @@ pub enum InteractionKind {
     /// the syscall and is anchored on whatever mount currently
     /// covers the path; without a real bind mount it would be
     /// anchored on a placeholder dentry and never see the host
-    /// content even if access is granted later.  Forces a `ro,noexec`
-    /// bind mount.
+    /// content even if access is granted later.  Library translates
+    /// this into a "needs at least read access" requirement on the
+    /// path, but only if the existing covering mount is not already
+    /// `rw` (any further exec upgrade is handled at execveat time
+    /// by re-resolving the target by absolute path — see §10
+    /// "Exec-at-execveat").
     AnchoringOpen,
     /// `readlink`/`readlinkat`/`stat`/`access`/etc. — resolve-only
     /// syscalls whose result is consumed in-syscall and does not
@@ -264,15 +268,97 @@ Semantics:
 Additional refinements that reduce the impact of the "any open forces
 read" rule:
 
-- **No dummy mount where the supervisor itself lacks write access on
-  the dir.**  Before adding an `AnchoringOpen` mount, the library
+- **"Full" means `rw` for anchoring purposes; exec is handled
+  separately.**  Exec is technically a third upgradable dimension,
+  but treating it the same as r/w would force a dummy mount on every
+  open under an `rw` (but `noexec`) mount — defeating the win of
+  granting `rw` on a large project dir.  We instead take the
+  pragmatic stance: `rw` coverage on the ancestor is treated as full
+  for anchoring; exec grants are honored at **execveat time** for
+  the **abspath form** of exec syscalls by establishing a one-off
+  bind mount with `exec` attrs for the specific target file and
+  letting `SECCOMP_USER_NOTIF_FLAG_CONTINUE` replay the syscall
+  (the kernel re-resolves from `/` and crosses into the new
+  mount).  See "Exec-at-execveat (abspath form only)" below.  This
+  keeps the common "rw-but-noexec project dir" case fast (no
+  per-open dummy mount) while letting `execve("/abs/path")`-style
+  exec calls work after a late grant.  Caveat: exec via held fds
+  (`execveat(dirfd, "relpath")`, `fexecve`, `mmap(PROT_EXEC)`) is
+  not recovered — the kernel checks the fd's mount directly and
+  the supervisor cannot rewrite syscall args.  See Limitation #11.
+- **No anchoring mount where no future grant could change the picture.**
+  An `AnchoringOpen` is only useful if the path's covering mount could
+  later have its effective permissions broadened on a sub-path.  If
+  the path is already covered by a mount with `rw` (or `rwx`) attrs,
+  no future *anchoring-relevant* grant can elevate it further — exec
+  is handled at execveat as above.  Skip the interaction entirely.
+  Concrete impact: when the policy author has granted
+  `/home/mao/turnstile` as `rw` (or `rwx`), an app running
+  `cargo build` inside it issues thousands of opens; none of those
+  need a dummy mount.
+- **"Non-full" coverage triggers anchoring; "full" doesn't.**  In what
+  follows, when we say "the anchoring rule applies", read it as: the
+  covering mount lacks `r` or `w` on the leaf's effective attrs.
+  `ro,noexec` and `ro,exec` are non-full (read-only — write could be
+  granted later); `rw,noexec` and `rwx` are full (any future grant is
+  either redundant or exec-only and handled at execveat).
+- **No anchoring mount where the supervisor itself lacks write access
+  on the dir.**  Before adding an `AnchoringOpen` mount, the library
   calls `faccessat(AT_FDCWD, host_path, W_OK, AT_EACCESS)` (from
   outside any namespace).  If the supervisor has no write permission
   on the host path, the policy could never legitimately grant write
-  to the sandboxed app either, so creating the bind mount serves no
-  purpose; instead emit a `PlaceholderMirror` so the path is still
-  resolvable.  This eliminates dummy mounts for system dirs like
-  `/usr`, `/lib`, `/etc` etc. when the supervisor runs unprivileged.
+  to the sandboxed app either, so the only remaining upgrade
+  dimension is exec (handled at execveat).  Emit a
+  `PlaceholderMirror` instead.  Eliminates dummy mounts for system
+  dirs like `/usr`, `/lib`, `/etc` etc. when the supervisor runs
+  unprivileged.
+
+### Exec-at-execveat (abspath form only)
+
+When the app calls `execve(path)` or `execveat(AT_FDCWD, path, ...)`
+(or `execveat(dirfd, path, ...)` where `path` is absolute), the
+bin's seccomp handler:
+
+1. Resolves the target to an absolute sandbox path from the
+   syscall's path argument.
+2. Calls `note_path_interaction(path, ExecFile)` — policy author
+   confirms; on grant, an `exec` bind mount is established for the
+   target file (a leaf mount, not the whole dir).
+3. Responds with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.  The kernel
+   replays the syscall in the app's context.  Path resolution
+   starts from `/` (or `AT_FDCWD`'s mount, which is cwd's mount
+   — the abspath case bypasses this) and crosses into the
+   newly-installed exec mount at the leaf.  `path_noexec` checks
+   the new mount, sees `exec`, succeeds.
+
+This covers the common case: shell-style `execve("/bin/sh", ...)`,
+`posix_spawn` with abspath, etc.  The worked example becomes: app
+does `execve("/a/b/c", ...)` or `execveat(AT_FDCWD, "/a/b/c",
+...)` — library mounts host `/a/b/c` exec, CONTINUE re-resolves
+from `/`, succeeds.
+
+**What this does *not* cover**, because the supervisor cannot
+rewrite the app's syscall args and cannot execute on the app's
+behalf:
+
+- **`execveat(dirfd, "c", ...)`** where `dirfd` was opened under a
+  `noexec` mount before the exec grant.  CONTINUE replays with the
+  same `dirfd`; the kernel checks `path_noexec(&dirfd_file->f_path)`
+  against the dirfd's (still-`noexec`) mount and returns `EACCES`.
+  The newly-installed leaf exec mount is irrelevant because the
+  resolution starts from the dirfd, not from `/`.
+- **`execveat(fd, "", AT_EMPTY_PATH)`** (`fexecve`) where `fd` was
+  opened under a `noexec` mount.  Same reason — the kernel checks
+  the fd's mount directly.
+- **`mmap(PROT_EXEC, fd, ...)`** where `fd` was opened under a
+  `noexec` mount.  Same kernel check in `mmap_region`.
+
+All three failure cases are documented under Limitation #11.
+They share a common workaround: if the policy author wants exec
+through a held fd, they must grant exec on the relevant subtree
+**before** the corresponding open, so the fd is anchored on an
+exec mount from the start.  Alternatively, the app can re-open
+by path after the grant.
 - **`openat("/")` and chdir-to-`/` are no-ops.**  The sandbox root is
   always already mounted (the bind of `root_tmpfs` over m1's `/`),
   and you cannot layer another mount over `/` and have it affect
@@ -528,11 +614,30 @@ keep the mount alive but the path is gone from current_mt.
    access.  An "I just want to resolve, not read" intent is not
    expressible at the kernel boundary for these syscalls.  The same
    applies to long-lived O_RDONLY directory fds (the dir must already
-   be backed by a real bind mount at open time).  Mitigations that
-   reduce how often this comes up:
+   be backed by a real bind mount at open time).  Scope and
+   mitigations:
+   - **Only triggers under non-full ancestor coverage.**  "Full"
+     here means `rw` (read+write) on the leaf's effective attrs.
+     If the path is already under a `rw` (or `rwx`) mount, no
+     future grant could broaden anchoring-relevant permissions
+     further; exec is handled at execveat time by abspath
+     re-resolution (see §10 "Exec-at-execveat").  In practice, an
+     app running entirely inside a `rw`-granted subtree (e.g.
+     `cargo build` under a fully-granted project dir) issues no
+     anchoring mounts at all.
+   - **Exec is not an anchoring-triggering dimension.**  Treating
+     exec as upgradable for anchoring purposes would force a dummy
+     mount on every open under a `rw,noexec` ancestor, which would
+     ruin the cost model for the common "granted rw, noexec"
+     project-dir case.  Instead, exec grants are honored at
+     execveat time via a one-off leaf mount and abspath
+     re-resolution.  This trades one corner case —
+     `mmap(PROT_EXEC, fd, ...)` against a fd opened before the
+     exec grant — for the bulk fast path; see Limitation #11.
    - Skip if the supervisor has no write permission on the host path
      (write could never be granted anyway → only a `PlaceholderMirror`
-     is offered, no bind mount, no read request).
+     is offered; if exec is the only remaining upgrade dimension we
+     err on the side of `PlaceholderMirror` for now).
    - Skip for the sandbox root `/`.
    - Resolve-only syscalls that do not produce a fd (`readlink`,
      `stat`, `access`, ...) use placeholder mirroring instead — no
@@ -585,6 +690,36 @@ keep the mount alive but the path is gone from current_mt.
     flags are enabled, the supervisor performs the relevant syscall
     in m0.  Risks: see §11.  The setting is off by default and the
     policy author has to opt in.
+11. **Exec through pre-grant fds fails.**  The exec dimension is
+    intentionally not treated as anchoring-triggering (see §10
+    "Exec-at-execveat (abspath form only)") to keep the cost model
+    for `rw,noexec` ancestors bearable.  Consequently, any syscall
+    whose exec check the kernel performs against a held fd's
+    vfsmount fails if that fd was acquired before the exec grant:
+    - **`mmap(PROT_EXEC, fd, ...)`**: `mmap_region` calls
+      `path_noexec(&file->f_path)`; on `noexec`, `VM_MAYEXEC` is
+      stripped and `PROT_EXEC` returns `EPERM`.  No subsequent
+      `mprotect` can recover.
+    - **`execveat(dirfd, "relpath", ...)`** with relative path:
+      kernel resolves from `dirfd`'s `struct path`; `path_noexec`
+      against `dirfd`'s mount fails with `EACCES`.  The supervisor
+      cannot rewrite the syscall args, and the abspath exec mount
+      is unreachable from the dirfd's resolution root.
+    - **`execveat(fd, "", AT_EMPTY_PATH)`** (`fexecve` /
+      `execveat`-on-fd): same check against `fd`'s mount.
+
+    Scope and workarounds:
+    - Dynamic linkers (glibc ld.so, musl) re-open the .so by
+      abspath, so library loading is unaffected.
+    - Shell-style `execve("/abs/path", ...)` and
+      `execveat(AT_FDCWD, "/abs/path", ...)` are handled by
+      `Exec-at-execveat` and do work.
+    - `execveat(dirfd, path)` with an abspath also works (kernel
+      ignores dirfd when path is absolute).
+    - Apps that need exec through pre-grant fds must either
+      re-open by abspath after the grant, or the policy author
+      grants exec on the relevant subtree **before** the original
+      open so the fd is anchored on an exec mount.
 
 ## Changes needed (relative to current code)
 
