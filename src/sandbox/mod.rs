@@ -2215,6 +2215,22 @@ impl ManagedBindMountSandbox {
 					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
 					crate::fstree::DiffTree::Removed(old) => {
+						// A `Removed` whose path still exists in the
+						// desired mount tree is half of a host_path-change
+						// "split" (§5): the diff emits Removed(P) then
+						// Added(P).  Its identity is being discarded and
+						// the following Added re-covers P, so detach the
+						// old bind unconditionally (MNT_DETACH) rather than
+						// running the §6 keep-on-EBUSY dance — keeping it
+						// would leave the new bind shadowing the old one.
+						if desired_mt.get(sandbox_path).is_some() {
+							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
+								err = Some(e);
+								return;
+							}
+							new_mt.remove(sandbox_path);
+							return;
+						}
 						// §6: discover the direct (topmost) sub-mounts
 						// still present under this path in the live tree
 						// and hand them to the Unmount choreography, which
@@ -2625,6 +2641,16 @@ mountinfo::parse_mountinfo(raw)
 .any(|e| e.mount_point.as_encoded_bytes() == mp)
 }
 
+/// Return the bind source (`root` field) of the topmost mount at `mp`,
+/// if any.
+fn mountinfo_root_for(raw: &[u8], mp: &[u8]) -> Option<Vec<u8>> {
+mountinfo::parse_mountinfo(raw)
+.iter()
+.filter(|e| e.mount_point.as_encoded_bytes() == mp)
+.last()
+.map(|e| e.root.as_bytes().to_vec())
+}
+
 /// Exercise `read_m1_mountinfo` + `park_to_scratch` +
 /// `restore_from_scratch`: a mount parked into the hidden scratch
 /// tmpfs disappears from its original mountpoint, and restoring it
@@ -2764,6 +2790,54 @@ assert!(
 assert!(
 mountinfo_has_mountpoint(&after, b"/p/ssl"),
 "/p/ssl child must be preserved through parent removal"
+);
+}
+
+/// A host_path change is handled as a §5 split (Removed then Added).
+/// The mountpoint must survive and rebind to the new host source.
+#[test]
+fn managed_host_path_change_rebinds() {
+let msb = match ManagedBindMountSandbox::new(false) {
+Ok(s) => s,
+Err(e) => {
+eprintln!("skipping privileged managed test: setup failed: {e}");
+return;
+}
+};
+msb.add_or_update_mount(
+OsStr::new("/p"),
+ManagedMountPoint {
+host_path: CString::new("/etc").unwrap(),
+attrs: MountAttributes::ro(),
+},
+)
+.expect("add /p -> /etc");
+let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
+assert_eq!(
+mountinfo_root_for(&before, b"/p").as_deref(),
+Some(&b"/etc"[..]),
+"/p should bind /etc initially"
+);
+
+// Change the host source for the same sandbox path.
+msb.add_or_update_mount(
+OsStr::new("/p"),
+ManagedMountPoint {
+host_path: CString::new("/usr").unwrap(),
+attrs: MountAttributes::ro(),
+},
+)
+.expect("rebind /p -> /usr");
+
+let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
+assert!(
+mountinfo_has_mountpoint(&after, b"/p"),
+"/p must still be mounted after host_path change"
+);
+assert_eq!(
+mountinfo_root_for(&after, b"/p").as_deref(),
+Some(&b"/usr"[..]),
+"/p should bind /usr after the host_path change"
 );
 }
 }
