@@ -13,12 +13,35 @@ pub(crate) struct MountObj(pub ForeignFd);
 
 impl MountObj {
 	pub fn new_tmpfs() -> io::Result<Self> {
+		Self::new_tmpfs_mode(None)
+	}
+
+	/// Create a new tmpfs mount object. When `mode` is provided (e.g. `c"0777"`),
+	/// the tmpfs root inode is created with that permission mode. This is used for
+	/// the hidden scratch tmpfs, whose root is owned by an unmapped uid and would
+	/// otherwise be unwritable by the supervisor's credentials.
+	pub fn new_tmpfs_mode(mode: Option<&std::ffi::CStr>) -> io::Result<Self> {
 		unsafe {
 			// libc::FSOPEN_CLOEXEC does not exist yet
 			let fs = libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), 0) as libc::c_int;
 			if fs < 0 {
 				let err = perror!("fsopen(tmpfs)");
 				return Err(io::Error::from_raw_os_error(err));
+			}
+			if let Some(mode) = mode {
+				let ret = libc::syscall(
+					libc::SYS_fsconfig,
+					fs,
+					/* FSCONFIG_SET_STRING */ 1,
+					c"mode".as_ptr(),
+					mode.as_ptr(),
+					0,
+				);
+				if ret != 0 {
+					let err = perror!("fsconfig(mode)");
+					libc::close(fs);
+					return Err(io::Error::from_raw_os_error(err));
+				}
 			}
 			let ret = libc::syscall(
 				libc::SYS_fsconfig,
