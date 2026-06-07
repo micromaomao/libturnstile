@@ -24,6 +24,18 @@ use crate::{
 /// context, but to make our life easier we will do it anyway in debug
 /// builds.
 const ENABLE_LOG_IN_FORK: bool = cfg!(debug_assertions);
+
+/// Generate a process-unique scratch directory name for parking a mount
+/// into the hidden scratch tmpfs (see [`BindMountSandbox::park_to_scratch`]).
+/// The name need only be unique among concurrently-parked mounts within
+/// this process; a monotonic counter combined with the pid suffices.
+fn next_scratch_uuid() -> CString {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+	let pid = unsafe { libc::getpid() };
+	CString::new(format!("park-{pid}-{n}")).expect("no NUL in generated name")
+}
 macro_rules! perror {
 	($s:literal) => {{
 		let err = libc::__errno_location().read();
@@ -1340,7 +1352,63 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// Join the current thread into the sandbox.  This can be used
+	/// §6 Unmount choreography: park every direct sub-mount under
+	/// `ns_path` to the hidden scratch tmpfs, attempt a non-detach
+	/// `umount2(ns_path)`, then restore the parked sub-mounts onto their
+	/// original paths.  Returns `Ok(true)` if the parent mount was
+	/// successfully unmounted, or `Ok(false)` if it was kept because the
+	/// app still holds it (the umount returned `EBUSY`).  In both cases
+	/// the children keep their `struct mount` identity (and thus any app
+	/// fds / cwd resolving through them remain valid).
+	///
+	/// `child_ns_paths` must list the *direct* (topmost) sub-mounts of
+	/// `ns_path` in the live mount tree — parking all present children
+	/// (not just still-desired ones) is required so that none of them
+	/// pins the parent and causes a spurious `EBUSY` (see §6).  Their
+	/// mountpoint dentries must exist on the layer revealed by the umount
+	/// (the placeholder hierarchy), which the caller is responsible for.
+	pub(self) fn unmount_covering(
+		&self,
+		ns_path: &CStr,
+		child_ns_paths: &[CString],
+	) -> Result<bool, BindMountSandboxError> {
+		validate_sandbox_path(ns_path)?;
+		// Park each direct child out of the way so it can't pin the
+		// parent; each gets a unique scratch directory.
+		let mut parked: Vec<(CString, &CStr)> = Vec::with_capacity(child_ns_paths.len());
+		for child in child_ns_paths {
+			let uuid = next_scratch_uuid();
+			if let Err(e) = self.park_to_scratch(child, &uuid) {
+				// Best-effort: restore anything already parked before
+				// propagating the failure.
+				for (uuid, dest) in &parked {
+					let _ = self.restore_from_scratch(uuid, dest);
+				}
+				return Err(e);
+			}
+			parked.push((uuid, child.as_c_str()));
+		}
+		// Attempt a non-detach unmount.  With every child parked, only the
+		// app's own references on `ns_path` can still pin it.
+		let unmounted = match self.unmount(ns_path, false) {
+			Ok(()) => true,
+			Err(BindMountSandboxError::UnmountFailed(e)) if e == libc::EBUSY => false,
+			Err(e) => {
+				for (uuid, dest) in &parked {
+					let _ = self.restore_from_scratch(uuid, dest);
+				}
+				return Err(e);
+			}
+		};
+		// Restore each parked child onto its original path: on the
+		// revealed placeholder layer when unmounted, or under the kept
+		// mount on EBUSY.
+		for (uuid, dest) in &parked {
+			self.restore_from_scratch(uuid, dest)?;
+		}
+		Ok(unmounted)
+	}
+
 	/// instead of [`Self::run_command`], most likely within a pre_exec
 	/// hook or after fork()ing.  This cannot be used if the current
 	/// process contains more than one threads.
@@ -2146,12 +2214,50 @@ impl ManagedBindMountSandbox {
 				let ns_path =
 					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
-					crate::fstree::DiffTree::Removed(_) => {
-						if let Err(e) = self.sandbox.unmount(&ns_path, true) {
-							err = Some(e);
-							return;
+					crate::fstree::DiffTree::Removed(old) => {
+						// §6: discover the direct (topmost) sub-mounts
+						// still present under this path in the live tree
+						// and hand them to the Unmount choreography, which
+						// parks them out of the way, does a non-detach
+						// umount, then restores them — preserving each
+						// child's `struct mount` identity instead of
+						// detaching the whole subtree.
+						let mut children: Vec<CString> = Vec::new();
+						new_mt.walk_subtree_top_down(sandbox_path, true, |child_path, _| {
+							if let Ok(c) = CString::new(child_path.as_encoded_bytes()) {
+								children.push(c);
+							}
+						});
+						match self.sandbox.unmount_covering(&ns_path, &children) {
+							Ok(true) => {
+								new_mt.remove(sandbox_path);
+							}
+							Ok(false) => {
+								// EBUSY: the app itself still holds this
+								// path.  Keep it but lock it down to the
+								// covering attrs (§4 SetAttrToCovering);
+								// a later reconcile retries the removal
+								// once the app lets go (eventual
+								// consistency).
+								let covering = self.covering_attrs(&desired_mt, sandbox_path);
+								if covering != old.user.attrs {
+									if let Err(e) = self.sandbox.set_mount_attr(
+										&ns_path,
+										covering,
+										old.user.attrs,
+									) {
+										err = Some(e);
+										return;
+									}
+								}
+								let entry = new_mt.get_mut(sandbox_path).expect("must exist");
+								entry.user.attrs = covering;
+							}
+							Err(e) => {
+								err = Some(e);
+								return;
+							}
 						}
-						new_mt.remove(sandbox_path);
 					}
 					crate::fstree::DiffTree::Added(new) => {
 						// §7: discover the immediate sub-mounts this new
@@ -2420,6 +2526,38 @@ impl ManagedBindMountSandbox {
 		}
 	}
 
+	/// §4 `SetAttrToCovering`: the attributes a path should fall back to
+	/// when an entry we tried to remove is kept (app still holds it).
+	/// This is the attrs of the deepest desired entry that is a proper
+	/// prefix of `path`, or the safe default `ro,noexec` when none
+	/// covers it.
+	fn covering_attrs(
+		&self,
+		desired_mt: &FsTree<ManagedMountPoint>,
+		path: &std::ffi::OsStr,
+	) -> MountAttributes {
+		let mut best: Option<MountAttributes> = None;
+		let mut best_len = 0usize;
+		desired_mt.walk_top_down(|p, mp| {
+			let pb = p.as_encoded_bytes();
+			let path_b = path.as_encoded_bytes();
+			// `p` must be a proper ancestor of `path`: either "/" or a
+			// path that `path` continues with a '/' separator.
+			let is_ancestor = if pb == b"/" {
+				path_b != b"/"
+			} else {
+				path_b.len() > pb.len()
+					&& path_b.starts_with(pb)
+					&& path_b[pb.len()] == b'/'
+			};
+			if is_ancestor && pb.len() >= best_len {
+				best_len = pb.len();
+				best = Some(mp.attrs);
+			}
+		});
+		best.unwrap_or_else(MountAttributes::ro)
+	}
+
 	pub fn check_covered<'a>(
 		&self,
 		path: &CStr,
@@ -2525,6 +2663,107 @@ let after = sb.read_m1_mountinfo().expect("read mountinfo after restore");
 assert!(
 mountinfo_has_mountpoint(&after, b"/etc"),
 "/etc must be mounted again after restore"
+);
+}
+
+/// Exercise `unmount_covering` (§6): a parent mount with a child
+/// sub-mount is unmounted while the child's `struct mount` identity is
+/// preserved.  After the choreography the parent is gone but the child
+/// is restored on the revealed placeholder layer.
+#[test]
+fn unmount_covering_preserves_child() {
+let Some(sb) = try_new_sandbox() else {
+return;
+};
+// Parent bind: /etc at /p (creates the /p placeholder).
+sb.mount_host_into_sandbox_impl(
+c"/etc",
+c"/p",
+MountAttributes::ro(),
+false,
+false,
+true,
+)
+.expect("mount parent /p");
+// Child bind: /etc at /p/ssl (mountpoint /etc/ssl exists through the
+// /p bind; also creates a /p/ssl placeholder on the revealed layer).
+sb.mount_host_into_sandbox_impl(
+c"/etc",
+c"/p/ssl",
+MountAttributes::ro(),
+false,
+false,
+true,
+)
+.expect("mount child /p/ssl");
+
+let before = sb.read_m1_mountinfo().expect("read mountinfo");
+assert!(
+mountinfo_has_mountpoint(&before, b"/p"),
+"/p should be mounted before unmount_covering"
+);
+assert!(
+mountinfo_has_mountpoint(&before, b"/p/ssl"),
+"/p/ssl should be mounted before unmount_covering"
+);
+
+let unmounted = sb
+.unmount_covering(c"/p", &[CString::new("/p/ssl").unwrap()])
+.expect("unmount_covering /p");
+assert!(
+unmounted,
+"/p should have been unmounted (nothing holds it)"
+);
+
+let after = sb.read_m1_mountinfo().expect("read mountinfo after");
+assert!(
+!mountinfo_has_mountpoint(&after, b"/p"),
+"/p must be gone after unmount_covering"
+);
+assert!(
+mountinfo_has_mountpoint(&after, b"/p/ssl"),
+"/p/ssl child mount must be preserved after unmount_covering"
+);
+}
+
+/// End-to-end §6 check through the managed reconcile API: removing a
+/// parent mount that has a still-desired child preserves the child
+/// (the `Removed` branch routes through `unmount_covering`).
+#[test]
+fn managed_remove_preserves_child_mount() {
+let msb = match ManagedBindMountSandbox::new(false) {
+Ok(s) => s,
+Err(e) => {
+eprintln!("skipping privileged managed test: setup failed: {e}");
+return;
+}
+};
+let mp = ManagedMountPoint {
+host_path: CString::new("/etc").unwrap(),
+attrs: MountAttributes::ro(),
+};
+msb.add_or_update_mount(OsStr::new("/p"), mp.clone())
+.expect("add /p");
+msb.add_or_update_mount(OsStr::new("/p/ssl"), mp.clone())
+.expect("add /p/ssl");
+
+let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
+assert!(mountinfo_has_mountpoint(&before, b"/p"), "/p mounted");
+assert!(
+mountinfo_has_mountpoint(&before, b"/p/ssl"),
+"/p/ssl mounted"
+);
+
+msb.remove_mount(OsStr::new("/p")).expect("remove /p");
+
+let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
+assert!(
+!mountinfo_has_mountpoint(&after, b"/p"),
+"/p must be removed"
+);
+assert!(
+mountinfo_has_mountpoint(&after, b"/p/ssl"),
+"/p/ssl child must be preserved through parent removal"
 );
 }
 }
