@@ -458,6 +458,12 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 /// process (matches the kernel's `XATTR_SIZE_MAX`).
 const XATTR_SIZE_MAX: usize = 65536;
 
+/// Read exactly `len` bytes from the traced process's memory at `ptr`.
+///
+/// Safety: the `MaybeUninit` slice aliases `buf`'s spare capacity (`len`
+/// bytes were just reserved).  `read_target_memory` fully initialises it
+/// (or returns `Err`, in which case we never call `set_len`), so the
+/// subsequent `set_len(len)` only exposes initialised bytes.
 fn read_target_bytes(
 	req: &mut RequestContext,
 	ptr: *const u8,

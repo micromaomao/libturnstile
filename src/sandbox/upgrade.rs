@@ -414,6 +414,11 @@ fn build_path_open_how() -> open_how {
 /// (an `O_PATH` fd, addressed via its `/proc/self/fd` magic symlink so
 /// the op resolves through m1's mount).  Returns the `errno` on failure.
 fn perform_modify(kind: &ModifyFdKind, fd: libc::c_int) -> Result<(), libc::c_int> {
+	// `fd` is a freshly m1-opened O_PATH handle returned by
+	// `m1_open_checked`, so it is always a valid non-negative descriptor;
+	// its /proc/self/fd magic symlink redirects the path-based ops below
+	// through m1's mount.
+	debug_assert!(fd >= 0);
 	let proc_path = format!("/proc/self/fd/{}\0", fd);
 	let p = proc_path.as_ptr() as *const libc::c_char;
 	let ret = unsafe {

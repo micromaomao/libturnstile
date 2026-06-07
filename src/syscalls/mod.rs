@@ -29,10 +29,19 @@ const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SeccompNotifAddfd {
+	/// The id of the notification being handled (the trapped syscall).
 	id: u64,
+	/// `SECCOMP_ADDFD_FLAG_*` bits (e.g. `SETFD`, `SEND`).
 	flags: u32,
+	/// The source descriptor, valid in *this* (the supervisor) process,
+	/// to be duplicated into the traced process.
 	srcfd: u32,
+	/// When `SETFD` is set, the exact descriptor number to install at in
+	/// the traced process; ignored otherwise (kernel picks the lowest
+	/// free number).
 	newfd: u32,
+	/// `O_CLOEXEC`-style flags to apply to the installed descriptor in
+	/// the traced process.
 	newfd_flags: u32,
 }
 
