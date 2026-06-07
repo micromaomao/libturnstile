@@ -39,6 +39,7 @@ macro_rules! perror {
 }
 
 mod mount_obj;
+mod mountinfo;
 mod namespace;
 mod utils;
 
@@ -138,6 +139,14 @@ pub struct BindMountSandbox {
 	/// is therefore acceptable to `open_tree()` once the helper process
 	/// enters m0.
 	host_root_fd: ForeignFd,
+	/// O_PATH fd to the *scratch* tmpfs root inside m1.  The scratch is
+	/// a brand-new tmpfs (distinct from `root_tmpfs`) that is made m1's
+	/// root and then shadowed beneath the `root_tmpfs` bind mount, so
+	/// the sandboxed app never sees it.  It serves as a hidden,
+	/// m1-owned parent into which mounts can be temporarily parked
+	/// during reconcile (see `park_to_scratch`).  Resolving this fd from
+	/// the supervisor side reaches the scratch directly.
+	m1_scratch_fd: ForeignFd,
 }
 
 #[derive(Debug)]
@@ -323,11 +332,45 @@ impl BindMountSandbox {
 			)?;
 			ForeignFd { local_fd: raw_fd }
 		};
+		// Create the scratch tmpfs inside m1 and make it m1's root, then
+		// capture an O_PATH handle to it.  This happens *before* the
+		// root_tmpfs bind below, so the scratch ends up shadowed beneath
+		// the placeholder root and is invisible to the app (see §1 of
+		// design.fd-upgrade.md).  We enter l0_user (for privilege over
+		// the nested user/mount namespaces) and l1_mnt (m1).
+		let m1_scratch_fd = unsafe {
+			let nsenter_fn = namespaces.nsenter_fn(true, false, true, false);
+			let raw_fd = send_fd_from_ns(
+				nsenter_fn,
+				|| {
+					// 1. fsmount a brand-new tmpfs (distinct from
+					//    root_tmpfs).
+					let scratch = MountObj::new_tmpfs()?;
+					// 2. move_mount it onto "/" so it becomes m1's root
+					//    and thus belongs to m1 (check_mnt passes),
+					//    qualifying it as a move_mount target parent.
+					scratch.mount(libc::AT_FDCWD, c"/", false)?;
+					// 3. Open "/" (now the scratch) as an O_PATH dirfd.
+					let fd = libc::open(
+						c"/".as_ptr(),
+						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+					);
+					if fd < 0 {
+						return Err(io::Error::last_os_error());
+					}
+					Ok(fd)
+				},
+				BindMountSandboxError::SetupScratchFailed,
+			)?;
+			ForeignFd { local_fd: raw_fd }
+		};
 		let s = Self {
 			namespaces,
 			root_tmpfs,
 			host_root_fd,
+			m1_scratch_fd,
 		};
+		// 4. Bind-mount root_tmpfs over m1's "/", shadowing the scratch.
 		s.mount_host_into_sandbox_impl(
 			CStr::from_bytes_with_nul(
 				format!("/proc/self/fd/{}\0", s.root_tmpfs.0.as_raw_fd()).as_bytes(),
@@ -658,7 +701,15 @@ impl BindMountSandbox {
 	/// sandbox.  Symlinks are not followed.  The path must not be "/".
 	/// The path must have been previously bind-mounted with
 	/// [`Self::mount_host_into_sandbox`].
-	pub fn unmount(&self, ns_path: &CStr) -> Result<(), BindMountSandboxError> {
+	///
+	/// When `forcibly` is false (the default for steady-state
+	/// reconcile), a plain `umount2` is used: it fails with `EBUSY` if
+	/// the app still holds the mount (an open fd or cwd), which the
+	/// caller uses as the source of truth for "still in use".  When
+	/// `forcibly` is true, `MNT_DETACH` is added so the unmount always
+	/// succeeds, detaching the subtree lazily (held references keep it
+	/// alive until they close).
+	pub fn unmount(&self, ns_path: &CStr, forcibly: bool) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(ns_path)?;
 		if ns_path.to_bytes() == b"/" {
 			return Err(BindMountSandboxError::InvalidSandboxPath(
@@ -702,7 +753,11 @@ impl BindMountSandbox {
 				if res != 0 {
 					return perror!("fchdir");
 				}
-				let res = libc::umount2(leaf.as_ptr(), libc::MNT_DETACH | libc::UMOUNT_NOFOLLOW);
+				let mut flags = libc::UMOUNT_NOFOLLOW;
+				if forcibly {
+					flags |= libc::MNT_DETACH;
+				}
+				let res = libc::umount2(leaf.as_ptr(), flags);
 				if res != 0 {
 					return perror!("umount2");
 				}
@@ -711,7 +766,9 @@ impl BindMountSandbox {
 		}
 		.map_err(BindMountSandboxError::ForkError)?;
 		if fork_res != 0 {
-			error!("Failed to unmount {:?}: errno {}", ns_path, fork_res);
+			if fork_res != libc::EBUSY {
+				error!("Failed to unmount {:?}: errno {}", ns_path, fork_res);
+			}
 			return Err(BindMountSandboxError::UnmountFailed(fork_res));
 		} else {
 			info!("Unmounted {:?}", ns_path);
@@ -776,6 +833,307 @@ impl BindMountSandbox {
 			return Err(BindMountSandboxError::MountSetAttrsFailed(fork_res));
 		} else {
 			info!("Set mount attributes for {:?} to {}", ns_path, attrs);
+		}
+		Ok(())
+	}
+
+	/// Open `path` (absolute, resolved from "/") inside m1, returning an
+	/// fd that resolves through m1's *current* mount layout.  `openhow`
+	/// gives the open flags / resolve flags; the path is always resolved
+	/// relative to m1's root.  Backs the fd-upgrade / proxy path (§11)
+	/// and the reconcile choreography (opening child mounts and mount
+	/// targets).
+	///
+	/// We resolve in m1 (not m0) so the sandbox's own mount layout and
+	/// `mount_attr`s are authoritative and we cannot accidentally
+	/// over-grant (§11.4).
+	pub fn open_in_m1(
+		&self,
+		path: &CStr,
+		openhow: &libc::open_how,
+	) -> Result<ForeignFd, BindMountSandboxError> {
+		let openhow_copy = *openhow;
+		let raw_fd = unsafe {
+			let nsenter_fn = self.namespaces.nsenter_fn(true, false, true, true);
+			send_fd_from_ns(
+				nsenter_fn,
+				|| {
+					if libc::chdir(c"/".as_ptr()) != 0 {
+						return Err(io::Error::last_os_error());
+					}
+					let fd = libc::syscall(
+						libc::SYS_openat2,
+						libc::AT_FDCWD,
+						path.as_ptr(),
+						&openhow_copy as *const _,
+						std::mem::size_of::<libc::open_how>(),
+					) as libc::c_int;
+					if fd < 0 {
+						return Err(io::Error::last_os_error());
+					}
+					Ok(fd)
+				},
+				BindMountSandboxError::OpenInM1Failed,
+			)?
+		};
+		Ok(ForeignFd { local_fd: raw_fd })
+	}
+
+	/// Read `/proc/self/mountinfo` as seen from inside m1, returning its
+	/// raw bytes.  A short-lived helper forks, `setns`es into m1, reads
+	/// its own mountinfo (now m1's view) and streams it back.  Backs the
+	/// §13 mount-tree refresh.
+	pub fn read_m1_mountinfo(&self) -> Result<Vec<u8>, BindMountSandboxError> {
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, false, true, false) };
+		unsafe {
+			thread::scope(|s| {
+				let mut pipe_fds = [-1i32; 2];
+				if libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+					return Err(BindMountSandboxError::ReadMountinfoFailed(
+						io::Error::last_os_error(),
+					));
+				}
+				let read_fd = pipe_fds[0];
+				let write_fd = pipe_fds[1];
+
+				// Read the whole pipe concurrently with the child writing,
+				// so a mountinfo larger than the pipe buffer can't
+				// deadlock.
+				let reader = s.spawn(move || {
+					let mut out = Vec::new();
+					let mut buf = [0u8; 8192];
+					loop {
+						let n = libc::read(
+							read_fd,
+							buf.as_mut_ptr() as *mut libc::c_void,
+							buf.len(),
+						);
+						if n < 0 {
+							let err = io::Error::last_os_error();
+							if err.kind() == io::ErrorKind::Interrupted {
+								continue;
+							}
+							libc::close(read_fd);
+							return Err(err);
+						}
+						if n == 0 {
+							break;
+						}
+						out.extend_from_slice(&buf[..n as usize]);
+					}
+					libc::close(read_fd);
+					Ok(out)
+				});
+
+				let fork_res = fork_wait(|| {
+					libc::close(read_fd);
+					match nsenter_fn() {
+						Ok(()) => (),
+						Err(e) => {
+							if ENABLE_LOG_IN_FORK {
+								error!("Failed to enter m1 for mountinfo: {}", e);
+							}
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+					}
+					let src = libc::open(
+						c"/proc/self/mountinfo".as_ptr(),
+						libc::O_RDONLY | libc::O_CLOEXEC,
+					);
+					if src < 0 {
+						return perror!("open(/proc/self/mountinfo)");
+					}
+					let mut buf = [0u8; 8192];
+					loop {
+						let n =
+							libc::read(src, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+						if n < 0 {
+							let err = libc::__errno_location().read();
+							if err == libc::EINTR {
+								continue;
+							}
+							libc::close(src);
+							return err;
+						}
+						if n == 0 {
+							break;
+						}
+						let mut off = 0isize;
+						while off < n {
+							let w = libc::write(
+								write_fd,
+								buf.as_ptr().offset(off) as *const libc::c_void,
+								(n - off) as usize,
+							);
+							if w < 0 {
+								let err = libc::__errno_location().read();
+								if err == libc::EINTR {
+									continue;
+								}
+								libc::close(src);
+								return err;
+							}
+							off += w;
+						}
+					}
+					libc::close(src);
+					0
+				});
+				// Closing our copy of the write end lets the reader see EOF.
+				libc::close(write_fd);
+
+				let fork_res = match fork_res {
+					Ok(c) => c,
+					Err(e) => {
+						let _ = reader.join();
+						return Err(BindMountSandboxError::ForkError(e));
+					}
+				};
+				let read_res = reader.join().expect("mountinfo reader thread panicked");
+				if fork_res != 0 {
+					return Err(BindMountSandboxError::ReadMountinfoFailed(
+						io::Error::from_raw_os_error(fork_res),
+					));
+				}
+				read_res.map_err(BindMountSandboxError::ReadMountinfoFailed)
+			})
+		}
+	}
+
+	/// Move the mount currently at `ns_path` into the hidden scratch
+	/// tmpfs at `scratch/<uuid>`, preserving its `struct mount` identity.
+	/// Used to temporarily "park" a child (or a soon-to-be-rebuilt
+	/// parent's descendants) out of the way during reconcile so a
+	/// non-`MNT_DETACH` umount of its old location can proceed.  The
+	/// `uuid` must be a single path component (no slashes).
+	pub fn park_to_scratch(
+		&self,
+		ns_path: &CStr,
+		uuid: &CStr,
+	) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(ns_path)?;
+		let scratch_fd = self.m1_scratch_fd.as_raw_fd();
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
+		let fork_res = unsafe {
+			fork_wait(|| {
+				match nsenter_fn() {
+					Ok(()) => (),
+					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
+				}
+				if libc::chdir(c"/".as_ptr()) != 0 {
+					return perror!("chdir");
+				}
+				// Create scratch/<uuid> to receive the parked mount.
+				if libc::mkdirat(scratch_fd, uuid.as_ptr(), 0o700) != 0 {
+					let err = libc::__errno_location().read();
+					if err != libc::EEXIST {
+						return perror!("mkdirat(scratch/uuid)");
+					}
+				}
+				let mut openhow: libc::open_how = mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				let src_fd = libc::syscall(
+					libc::SYS_openat2,
+					libc::AT_FDCWD,
+					ns_path.as_ptr(),
+					&openhow as *const _,
+					std::mem::size_of::<libc::open_how>(),
+				) as libc::c_int;
+				if src_fd < 0 {
+					return perror!("openat2(park source)");
+				}
+				let res = libc::syscall(
+					libc::SYS_move_mount,
+					src_fd,
+					c"".as_ptr(),
+					scratch_fd,
+					uuid.as_ptr(),
+					libc::MOVE_MOUNT_F_EMPTY_PATH,
+				);
+				libc::close(src_fd);
+				if res != 0 {
+					return perror!("move_mount(park)");
+				}
+				0
+			})
+		}
+		.map_err(BindMountSandboxError::ForkError)?;
+		if fork_res != 0 {
+			return Err(BindMountSandboxError::ParkToScratchFailed(fork_res));
+		}
+		Ok(())
+	}
+
+	/// Move a previously parked mount at `scratch/<uuid>` back to
+	/// `dest` (an absolute m1 path whose mountpoint dentry must exist),
+	/// then remove the now-empty `scratch/<uuid>` directory.  The inverse
+	/// of [`Self::park_to_scratch`].
+	pub fn restore_from_scratch(
+		&self,
+		uuid: &CStr,
+		dest: &CStr,
+	) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(dest)?;
+		let scratch_fd = self.m1_scratch_fd.as_raw_fd();
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
+		let fork_res = unsafe {
+			fork_wait(|| {
+				match nsenter_fn() {
+					Ok(()) => (),
+					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
+				}
+				if libc::chdir(c"/".as_ptr()) != 0 {
+					return perror!("chdir");
+				}
+				let mut openhow: libc::open_how = mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS;
+				let src_fd = libc::syscall(
+					libc::SYS_openat2,
+					scratch_fd,
+					uuid.as_ptr(),
+					&openhow as *const _,
+					std::mem::size_of::<libc::open_how>(),
+				) as libc::c_int;
+				if src_fd < 0 {
+					return perror!("openat2(scratch/uuid)");
+				}
+				let mut dest_openhow: libc::open_how = mem::zeroed();
+				dest_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				dest_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				let dest_fd = libc::syscall(
+					libc::SYS_openat2,
+					libc::AT_FDCWD,
+					dest.as_ptr(),
+					&dest_openhow as *const _,
+					std::mem::size_of::<libc::open_how>(),
+				) as libc::c_int;
+				if dest_fd < 0 {
+					libc::close(src_fd);
+					return perror!("openat2(restore dest)");
+				}
+				let res = libc::syscall(
+					libc::SYS_move_mount,
+					src_fd,
+					c"".as_ptr(),
+					dest_fd,
+					c"".as_ptr(),
+					libc::MOVE_MOUNT_F_EMPTY_PATH | libc::MOVE_MOUNT_T_EMPTY_PATH,
+				);
+				libc::close(src_fd);
+				libc::close(dest_fd);
+				if res != 0 {
+					return perror!("move_mount(restore)");
+				}
+				// Best-effort cleanup of the now-empty scratch dir.
+				libc::unlinkat(scratch_fd, uuid.as_ptr(), libc::AT_REMOVEDIR);
+				0
+			})
+		}
+		.map_err(BindMountSandboxError::ForkError)?;
+		if fork_res != 0 {
+			return Err(BindMountSandboxError::RestoreFromScratchFailed(fork_res));
 		}
 		Ok(())
 	}
@@ -1562,7 +1920,7 @@ impl ManagedBindMountSandbox {
 					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
 					crate::fstree::DiffTree::Removed(_) => {
-						if let Err(e) = self.sandbox.unmount(&ns_path) {
+						if let Err(e) = self.sandbox.unmount(&ns_path, true) {
 							err = Some(e);
 							return;
 						}

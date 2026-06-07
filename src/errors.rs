@@ -119,4 +119,14 @@ pub enum BindMountSandboxError {
 	InvalidSandboxPath(&'static str, CString),
 	#[error("unmount failed: errno {0}")]
 	UnmountFailed(libc::c_int),
+	#[error("Failed to set up scratch tmpfs in sandbox: errno {0}")]
+	SetupScratchFailed(libc::c_int),
+	#[error("Failed to park mount to scratch: errno {0}")]
+	ParkToScratchFailed(libc::c_int),
+	#[error("Failed to restore mount from scratch: errno {0}")]
+	RestoreFromScratchFailed(libc::c_int),
+	#[error("Failed to open path in m1: errno {0}")]
+	OpenInM1Failed(libc::c_int),
+	#[error("Failed to read m1 mountinfo: {0}")]
+	ReadMountinfoFailed(#[source] std::io::Error),
 }
