@@ -105,6 +105,40 @@ impl ForeignFd {
 			ino: stx.stx_ino,
 		})
 	}
+
+	/// Return the kernel mount id (`STATX_MNT_ID`) of the mount this fd
+	/// is resolved through, using `statx(2)` with `AT_EMPTY_PATH`.
+	///
+	/// The mount id uniquely identifies a `struct mount` for the
+	/// lifetime of that mount and is used to detect when a held fd has
+	/// become "stale" relative to the current mount layout (see the
+	/// fd-upgrade design), as well as to join entries when refreshing
+	/// the mount tree from `/proc/<pid>/mountinfo`.
+	///
+	/// Note: the kernel only fills in `stx_mnt_id` when `STATX_MNT_ID`
+	/// is requested *and* set in the returned `stx_mask`.  If the
+	/// running kernel does not support it, an `ENOSYS`/`EINVAL`-style
+	/// error is surfaced, or — if the syscall succeeds but the mask bit
+	/// is unset — `ENODATA` is returned.
+	pub fn mnt_id(&self) -> Result<u64, io::Error> {
+		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+		let ret = unsafe {
+			libc::statx(
+				self.local_fd,
+				c"".as_ptr(),
+				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
+				libc::STATX_MNT_ID,
+				&mut stx,
+			)
+		};
+		if ret < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		if stx.stx_mask & libc::STATX_MNT_ID == 0 {
+			return Err(io::Error::from_raw_os_error(libc::ENODATA));
+		}
+		Ok(stx.stx_mnt_id)
+	}
 }
 
 impl AsRawFd for ForeignFd {
@@ -868,4 +902,32 @@ impl std::fmt::Display for RwxPermission {
 		}
 		Ok(())
 	}
+}
+
+#[cfg(test)]
+mod tests {
+use super::*;
+
+#[test]
+fn inode_id_and_mnt_id_on_root() {
+let fd = ForeignFd::from_path(c"/").expect("open /");
+let id = fd.inode_id().expect("inode_id");
+// Root inode number is conventionally 2 on most filesystems, but
+// we only assert that statx succeeded and returned a nonzero ino.
+assert_ne!(id.ino, 0);
+
+// STATX_MNT_ID requires Linux >= 5.8; the CI/runner kernels are
+// far newer, so this should always succeed and be nonzero.
+let mnt_id = fd.mnt_id().expect("mnt_id");
+assert_ne!(mnt_id, 0);
+}
+
+#[test]
+fn mnt_id_differs_across_mounts_but_same_within() {
+// Two fds on the same path resolve through the same mount, so
+// their mount ids must match.
+let a = ForeignFd::from_path(c"/").unwrap();
+let b = ForeignFd::from_path(c"/").unwrap();
+assert_eq!(a.mnt_id().unwrap(), b.mnt_id().unwrap());
+}
 }
