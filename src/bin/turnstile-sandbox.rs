@@ -459,22 +459,24 @@ fn tracing_thread(context: &'static Context) {
 					}
 					_ => {}
 				}
-				if send_eperm {
-					req_ctx.send_error(-libc::EPERM).unwrap_or_else(|e| {
-						if req_ctx.still_valid().ok() == Some(true) {
-							error!("error sending EPERM: {}", e);
-						} else {
-							debug!("request is no longer valid");
-						}
-					});
+				if req_ctx.still_valid().ok() != Some(true) {
+					debug!("request is no longer valid; skipping response");
+					continue;
+				}
+				// Finalize via the sandbox, which transparently upgrades
+				// the traced process's fd view (§11) on allow, or fails
+				// the syscall on deny.
+				let handle = context.sandbox.new_request_handle(request, req_ctx);
+				let res = if send_eperm {
+					handle.deny(libc::EPERM)
 				} else {
-					req_ctx.send_continue().unwrap_or_else(|e| {
-						if req_ctx.still_valid().ok() == Some(true) {
-							error!("error continuing request: {}", e);
-						} else {
-							debug!("request is no longer valid");
-						}
-					});
+					handle.allow()
+				};
+				if let Err(e) = res {
+					// The most common cause here is the request having
+					// been invalidated by the target exiting, which is
+					// benign; the dispatch logs genuine failures itself.
+					debug!("error finalizing request (likely no longer valid): {}", e);
 				}
 			}
 			Ok(None) => {}

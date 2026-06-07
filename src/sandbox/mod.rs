@@ -54,10 +54,12 @@ macro_rules! perror {
 mod mount_obj;
 mod mountinfo;
 mod namespace;
+mod upgrade;
 mod utils;
 
 use mount_obj::MountObj;
 use namespace::ManagedNamespaces;
+pub use upgrade::RequestHandle;
 use utils::{split_parent_leaf, validate_sandbox_path};
 
 fn write_to_path(path: &CStr, content: &str) -> libc::c_int {
