@@ -1,6 +1,7 @@
 use std::{
 	borrow::Cow,
-	ffi::{CStr, CString, OsStr},
+	collections::HashMap,
+	ffi::{CStr, CString, OsStr, OsString},
 	io, mem,
 	os::{
 		fd::{AsRawFd, IntoRawFd},
@@ -10,7 +11,7 @@ use std::{
 	thread,
 };
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use crate::{
 	BindMountSandboxError,
@@ -927,21 +928,38 @@ impl BindMountSandbox {
 
 				let fork_res = fork_wait(|| {
 					libc::close(read_fd);
+					// Pin a handle to the host procfs *before* entering m1,
+					// because m1's mount layout has no /proc mounted.  An
+					// fd to procfs stays valid across setns; reading
+					// `self/mountinfo` through it still reflects the
+					// reader's *current* mount namespace (m1 after setns),
+					// rendered relative to m1's root (mntns_install sets
+					// our fs root/pwd to m1's root).
+					let proc_fd = libc::open(
+						c"/proc".as_ptr(),
+						libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+					);
+					if proc_fd < 0 {
+						return perror!("open(/proc)");
+					}
 					match nsenter_fn() {
 						Ok(()) => (),
 						Err(e) => {
 							if ENABLE_LOG_IN_FORK {
 								error!("Failed to enter m1 for mountinfo: {}", e);
 							}
+							libc::close(proc_fd);
 							return e.raw_os_error().unwrap_or(libc::EIO);
 						}
 					}
-					let src = libc::open(
-						c"/proc/self/mountinfo".as_ptr(),
+					let src = libc::openat(
+						proc_fd,
+						c"self/mountinfo".as_ptr(),
 						libc::O_RDONLY | libc::O_CLOEXEC,
 					);
+					libc::close(proc_fd);
 					if src < 0 {
-						return perror!("open(/proc/self/mountinfo)");
+						return perror!("openat(/proc/self/mountinfo)");
 					}
 					let mut buf = [0u8; 8192];
 					loop {
@@ -1197,6 +1215,25 @@ impl BindMountSandbox {
 pub struct ManagedMountPoint {
 	pub host_path: CString,
 	pub attrs: MountAttributes,
+}
+
+/// Internal per-mount bookkeeping kept in `current_mount_tree`.  Wraps
+/// the user-facing [`ManagedMountPoint`] with the kernel `mnt_id`
+/// captured at mount-creation time (used as the join key for the §13
+/// mountinfo refresh and, in future, the fd-staleness key for §11), and
+/// an `expired` flag set by the refresh when the bind source has been
+/// unlinked on the host (`//deleted`).
+#[derive(Debug, Clone)]
+pub(crate) struct MountInternal {
+	/// host_path + currently-applied attrs (the user-visible part).
+	pub user: ManagedMountPoint,
+	/// Kernel `mnt_id` captured at creation via `statx(STATX_MNT_ID)`
+	/// from the m1 helper; 0 if the capture failed.
+	pub mnt_id: u64,
+	/// Set by the refresh when mountinfo shows the bind source as
+	/// `//deleted`; forces umount-and-readd on the next reconcile if
+	/// still desired.
+	pub expired: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1696,7 +1733,7 @@ impl PlaceholderSymlinkData {
 pub struct ManagedBindMountSandbox {
 	sandbox: BindMountSandbox,
 	current_placeholder_tree: Mutex<FsTree<ManagedPlaceholder>>,
-	current_mount_tree: Mutex<FsTree<ManagedMountPoint>>,
+	current_mount_tree: Mutex<FsTree<MountInternal>>,
 }
 
 impl ManagedBindMountSandbox {
@@ -1808,7 +1845,7 @@ impl ManagedBindMountSandbox {
 		&self,
 	) -> (
 		std::sync::MutexGuard<'_, FsTree<ManagedPlaceholder>>,
-		std::sync::MutexGuard<'_, FsTree<ManagedMountPoint>>,
+		std::sync::MutexGuard<'_, FsTree<MountInternal>>,
 	) {
 		// Always acquire in the same order to avoid deadlocks.
 		let pt = self
@@ -1829,14 +1866,14 @@ impl ManagedBindMountSandbox {
 	fn entries_from_state(
 		&self,
 		pt: &FsTree<ManagedPlaceholder>,
-		mt: &FsTree<ManagedMountPoint>,
+		mt: &FsTree<MountInternal>,
 	) -> FsTree<ManagedTreeEntry> {
 		let mut out = FsTree::new();
 		pt.walk_top_down(|path, ph| {
 			out.insert(path, ManagedTreeEntry::Placeholder(ph.clone()));
 		});
 		mt.walk_top_down(|path, mp| {
-			out.insert(path, ManagedTreeEntry::BindMount(mp.clone()));
+			out.insert(path, ManagedTreeEntry::BindMount(mp.user.clone()));
 		});
 		out
 	}
@@ -1860,9 +1897,15 @@ impl ManagedBindMountSandbox {
 	fn reconcile(
 		&self,
 		current_pt: &mut FsTree<ManagedPlaceholder>,
-		current_mt: &mut FsTree<ManagedMountPoint>,
+		current_mt: &mut FsTree<MountInternal>,
 		desired_entries: &FsTree<ManagedTreeEntry>,
 	) -> Result<(), BindMountSandboxError> {
+		// §13: refresh the mount tree from m1's mountinfo so the diff
+		// input is kernel-truthful (drops vanished mounts, tracks renamed
+		// bind sources, flags unlinked sources as expired).  Best-effort:
+		// on any read/parse failure we keep the current tree as-is.
+		self.refresh_mount_tree(current_mt);
+
 		let (desired_pt, desired_mt) = self.build_desired_trees(desired_entries)?;
 		debug!("Current placeholder tree: {:?}", current_pt);
 		debug!("Desired placeholder tree: {:?}", desired_pt);
@@ -1938,23 +1981,57 @@ impl ManagedBindMountSandbox {
 							err = Some(e);
 							return;
 						}
-						new_mt.insert(sandbox_path, (*new).clone());
+						let mnt_id = self.capture_mnt_id(&ns_path);
+						new_mt.insert(
+							sandbox_path,
+							MountInternal {
+								user: (*new).clone(),
+								mnt_id,
+								expired: false,
+							},
+						);
 					}
 					crate::fstree::DiffTree::Updated(old, new) => {
-						assert_eq!(old.host_path, new.host_path);
-						if old.attrs != new.attrs {
+						assert_eq!(old.user.host_path, new.host_path);
+						// §13: an expired entry (host source was unlinked
+						// while mounted) is rebuilt so the sandbox picks up
+						// any freshly created host dentry at the same path.
+						if old.expired {
+							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
+								err = Some(e);
+								return;
+							}
+							if let Err(e) = self.sandbox.mount_host_into_sandbox_impl(
+								&new.host_path,
+								&ns_path,
+								new.attrs,
+								false,
+								false,
+								false,
+							) {
+								err = Some(e);
+								return;
+							}
+							let mnt_id = self.capture_mnt_id(&ns_path);
+							*new_mt.get_mut(sandbox_path).expect("must exist") = MountInternal {
+								user: (*new).clone(),
+								mnt_id,
+								expired: false,
+							};
+						} else if old.user.attrs != new.attrs {
 							if let Err(e) =
-								self.sandbox.set_mount_attr(&ns_path, new.attrs, old.attrs)
+								self.sandbox.set_mount_attr(&ns_path, new.attrs, old.user.attrs)
 							{
 								err = Some(e);
 								return;
 							}
-							*new_mt.get_mut(sandbox_path).expect("must exist") = (*new).clone();
+							let entry = new_mt.get_mut(sandbox_path).expect("must exist");
+							entry.user = (*new).clone();
 						}
 					}
 				}
 			},
-			|_, old, new| old.host_path != new.host_path,
+			|_, old, new| old.user.host_path != new.host_path,
 			true,
 		);
 		if let Some(e) = err {
@@ -2064,6 +2141,94 @@ impl ManagedBindMountSandbox {
 		Ok((placeholders, mounts))
 	}
 
+	/// Capture the kernel `mnt_id` of the mount currently topmost at
+	/// `ns_path`, by opening an `O_PATH` handle to it in m1 and running
+	/// `statx(STATX_MNT_ID)`.  Returns 0 (and logs) if the capture
+	/// fails, since a missing id only degrades the §13 refresh join for
+	/// that one entry rather than breaking the mount.
+	fn capture_mnt_id(&self, ns_path: &CStr) -> u64 {
+		let mut openhow: libc::open_how = unsafe { mem::zeroed() };
+		openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+		openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+		match self.sandbox.open_in_m1(ns_path, &openhow) {
+			Ok(fd) => match fd.mnt_id() {
+				Ok(id) => id,
+				Err(e) => {
+					warn!("Failed to capture mnt_id for {:?}: {}", ns_path, e);
+					0
+				}
+			},
+			Err(e) => {
+				warn!("Failed to open {:?} in m1 to capture mnt_id: {}", ns_path, e);
+				0
+			}
+		}
+	}
+
+	/// §13: refresh `current_mt` from m1's `/proc/self/mountinfo`.
+	///
+	/// Joins each tracked entry to its live mountinfo line by `mnt_id`:
+	/// an entry whose `mnt_id` is absent from mountinfo is dropped (its
+	/// mount is gone); a `//deleted` source flags the entry `expired`;
+	/// a renamed source (different root path, no `//deleted`) updates the
+	/// recorded `host_path` without expiring.  Entries with a 0 `mnt_id`
+	/// (capture previously failed) are kept untouched.
+	///
+	/// Best-effort: on any error reading or parsing mountinfo, the tree
+	/// is left unchanged.
+	fn refresh_mount_tree(&self, current_mt: &mut FsTree<MountInternal>) {
+		if current_mt.is_empty() {
+			return;
+		}
+		let raw = match self.sandbox.read_m1_mountinfo() {
+			Ok(b) => b,
+			Err(e) => {
+				warn!("mountinfo refresh skipped: {}", e);
+				return;
+			}
+		};
+		let entries = mountinfo::parse_mountinfo(&raw);
+		// Index the parsed lines by mnt_id for the join.
+		let mut by_id: HashMap<u64, &mountinfo::MountinfoEntry> = HashMap::new();
+		for e in &entries {
+			by_id.insert(e.mnt_id, e);
+		}
+
+		let mut updates: Vec<(OsString, bool, Option<CString>)> = Vec::new();
+		let mut drops: Vec<OsString> = Vec::new();
+		current_mt.walk_top_down(|path, mi| {
+			if mi.mnt_id == 0 {
+				// No usable join key; leave as-is.
+				return;
+			}
+			match by_id.get(&mi.mnt_id) {
+				None => drops.push(OsString::from(path)),
+				Some(info) => {
+					let new_host = if !info.deleted
+						&& info.root.as_bytes() != mi.user.host_path.to_bytes()
+					{
+						CString::new(info.root.as_bytes()).ok()
+					} else {
+						None
+					};
+					updates.push((OsString::from(path), info.deleted, new_host));
+				}
+			}
+		});
+
+		for (path, deleted, new_host) in updates {
+			if let Some(entry) = current_mt.get_mut(&path) {
+				entry.expired = deleted;
+				if let Some(h) = new_host {
+					entry.user.host_path = h;
+				}
+			}
+		}
+		for path in drops {
+			current_mt.remove(&path);
+		}
+	}
+
 	pub fn check_covered<'a>(
 		&self,
 		path: &CStr,
@@ -2079,13 +2244,13 @@ impl ManagedBindMountSandbox {
 		{
 			None => return Ok((false, None)),
 			Some((_, mnt)) => {
-				if need_write && mnt.attrs.readonly {
-					return Ok((false, Some(mnt.clone())));
+				if need_write && mnt.user.attrs.readonly {
+					return Ok((false, Some(mnt.user.clone())));
 				}
-				if need_exec && mnt.attrs.noexec {
-					return Ok((false, Some(mnt.clone())));
+				if need_exec && mnt.user.attrs.noexec {
+					return Ok((false, Some(mnt.user.clone())));
 				}
-				Ok((true, Some(mnt.clone())))
+				Ok((true, Some(mnt.user.clone())))
 			}
 		}
 	}

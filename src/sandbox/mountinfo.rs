@@ -12,8 +12,8 @@
 //! field of a mount whose backing dentry has been unlinked while still
 //! mounted gains a trailing ` //deleted` marker.
 
-use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 
 /// A single parsed mountinfo line, limited to the fields the sandbox
 /// cares about.
@@ -114,6 +114,8 @@ fn parse_line(line: &[u8]) -> Option<MountinfoEntry> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::ffi::OsStr;
+	use std::os::unix::ffi::OsStrExt;
 
 	#[test]
 	fn parses_basic_line() {
