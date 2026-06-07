@@ -1,10 +1,13 @@
-use libseccomp::ScmpFilterContext;
+use libseccomp::{ScmpFilterContext, ScmpSyscall};
+use smallvec::{SmallVec, smallvec};
+
+use std::sync::OnceLock;
 
 use crate::{
 	AccessRequestError, TurnstileTracerError,
 	access::fs::{
-		CreateKind, CreateOperation, ExecOperation, FsTarget, LinkOperation, OpenOperation,
-		RenameOperation, UnlinkOperation,
+		CreateKind, CreateOperation, ExecOperation, FsTarget, LinkOperation, ModifyFdKind,
+		ModifyFdOperation, OpenOperation, RenameOperation, UnlinkOperation,
 	},
 	access::{
 		AccessRequest, Operation,
@@ -451,6 +454,112 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 	),
 ];
 
+/// Maximum xattr value size we are willing to copy out of the traced
+/// process (matches the kernel's `XATTR_SIZE_MAX`).
+const XATTR_SIZE_MAX: usize = 65536;
+
+fn read_target_bytes(
+	req: &mut RequestContext,
+	ptr: *const u8,
+	len: usize,
+) -> Result<Vec<u8>, AccessRequestError> {
+	let mut buf: Vec<u8> = Vec::with_capacity(len);
+	{
+		let uninit = unsafe {
+			std::slice::from_raw_parts_mut(
+				buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
+				len,
+			)
+		};
+		req.read_target_memory(ptr, uninit)?;
+	}
+	unsafe { buf.set_len(len) };
+	Ok(buf)
+}
+
+fn handle_modify_fd(
+	target: FsTarget,
+	kind: ModifyFdKind,
+) -> Result<Operation, AccessRequestError> {
+	Ok(fsop(FsModifyFd(ModifyFdOperation { target, kind })))
+}
+
+// File-descriptor metadata/content modifying syscalls.  The descriptor
+// is always argument 0; remaining arguments carry the operation
+// payload.  (name, handler, fd arg index)
+const FS_SYSCALLS_FD_MODIFY: &[(&str, SyscallHandler1, u8)] = &[
+	(
+		"fchmod",
+		|req, target| {
+			handle_modify_fd(
+				target,
+				ModifyFdKind::Chmod {
+					mode: req.arg(1) as u32,
+				},
+			)
+		},
+		0,
+	),
+	(
+		"fchown",
+		|req, target| {
+			handle_modify_fd(
+				target,
+				ModifyFdKind::Chown {
+					uid: req.arg(1) as u32,
+					gid: req.arg(2) as u32,
+				},
+			)
+		},
+		0,
+	),
+	(
+		"ftruncate",
+		|req, target| {
+			handle_modify_fd(
+				target,
+				ModifyFdKind::Truncate {
+					length: req.arg(1) as i64,
+				},
+			)
+		},
+		0,
+	),
+	(
+		"fsetxattr",
+		|req, target| {
+			let name_ptr = req.arg(1) as *const libc::c_char;
+			let name = req.cstr_from_target_memory(name_ptr)?;
+			let size = req.arg(3) as usize;
+			if size > XATTR_SIZE_MAX {
+				return Err(AccessRequestError::InvalidSyscallData(
+					"fsetxattr value exceeds XATTR_SIZE_MAX",
+				));
+			}
+			let value_ptr = req.arg(2) as *const u8;
+			let value = read_target_bytes(req, value_ptr, size)?;
+			handle_modify_fd(
+				target,
+				ModifyFdKind::SetXattr {
+					name,
+					value,
+					flags: req.arg(4) as i32,
+				},
+			)
+		},
+		0,
+	),
+	(
+		"fremovexattr",
+		|req, target| {
+			let name_ptr = req.arg(1) as *const libc::c_char;
+			let name = req.cstr_from_target_memory(name_ptr)?;
+			handle_modify_fd(target, ModifyFdKind::RemoveXattr { name })
+		},
+		0,
+	),
+];
+
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
 ) -> Result<(), TurnstileTracerError> {
@@ -475,6 +584,11 @@ pub(crate) fn add_filter_rules(
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	for &(sys, ..) in fs_syscalls_fd_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_fd_modify_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
@@ -514,6 +628,12 @@ lazy_syscall_table_name_to_number!(
 	Option<u8>
 );
 lazy_syscall_table_name_to_number!(FS_SYSCALLS_FD, fs_syscalls_fd_table, SyscallHandler1, u8);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_FD_MODIFY,
+	fs_syscalls_fd_modify_table,
+	SyscallHandler1,
+	u8
+);
 
 pub(crate) fn handle_notification<'a>(
 	request_ctx: &mut RequestContext<'a>,
@@ -578,5 +698,116 @@ pub(crate) fn handle_notification<'a>(
 		}
 	}
 
+	for &(sys, handler, fd_arg_index) in fs_syscalls_fd_modify_table() {
+		if syscall == sys {
+			let target = FsTarget::from_fd(request_ctx, fd_arg_index)?;
+			let op = handler(request_ctx, target)?;
+			return Ok(Some(AccessRequest { operation: op }));
+		}
+	}
+
 	Ok(None)
+}
+
+/// Cache of the syscall numbers the §11 fd-upgrade dispatch needs to
+/// special-case, resolved once for the native architecture.
+struct UpgradeSyscalls {
+	open: Option<ScmpSyscall>,
+	openat: Option<ScmpSyscall>,
+	openat2: Option<ScmpSyscall>,
+	creat: Option<ScmpSyscall>,
+	chdir: Option<ScmpSyscall>,
+	fchdir: Option<ScmpSyscall>,
+}
+
+fn upgrade_syscalls() -> &'static UpgradeSyscalls {
+	static ONCE: OnceLock<UpgradeSyscalls> = OnceLock::new();
+	ONCE.get_or_init(|| {
+		let n = |name: &str| ScmpSyscall::from_name(name).ok();
+		UpgradeSyscalls {
+			open: n("open"),
+			openat: n("openat"),
+			openat2: n("openat2"),
+			creat: n("creat"),
+			chdir: n("chdir"),
+			fchdir: n("fchdir"),
+		}
+	})
+}
+
+/// How a freshly-resolved `openat`-family syscall should be re-opened in
+/// m1: the open flags, creation mode, and `openat2` resolve flags (0 for
+/// the non-`openat2` variants).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReopenParams {
+	pub flags: u64,
+	pub mode: u64,
+	pub resolve: u64,
+}
+
+/// If `syscall` is an `open`-family syscall, return the parameters needed
+/// to faithfully re-open the target in m1.  Reuses the same argument
+/// layout the request-parsing handlers use, rather than re-parsing.
+pub(crate) fn open_reopen_params(
+	req: &mut RequestContext,
+) -> Result<Option<ReopenParams>, AccessRequestError> {
+	let s = upgrade_syscalls();
+	let syscall = req.syscall();
+	if Some(syscall) == s.open {
+		Ok(Some(ReopenParams {
+			flags: req.arg(1),
+			mode: req.arg(2),
+			resolve: 0,
+		}))
+	} else if Some(syscall) == s.openat {
+		Ok(Some(ReopenParams {
+			flags: req.arg(2),
+			mode: req.arg(3),
+			resolve: 0,
+		}))
+	} else if Some(syscall) == s.openat2 {
+		let open_how_ptr = req.arg(2) as *const libc::open_how;
+		let how = req.value_from_target_memory(open_how_ptr)?;
+		Ok(Some(ReopenParams {
+			flags: how.flags,
+			mode: how.mode,
+			resolve: how.resolve,
+		}))
+	} else if Some(syscall) == s.creat {
+		Ok(Some(ReopenParams {
+			flags: (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64,
+			mode: req.arg(1),
+			resolve: 0,
+		}))
+	} else {
+		Ok(None)
+	}
+}
+
+/// Whether `syscall` is `chdir` or `fchdir`.
+pub(crate) fn is_chdir(syscall: ScmpSyscall) -> bool {
+	let s = upgrade_syscalls();
+	Some(syscall) == s.chdir || Some(syscall) == s.fchdir
+}
+
+/// Argument indices of any real `dirfd`s this syscall accepts, derived
+/// from the existing request-parsing tables so the fd-upgrade path does
+/// not re-implement syscall parsing.  `openat`-family syscalls are
+/// excluded (they are handled by re-opening the result instead).
+pub(crate) fn dfd_arg_indices(syscall: ScmpSyscall) -> SmallVec<[u8; 2]> {
+	let s = upgrade_syscalls();
+	if Some(syscall) == s.openat || Some(syscall) == s.openat2 {
+		return smallvec![];
+	}
+	for &(sys, _h, dfd, _path, _flags) in fs_syscalls_dfd_path_table() {
+		if sys == syscall {
+			return smallvec![dfd];
+		}
+	}
+	for &(sys, _h, dfd1, _p1, dfd2, _p2, _flags) in fs_syscall_dfd_path_dfd_path_table() {
+		if sys == syscall {
+			return smallvec![dfd1, dfd2];
+		}
+	}
+	smallvec![]
 }

@@ -11,10 +11,75 @@ use libseccomp::{ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
 use log::warn;
 
 use crate::{AccessRequestError, TurnstileTracer, access::fs::ForeignFd};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 pub mod fs;
 pub mod net;
+
+/// `flags` bit for `SECCOMP_IOCTL_NOTIF_ADDFD`: install the new fd at the
+/// exact descriptor number given in `newfd` (replacing whatever was
+/// there), rather than at the lowest free number.
+const SECCOMP_ADDFD_FLAG_SETFD: u32 = 1 << 0;
+/// `flags` bit for `SECCOMP_IOCTL_NOTIF_ADDFD`: install the fd *and*
+/// atomically complete the notification, returning the new fd number to
+/// the trapped syscall as its return value (kernel >= 5.14).
+const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;
+
+/// `struct seccomp_notif_addfd` from `<linux/seccomp.h>`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeccompNotifAddfd {
+	id: u64,
+	flags: u32,
+	srcfd: u32,
+	newfd: u32,
+	newfd_flags: u32,
+}
+
+// `_IOC`-style ioctl number for `SECCOMP_IOCTL_NOTIF_ADDFD`, computed
+// with the asm-generic encoding used by all architectures libseccomp
+// supports natively here (x86-64 / aarch64 / etc.).  This evaluates to
+// 0x40182103 on those platforms, which a unit test below asserts.
+const _IOC_NRBITS: u32 = 8;
+const _IOC_TYPEBITS: u32 = 8;
+const _IOC_SIZEBITS: u32 = 14;
+const _IOC_NRSHIFT: u32 = 0;
+const _IOC_TYPESHIFT: u32 = _IOC_NRSHIFT + _IOC_NRBITS;
+const _IOC_SIZESHIFT: u32 = _IOC_TYPESHIFT + _IOC_TYPEBITS;
+const _IOC_DIRSHIFT: u32 = _IOC_SIZESHIFT + _IOC_SIZEBITS;
+const _IOC_WRITE: u32 = 1;
+
+const fn _ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u32 {
+	(dir << _IOC_DIRSHIFT)
+		| (ty << _IOC_TYPESHIFT)
+		| (nr << _IOC_NRSHIFT)
+		| (size << _IOC_SIZESHIFT)
+}
+
+const SECCOMP_IOC_MAGIC: u32 = b'!' as u32;
+const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = _ioc(
+	_IOC_WRITE,
+	SECCOMP_IOC_MAGIC,
+	3,
+	std::mem::size_of::<SeccompNotifAddfd>() as u32,
+);
+
+/// Raw `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper.  Returns the new fd
+/// number installed in the target on success.
+fn notif_addfd(notify_fd: ScmpFd, addfd: &SeccompNotifAddfd) -> io::Result<libc::c_int> {
+	let ret = unsafe {
+		libc::ioctl(
+			notify_fd,
+			SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+			addfd as *const SeccompNotifAddfd,
+		)
+	};
+	if ret < 0 {
+		Err(io::Error::last_os_error())
+	} else {
+		Ok(ret)
+	}
+}
 
 macro_rules! syscall_transform_tuple {
 	($sys:expr, $t:expr, $ty1:ty) => {
@@ -128,6 +193,78 @@ impl<'a> RequestContext<'a> {
 		self.send_response_impl(ScmpNotifResp::new_error(
 			self.sreq.id,
 			errno,
+			ScmpNotifRespFlags::empty(),
+		))
+	}
+
+	/// Returns the syscall number that triggered this notification.
+	pub fn syscall(&self) -> libseccomp::ScmpSyscall {
+		self.sreq.data.syscall
+	}
+
+	/// Install `srcfd` (a descriptor valid in *this* — the supervisor —
+	/// process) into the traced process and atomically complete the
+	/// notification, so the trapped syscall returns the newly installed
+	/// descriptor number.  Used to substitute a freshly-resolved fd for
+	/// the result of `openat`-family syscalls (§11.2).
+	///
+	/// On success the context is marked answered and the new descriptor
+	/// number (as seen by the traced process) is returned.
+	pub fn install_fd_and_respond(
+		&mut self,
+		srcfd: RawFd,
+		cloexec: bool,
+	) -> Result<i64, AccessRequestError> {
+		if !self.valid {
+			return Err(AccessRequestError::NotificationAlreadyAnswered);
+		}
+		let addfd = SeccompNotifAddfd {
+			id: self.sreq.id,
+			flags: SECCOMP_ADDFD_FLAG_SEND,
+			srcfd: srcfd as u32,
+			newfd: 0,
+			newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+		};
+		let newfd = notif_addfd(self.notify_fd, &addfd).map_err(AccessRequestError::AddFd)?;
+		// SECCOMP_ADDFD_FLAG_SEND completes the notification for us.
+		self.valid = false;
+		Ok(newfd as i64)
+	}
+
+	/// Install `srcfd` (valid in the supervisor) into the traced process
+	/// at the *exact* descriptor number `newfd`, replacing whatever the
+	/// traced process currently has there.  Unlike
+	/// [`Self::install_fd_and_respond`], this does **not** complete the
+	/// notification — the caller is expected to subsequently
+	/// [`Self::send_continue`] so the kernel re-executes the syscall
+	/// against the now-upgraded descriptor (§11.2 stale-`dirfd` upgrade).
+	pub fn replace_fd(
+		&mut self,
+		srcfd: RawFd,
+		newfd: RawFd,
+		cloexec: bool,
+	) -> Result<(), AccessRequestError> {
+		if !self.valid {
+			return Err(AccessRequestError::NotificationAlreadyAnswered);
+		}
+		let addfd = SeccompNotifAddfd {
+			id: self.sreq.id,
+			flags: SECCOMP_ADDFD_FLAG_SETFD,
+			srcfd: srcfd as u32,
+			newfd: newfd as u32,
+			newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+		};
+		notif_addfd(self.notify_fd, &addfd).map_err(AccessRequestError::AddFd)?;
+		Ok(())
+	}
+
+	/// Complete the notification with a spoofed successful return value
+	/// `val` (the syscall returns `val` without being re-executed).  Used
+	/// by the file-fd modifying-op proxy (§11.2).
+	pub fn send_value(&mut self, val: i64) -> Result<(), AccessRequestError> {
+		self.send_response_impl(ScmpNotifResp::new_val(
+			self.sreq.id,
+			val,
 			ScmpNotifRespFlags::empty(),
 		))
 	}
@@ -289,5 +426,21 @@ impl Drop for RequestContext<'_> {
 			warn!("RequestContext dropped without sending a response — auto-continuing");
 			_ = self.send_continue();
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn addfd_ioctl_number_and_struct_layout() {
+		// `struct seccomp_notif_addfd` is exactly 24 bytes on all LP64
+		// targets (two u32s pack into the u64's tail).
+		assert_eq!(std::mem::size_of::<SeccompNotifAddfd>(), 24);
+		// _IOW('!', 3, struct seccomp_notif_addfd) on asm-generic archs.
+		assert_eq!(SECCOMP_IOCTL_NOTIF_ADDFD, 0x4018_2103);
+		assert_eq!(SECCOMP_ADDFD_FLAG_SETFD, 1);
+		assert_eq!(SECCOMP_ADDFD_FLAG_SEND, 2);
 	}
 }

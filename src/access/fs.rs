@@ -648,6 +648,44 @@ pub struct UnixBindOperation {
 	pub target: FsTarget,
 }
 
+/// A metadata- or content-modifying operation issued against an
+/// already-open file descriptor (`fchmod`, `fchown`, `ftruncate`,
+/// `fsetxattr`, `fremovexattr`).  These are mediated so that, after a
+/// grant changes the live mount layout, a descriptor opened against a
+/// now-stale mount can be transparently re-resolved and the operation
+/// re-issued through the current layout (§11.2).
+#[derive(Debug)]
+pub struct ModifyFdOperation {
+	/// The file the descriptor refers to (a `from_fd` target).
+	pub target: FsTarget,
+	pub kind: ModifyFdKind,
+}
+
+#[derive(Debug)]
+pub enum ModifyFdKind {
+	Chmod { mode: u32 },
+	Chown { uid: u32, gid: u32 },
+	Truncate { length: i64 },
+	SetXattr {
+		name: CString,
+		value: Vec<u8>,
+		flags: i32,
+	},
+	RemoveXattr { name: CString },
+}
+
+impl ModifyFdKind {
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			ModifyFdKind::Chmod { .. } => "fchmod",
+			ModifyFdKind::Chown { .. } => "fchown",
+			ModifyFdKind::Truncate { .. } => "ftruncate",
+			ModifyFdKind::SetXattr { .. } => "fsetxattr",
+			ModifyFdKind::RemoveXattr { .. } => "fremovexattr",
+		}
+	}
+}
+
 #[derive(Debug)]
 pub enum FsOperation {
 	FsOpen(OpenOperation),
@@ -660,6 +698,7 @@ pub enum FsOperation {
 	FsReadlink(FsTarget),
 	FsChdir(FsTarget),
 	FsStat(StatOperation),
+	FsModifyFd(ModifyFdOperation),
 	UnixConnect(FsTarget),
 	UnixBind(UnixBindOperation),
 	UnixSendto(FsTarget),
@@ -795,6 +834,9 @@ impl std::fmt::Display for FsOperation {
 			Self::FsStat(StatOperation { target, lstat }) => {
 				write!(f, "{} {}", if *lstat { "lstat" } else { "stat" }, target)?;
 			}
+			Self::FsModifyFd(ModifyFdOperation { target, kind }) => {
+				write!(f, "{} {}", kind.as_str(), target)?;
+			}
 			Self::UnixConnect(target) => {
 				write!(f, "connect unix:{}", target)?;
 			}
@@ -879,6 +921,9 @@ impl FsOperation {
 			}
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
+			}
+			Self::FsModifyFd(ModifyFdOperation { target, .. }) => {
+				smallvec![make_rwx!(target.clone(), write)]
 			}
 			Self::UnixConnect(target) => {
 				smallvec![make_rwx!(target.clone(), read, write)]

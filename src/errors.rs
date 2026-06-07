@@ -57,6 +57,12 @@ pub enum AccessRequestError {
 	ShortReadProcessMemory(u32, usize, usize),
 	#[error("Read from /proc/{0}/comm failed: {1}")]
 	ReadPidComm(u32, std::io::Error),
+	#[error("SECCOMP_IOCTL_NOTIF_ADDFD failed: {0}")]
+	AddFd(std::io::Error),
+	#[error("attempted to respond to a notification that was already answered")]
+	NotificationAlreadyAnswered,
+	#[error("failed to upgrade or proxy fd for request: {0}")]
+	FdUpgrade(#[source] Box<BindMountSandboxError>),
 }
 
 #[derive(Error, Debug)]
