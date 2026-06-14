@@ -16,26 +16,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 pub mod fs;
 pub mod net;
 
-/// `flags` bit for `SECCOMP_IOCTL_NOTIF_ADDFD`: install the new fd at the
-/// exact descriptor number given in `newfd` (replacing whatever was
-/// there), rather than at the lowest free number.
-const SECCOMP_ADDFD_FLAG_SETFD: u32 = 1 << 0;
-/// `flags` bit for `SECCOMP_IOCTL_NOTIF_ADDFD`: install the fd *and*
-/// atomically complete the notification, returning the new fd number to
-/// the trapped syscall as its return value (kernel >= 5.14).
-const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;
-
-/// `struct seccomp_notif_addfd` from `<linux/seccomp.h>`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SeccompNotifAddfd {
-	id: u64,
-	flags: u32,
-	srcfd: u32,
-	newfd: u32,
-	newfd_flags: u32,
-}
-
 // `_IOC`-style ioctl number for `SECCOMP_IOCTL_NOTIF_ADDFD`, computed
 // with the asm-generic encoding used by all architectures libseccomp
 // supports natively here (x86-64 / aarch64 / etc.).  This evaluates to
@@ -61,7 +41,7 @@ const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = _ioc(
 	_IOC_WRITE,
 	SECCOMP_IOC_MAGIC,
 	3,
-	std::mem::size_of::<SeccompNotifAddfd>() as u32,
+	std::mem::size_of::<libc::seccomp_notif_addfd>() as u32,
 );
 
 macro_rules! syscall_transform_tuple {
@@ -115,12 +95,12 @@ pub(crate) use lazy_syscall_table_name_to_number;
 
 /// Raw `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper.  Returns the new fd
 /// number installed in the target on success.
-fn notif_addfd(notify_fd: ScmpFd, addfd: &SeccompNotifAddfd) -> io::Result<libc::c_int> {
+fn notif_addfd(notify_fd: ScmpFd, addfd: &libc::seccomp_notif_addfd) -> io::Result<libc::c_int> {
 	let ret = unsafe {
 		libc::ioctl(
 			notify_fd,
 			SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
-			addfd as *const SeccompNotifAddfd,
+			addfd as *const libc::seccomp_notif_addfd,
 		)
 	};
 	if ret < 0 {
@@ -217,9 +197,9 @@ impl<'a> RequestContext<'a> {
 		if !self.valid {
 			return Err(AccessRequestError::NotificationAlreadyAnswered);
 		}
-		let addfd = SeccompNotifAddfd {
+		let addfd = libc::seccomp_notif_addfd {
 			id: self.sreq.id,
-			flags: SECCOMP_ADDFD_FLAG_SEND,
+			flags: libc::SECCOMP_ADDFD_FLAG_SEND as u32,
 			srcfd: srcfd as u32,
 			newfd: 0,
 			newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
@@ -246,9 +226,9 @@ impl<'a> RequestContext<'a> {
 		if !self.valid {
 			return Err(AccessRequestError::NotificationAlreadyAnswered);
 		}
-		let addfd = SeccompNotifAddfd {
+		let addfd = libc::seccomp_notif_addfd {
 			id: self.sreq.id,
-			flags: SECCOMP_ADDFD_FLAG_SETFD,
+			flags: libc::SECCOMP_ADDFD_FLAG_SETFD as u32,
 			srcfd: srcfd as u32,
 			newfd: newfd as u32,
 			newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
@@ -436,10 +416,10 @@ mod tests {
 	fn addfd_ioctl_number_and_struct_layout() {
 		// `struct seccomp_notif_addfd` is exactly 24 bytes on all LP64
 		// targets (two u32s pack into the u64's tail).
-		assert_eq!(std::mem::size_of::<SeccompNotifAddfd>(), 24);
+		assert_eq!(std::mem::size_of::<libc::seccomp_notif_addfd>(), 24);
 		// _IOW('!', 3, struct seccomp_notif_addfd) on asm-generic archs.
 		assert_eq!(SECCOMP_IOCTL_NOTIF_ADDFD, 0x4018_2103);
-		assert_eq!(SECCOMP_ADDFD_FLAG_SETFD, 1);
-		assert_eq!(SECCOMP_ADDFD_FLAG_SEND, 2);
+		assert_eq!(libc::SECCOMP_ADDFD_FLAG_SETFD, 1);
+		assert_eq!(libc::SECCOMP_ADDFD_FLAG_SEND, 2);
 	}
 }
