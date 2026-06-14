@@ -155,7 +155,7 @@ impl<'a> RequestContext<'a> {
 				.map_err(AccessRequestError::NotifyRespond)?;
 			self.valid = false;
 		} else {
-			warn!("send_response_impl called on an already-answered notification; ignoring");
+			warn!("send_response_impl called on a no longer valid notification");
 		}
 		Ok(())
 	}
@@ -201,22 +201,16 @@ impl<'a> RequestContext<'a> {
 	/// notification such that the newly installed fd is returned from the
 	/// syscall.
 	///
-	/// On success the context is marked answered and the new descriptor number
-	/// (as seen by the traced process, but may not be a valid fd for the
-	/// caller) is returned.
-	///
-	/// If the notification is no longer valid (already answered, or
-	/// invalidated by a signal), this is a no-op that returns `Ok(0)`; the
-	/// `0` is a placeholder, as no fd is installed and the syscall return
-	/// value seen by the traced process is whatever already answered it.
+	/// On success the new descriptor number (as seen by the traced process, but
+	/// may not be a valid fd for the caller) is returned.
 	pub fn install_fd_and_respond(
 		&mut self,
 		srcfd: RawFd,
 		cloexec: bool,
 	) -> Result<i64, AccessRequestError> {
 		if !self.valid {
-			warn!("install_fd_and_respond called on an already-answered notification; ignoring");
-			return Ok(0);
+			warn!("install_fd_and_respond called on a no longer valid notification");
+			return Err(AccessRequestError::NotificationAlreadyAnswered);
 		}
 		let addfd = libc::seccomp_notif_addfd {
 			id: self.sreq.id,
@@ -244,8 +238,8 @@ impl<'a> RequestContext<'a> {
 		cloexec: bool,
 	) -> Result<(), AccessRequestError> {
 		if !self.valid {
-			warn!("replace_fd called on an already-answered notification; ignoring");
-			return Ok(());
+			warn!("replace_fd called on a no longer valid notification");
+			return Err(AccessRequestError::NotificationAlreadyAnswered);
 		}
 		let addfd = libc::seccomp_notif_addfd {
 			id: self.sreq.id,
