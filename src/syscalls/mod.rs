@@ -165,6 +165,9 @@ impl<'a> RequestContext<'a> {
 		))
 	}
 
+	/// Send an error value for the currently traced syscall (without
+	/// actually executing it).
+	///
 	/// Users are reminded that this should not be used to deny access
 	/// unless there is a separate sandboxing mechanism making sure that
 	/// the access would be denied should the traced process attempt to
@@ -177,18 +180,28 @@ impl<'a> RequestContext<'a> {
 		))
 	}
 
+	/// Send a non-error value for the currently traced syscall (without
+	/// actually executing it).
+	pub fn send_value(&mut self, val: i64) -> Result<(), AccessRequestError> {
+		self.send_response_impl(ScmpNotifResp::new_val(
+			self.sreq.id,
+			val,
+			ScmpNotifRespFlags::empty(),
+		))
+	}
+
 	/// Returns the syscall number that triggered this notification.
 	pub fn syscall(&self) -> libseccomp::ScmpSyscall {
 		self.sreq.data.syscall
 	}
 
 	/// Install `srcfd` into the traced process and atomically complete the
-	/// notification, so the traced syscall returns the newly installed
-	/// descriptor number.  Used to substitute a freshly-resolved fd for
-	/// the result of `openat`-family syscalls (§11.2).
+	/// notification such that the newly installed fd is returned from the
+	/// syscall.
 	///
-	/// On success the context is marked answered and the new descriptor
-	/// number (as seen by the traced process) is returned.
+	/// On success the context is marked answered and the new descriptor number
+	/// (as seen by the traced process, but may not be a valid fd for the
+	/// caller) is returned.
 	pub fn install_fd_and_respond(
 		&mut self,
 		srcfd: RawFd,
@@ -210,13 +223,9 @@ impl<'a> RequestContext<'a> {
 		Ok(newfd as i64)
 	}
 
-	/// Install `srcfd` (valid in the supervisor) into the traced process
-	/// at the *exact* descriptor number `newfd`, replacing whatever the
-	/// traced process currently has there.  Unlike
-	/// [`Self::install_fd_and_respond`], this does **not** complete the
-	/// notification — the caller is expected to subsequently
-	/// [`Self::send_continue`] so the kernel re-executes the syscall
-	/// against the now-upgraded descriptor (§11.2 stale-`dirfd` upgrade).
+	/// Install `srcfd` into the traced process as `newfd`, replacing any
+	/// existing fds in the traced process, but without sending any responses
+	/// for this syscall.
 	pub fn replace_fd(
 		&mut self,
 		srcfd: RawFd,
@@ -235,17 +244,6 @@ impl<'a> RequestContext<'a> {
 		};
 		notif_addfd(self.notify_fd, &addfd).map_err(AccessRequestError::AddFd)?;
 		Ok(())
-	}
-
-	/// Complete the notification with a spoofed successful return value
-	/// `val` (the syscall returns `val` without being re-executed).  Used
-	/// by the file-fd modifying-op proxy (§11.2).
-	pub fn send_value(&mut self, val: i64) -> Result<(), AccessRequestError> {
-		self.send_response_impl(ScmpNotifResp::new_val(
-			self.sreq.id,
-			val,
-			ScmpNotifRespFlags::empty(),
-		))
 	}
 
 	/// Read a NUL-terminated C string from the traced process's memory at
