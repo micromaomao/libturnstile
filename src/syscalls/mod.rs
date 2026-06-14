@@ -154,6 +154,8 @@ impl<'a> RequestContext<'a> {
 			resp.respond(self.notify_fd)
 				.map_err(AccessRequestError::NotifyRespond)?;
 			self.valid = false;
+		} else {
+			warn!("send_response_impl called on an already-answered notification; ignoring");
 		}
 		Ok(())
 	}
@@ -202,13 +204,17 @@ impl<'a> RequestContext<'a> {
 	/// On success the context is marked answered and the new descriptor number
 	/// (as seen by the traced process, but may not be a valid fd for the
 	/// caller) is returned.
+	///
+	/// If the notification is no longer valid (already answered, or
+	/// invalidated by a signal), this is a no-op that returns `Ok(0)`.
 	pub fn install_fd_and_respond(
 		&mut self,
 		srcfd: RawFd,
 		cloexec: bool,
 	) -> Result<i64, AccessRequestError> {
 		if !self.valid {
-			return Err(AccessRequestError::NotificationAlreadyAnswered);
+			warn!("install_fd_and_respond called on an already-answered notification; ignoring");
+			return Ok(0);
 		}
 		let addfd = libc::seccomp_notif_addfd {
 			id: self.sreq.id,
@@ -226,6 +232,9 @@ impl<'a> RequestContext<'a> {
 	/// Install `srcfd` into the traced process as `newfd`, replacing any
 	/// existing fds in the traced process, but without sending any responses
 	/// for this syscall.
+	///
+	/// If the notification is no longer valid (already answered, or
+	/// invalidated by a signal), this is a no-op.
 	pub fn replace_fd(
 		&mut self,
 		srcfd: RawFd,
@@ -233,7 +242,8 @@ impl<'a> RequestContext<'a> {
 		cloexec: bool,
 	) -> Result<(), AccessRequestError> {
 		if !self.valid {
-			return Err(AccessRequestError::NotificationAlreadyAnswered);
+			warn!("replace_fd called on an already-answered notification; ignoring");
+			return Ok(());
 		}
 		let addfd = libc::seccomp_notif_addfd {
 			id: self.sreq.id,
