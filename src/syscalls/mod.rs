@@ -206,7 +206,9 @@ impl<'a> RequestContext<'a> {
 	/// caller) is returned.
 	///
 	/// If the notification is no longer valid (already answered, or
-	/// invalidated by a signal), this is a no-op that returns `Ok(0)`.
+	/// invalidated by a signal), this is a no-op that returns `Ok(0)`; the
+	/// `0` is a placeholder, as no fd is installed and the syscall return
+	/// value seen by the traced process is whatever already answered it.
 	pub fn install_fd_and_respond(
 		&mut self,
 		srcfd: RawFd,
