@@ -34,7 +34,7 @@ use crate::{
 	AccessRequestError, RequestContext,
 	access::{
 		AccessRequest, Operation,
-		fs::{FsOperation, ForeignFd, InodeId, ModifyFdKind, ModifyFdOperation},
+		fs::{ForeignFd, FsOperation, InodeId, ModifyFdKind, ModifyFdOperation},
 	},
 	syscalls::fs as syscalls_fs,
 };
@@ -129,7 +129,10 @@ impl ManagedBindMountSandbox {
 				},
 				Err(e) => {
 					attempts += 1;
-					debug!("m1 reopen of {:?} failed: {}, attempt {}", path, e, attempts);
+					debug!(
+						"m1 reopen of {:?} failed: {}, attempt {}",
+						path, e, attempts
+					);
 					if attempts >= 2 {
 						return None;
 					}
@@ -207,7 +210,10 @@ impl ManagedBindMountSandbox {
 		let expected = if creating {
 			None
 		} else {
-			op.target.open_target().ok().and_then(|fd| fd.inode_id().ok())
+			op.target
+				.open_target()
+				.ok()
+				.and_then(|fd| fd.inode_id().ok())
 		};
 
 		let how = build_open_how(&params);
@@ -227,7 +233,10 @@ impl ManagedBindMountSandbox {
 		let cloexec = params.flags & libc::O_CLOEXEC as u64 != 0;
 		match ctx.install_fd_and_respond(fd.as_raw_fd(), cloexec) {
 			Ok(newfd) => {
-				debug!("openat upgrade: installed fresh fd {} for {:?}", newfd, abspath_c);
+				debug!(
+					"openat upgrade: installed fresh fd {} for {:?}",
+					newfd, abspath_c
+				);
 				Ok(())
 			}
 			Err(e) => {
@@ -309,7 +318,10 @@ impl ManagedBindMountSandbox {
 			let cur_mnt = match app_fd.mnt_id() {
 				Ok(m) => m,
 				Err(e) => {
-					debug!("dirfd upgrade: statx(mnt_id) on app fd {} failed: {}", raw, e);
+					debug!(
+						"dirfd upgrade: statx(mnt_id) on app fd {} failed: {}",
+						raw, e
+					);
 					continue;
 				}
 			};
@@ -426,9 +438,7 @@ fn perform_modify(kind: &ModifyFdKind, fd: libc::c_int) -> Result<(), libc::c_in
 			ModifyFdKind::Chmod { mode } => {
 				libc::fchmodat(libc::AT_FDCWD, p, *mode as libc::mode_t, 0)
 			}
-			ModifyFdKind::Chown { uid, gid } => {
-				libc::fchownat(libc::AT_FDCWD, p, *uid, *gid, 0)
-			}
+			ModifyFdKind::Chown { uid, gid } => libc::fchownat(libc::AT_FDCWD, p, *uid, *gid, 0),
 			ModifyFdKind::Truncate { length } => libc::truncate(p, *length as libc::off_t),
 			ModifyFdKind::SetXattr { name, value, flags } => libc::setxattr(
 				p,

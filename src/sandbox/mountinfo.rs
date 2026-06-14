@@ -119,7 +119,8 @@ mod tests {
 
 	#[test]
 	fn parses_basic_line() {
-		let line = b"36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue";
+		let line =
+			b"36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue";
 		let e = parse_line(line).unwrap();
 		assert_eq!(e.mnt_id, 36);
 		assert_eq!(e.parent_mnt_id, 35);

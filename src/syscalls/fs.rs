@@ -472,10 +472,7 @@ fn read_target_bytes(
 	let mut buf: Vec<u8> = Vec::with_capacity(len);
 	{
 		let uninit = unsafe {
-			std::slice::from_raw_parts_mut(
-				buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
-				len,
-			)
+			std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>, len)
 		};
 		req.read_target_memory(ptr, uninit)?;
 	}
@@ -483,10 +480,7 @@ fn read_target_bytes(
 	Ok(buf)
 }
 
-fn handle_modify_fd(
-	target: FsTarget,
-	kind: ModifyFdKind,
-) -> Result<Operation, AccessRequestError> {
+fn handle_modify_fd(target: FsTarget, kind: ModifyFdKind) -> Result<Operation, AccessRequestError> {
 	Ok(fsop(FsModifyFd(ModifyFdOperation { target, kind })))
 }
 

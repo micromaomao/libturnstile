@@ -693,7 +693,8 @@ impl BindMountSandbox {
 		child_ns_paths: &[CString],
 	) -> Result<libc::stat, BindMountSandboxError> {
 		if child_ns_paths.is_empty() {
-			return self.mount_host_into_sandbox_impl(host_path, ns_path, attrs, false, false, false);
+			return self
+				.mount_host_into_sandbox_impl(host_path, ns_path, attrs, false, false, false);
 		}
 		validate_sandbox_path(ns_path)?;
 
@@ -774,8 +775,7 @@ impl BindMountSandbox {
 				let child_fds_ptr = child_fds_ptr as *mut libc::c_int;
 				// Step 2: open every child while still reachable.
 				let mut child_openhow: libc::open_how = mem::zeroed();
-				child_openhow.flags =
-					(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				child_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
 				child_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
 				for i in 0..n_children {
 					let cpath = *child_ptrs_ptr.add(i);
@@ -1102,11 +1102,8 @@ impl BindMountSandbox {
 					let mut out = Vec::new();
 					let mut buf = [0u8; 8192];
 					loop {
-						let n = libc::read(
-							read_fd,
-							buf.as_mut_ptr() as *mut libc::c_void,
-							buf.len(),
-						);
+						let n =
+							libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
 						if n < 0 {
 							let err = io::Error::last_os_error();
 							if err.kind() == io::ErrorKind::Interrupted {
@@ -1161,8 +1158,7 @@ impl BindMountSandbox {
 					}
 					let mut buf = [0u8; 8192];
 					loop {
-						let n =
-							libc::read(src, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+						let n = libc::read(src, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
 						if n < 0 {
 							let err = libc::__errno_location().read();
 							if err == libc::EINTR {
@@ -2335,7 +2331,8 @@ impl ManagedBindMountSandbox {
 							};
 						} else if old.user.attrs != new.attrs {
 							if let Err(e) =
-								self.sandbox.set_mount_attr(&ns_path, new.attrs, old.user.attrs)
+								self.sandbox
+									.set_mount_attr(&ns_path, new.attrs, old.user.attrs)
 							{
 								err = Some(e);
 								return;
@@ -2474,7 +2471,10 @@ impl ManagedBindMountSandbox {
 				}
 			},
 			Err(e) => {
-				warn!("Failed to open {:?} in m1 to capture mnt_id: {}", ns_path, e);
+				warn!(
+					"Failed to open {:?} in m1 to capture mnt_id: {}",
+					ns_path, e
+				);
 				0
 			}
 		}
@@ -2519,13 +2519,12 @@ impl ManagedBindMountSandbox {
 			match by_id.get(&mi.mnt_id) {
 				None => drops.push(OsString::from(path)),
 				Some(info) => {
-					let new_host = if !info.deleted
-						&& info.root.as_bytes() != mi.user.host_path.to_bytes()
-					{
-						CString::new(info.root.as_bytes()).ok()
-					} else {
-						None
-					};
+					let new_host =
+						if !info.deleted && info.root.as_bytes() != mi.user.host_path.to_bytes() {
+							CString::new(info.root.as_bytes()).ok()
+						} else {
+							None
+						};
 					updates.push((OsString::from(path), info.deleted, new_host));
 				}
 			}
@@ -2564,9 +2563,7 @@ impl ManagedBindMountSandbox {
 			let is_ancestor = if pb == b"/" {
 				path_b != b"/"
 			} else {
-				path_b.len() > pb.len()
-					&& path_b.starts_with(pb)
-					&& path_b[pb.len()] == b'/'
+				path_b.len() > pb.len() && path_b.starts_with(pb) && path_b[pb.len()] == b'/'
 			};
 			if is_ancestor && pb.len() >= best_len {
 				best_len = pb.len();
@@ -2620,226 +2617,222 @@ impl ManagedBindMountSandbox {
 
 #[cfg(test)]
 mod sandbox_integration_tests {
-use super::*;
+	use super::*;
 
-/// Try to create a low-level sandbox.  Nested user namespaces are
-/// unavailable in many CI/build environments (and may be blocked by
-/// AppArmor); when setup fails we skip the test rather than fail, so
-/// these privileged integration tests are a no-op where they can't
-/// run but still exercise the m1 mount choreography where they can.
-fn try_new_sandbox() -> Option<BindMountSandbox> {
-match BindMountSandbox::new(false) {
-Ok(sb) => Some(sb),
-Err(e) => {
-eprintln!("skipping privileged sandbox test: setup failed: {e}");
-None
-}
-}
-}
+	/// Try to create a low-level sandbox.  Nested user namespaces are
+	/// unavailable in many CI/build environments (and may be blocked by
+	/// AppArmor); when setup fails we skip the test rather than fail, so
+	/// these privileged integration tests are a no-op where they can't
+	/// run but still exercise the m1 mount choreography where they can.
+	fn try_new_sandbox() -> Option<BindMountSandbox> {
+		match BindMountSandbox::new(false) {
+			Ok(sb) => Some(sb),
+			Err(e) => {
+				eprintln!("skipping privileged sandbox test: setup failed: {e}");
+				None
+			}
+		}
+	}
 
-fn mountinfo_has_mountpoint(raw: &[u8], mp: &[u8]) -> bool {
-mountinfo::parse_mountinfo(raw)
-.iter()
-.any(|e| e.mount_point.as_encoded_bytes() == mp)
-}
+	fn mountinfo_has_mountpoint(raw: &[u8], mp: &[u8]) -> bool {
+		mountinfo::parse_mountinfo(raw)
+			.iter()
+			.any(|e| e.mount_point.as_encoded_bytes() == mp)
+	}
 
-/// Return the bind source (`root` field) of the topmost mount at `mp`,
-/// if any.
-fn mountinfo_root_for(raw: &[u8], mp: &[u8]) -> Option<Vec<u8>> {
-mountinfo::parse_mountinfo(raw)
-.iter()
-.filter(|e| e.mount_point.as_encoded_bytes() == mp)
-.last()
-.map(|e| e.root.as_bytes().to_vec())
-}
+	/// Return the bind source (`root` field) of the topmost mount at `mp`,
+	/// if any.
+	fn mountinfo_root_for(raw: &[u8], mp: &[u8]) -> Option<Vec<u8>> {
+		mountinfo::parse_mountinfo(raw)
+			.iter()
+			.filter(|e| e.mount_point.as_encoded_bytes() == mp)
+			.last()
+			.map(|e| e.root.as_bytes().to_vec())
+	}
 
-/// Exercise `read_m1_mountinfo` + `park_to_scratch` +
-/// `restore_from_scratch`: a mount parked into the hidden scratch
-/// tmpfs disappears from its original mountpoint, and restoring it
-/// brings the same mount back to that path.
-#[test]
-fn park_and_restore_roundtrip() {
-let Some(sb) = try_new_sandbox() else {
-return;
-};
-sb.mount_host_into_sandbox_impl(
-c"/etc",
-c"/etc",
-MountAttributes::ro(),
-false,
-false,
-true,
-)
-.expect("mount /etc");
+	/// Exercise `read_m1_mountinfo` + `park_to_scratch` +
+	/// `restore_from_scratch`: a mount parked into the hidden scratch
+	/// tmpfs disappears from its original mountpoint, and restoring it
+	/// brings the same mount back to that path.
+	#[test]
+	fn park_and_restore_roundtrip() {
+		let Some(sb) = try_new_sandbox() else {
+			return;
+		};
+		sb.mount_host_into_sandbox_impl(
+			c"/etc",
+			c"/etc",
+			MountAttributes::ro(),
+			false,
+			false,
+			true,
+		)
+		.expect("mount /etc");
 
-let before = sb.read_m1_mountinfo().expect("read mountinfo");
-assert!(
-mountinfo_has_mountpoint(&before, b"/etc"),
-"/etc should be mounted before parking"
-);
+		let before = sb.read_m1_mountinfo().expect("read mountinfo");
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/etc"),
+			"/etc should be mounted before parking"
+		);
 
-sb.park_to_scratch(c"/etc", c"park-test").expect("park /etc");
-let parked = sb.read_m1_mountinfo().expect("read mountinfo after park");
-assert!(
-!mountinfo_has_mountpoint(&parked, b"/etc"),
-"/etc must no longer be mounted after parking"
-);
+		sb.park_to_scratch(c"/etc", c"park-test")
+			.expect("park /etc");
+		let parked = sb.read_m1_mountinfo().expect("read mountinfo after park");
+		assert!(
+			!mountinfo_has_mountpoint(&parked, b"/etc"),
+			"/etc must no longer be mounted after parking"
+		);
 
-sb.restore_from_scratch(c"park-test", c"/etc")
-.expect("restore /etc");
-let after = sb.read_m1_mountinfo().expect("read mountinfo after restore");
-assert!(
-mountinfo_has_mountpoint(&after, b"/etc"),
-"/etc must be mounted again after restore"
-);
-}
+		sb.restore_from_scratch(c"park-test", c"/etc")
+			.expect("restore /etc");
+		let after = sb
+			.read_m1_mountinfo()
+			.expect("read mountinfo after restore");
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/etc"),
+			"/etc must be mounted again after restore"
+		);
+	}
 
-/// Exercise `unmount_covering` (§6): a parent mount with a child
-/// sub-mount is unmounted while the child's `struct mount` identity is
-/// preserved.  After the choreography the parent is gone but the child
-/// is restored on the revealed placeholder layer.
-#[test]
-fn unmount_covering_preserves_child() {
-let Some(sb) = try_new_sandbox() else {
-return;
-};
-// Parent bind: /etc at /p (creates the /p placeholder).
-sb.mount_host_into_sandbox_impl(
-c"/etc",
-c"/p",
-MountAttributes::ro(),
-false,
-false,
-true,
-)
-.expect("mount parent /p");
-// Child bind: /etc at /p/ssl (mountpoint /etc/ssl exists through the
-// /p bind; also creates a /p/ssl placeholder on the revealed layer).
-sb.mount_host_into_sandbox_impl(
-c"/etc",
-c"/p/ssl",
-MountAttributes::ro(),
-false,
-false,
-true,
-)
-.expect("mount child /p/ssl");
+	/// Exercise `unmount_covering` (§6): a parent mount with a child
+	/// sub-mount is unmounted while the child's `struct mount` identity is
+	/// preserved.  After the choreography the parent is gone but the child
+	/// is restored on the revealed placeholder layer.
+	#[test]
+	fn unmount_covering_preserves_child() {
+		let Some(sb) = try_new_sandbox() else {
+			return;
+		};
+		// Parent bind: /etc at /p (creates the /p placeholder).
+		sb.mount_host_into_sandbox_impl(c"/etc", c"/p", MountAttributes::ro(), false, false, true)
+			.expect("mount parent /p");
+		// Child bind: /etc at /p/ssl (mountpoint /etc/ssl exists through the
+		// /p bind; also creates a /p/ssl placeholder on the revealed layer).
+		sb.mount_host_into_sandbox_impl(
+			c"/etc",
+			c"/p/ssl",
+			MountAttributes::ro(),
+			false,
+			false,
+			true,
+		)
+		.expect("mount child /p/ssl");
 
-let before = sb.read_m1_mountinfo().expect("read mountinfo");
-assert!(
-mountinfo_has_mountpoint(&before, b"/p"),
-"/p should be mounted before unmount_covering"
-);
-assert!(
-mountinfo_has_mountpoint(&before, b"/p/ssl"),
-"/p/ssl should be mounted before unmount_covering"
-);
+		let before = sb.read_m1_mountinfo().expect("read mountinfo");
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p"),
+			"/p should be mounted before unmount_covering"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p/ssl"),
+			"/p/ssl should be mounted before unmount_covering"
+		);
 
-let unmounted = sb
-.unmount_covering(c"/p", &[CString::new("/p/ssl").unwrap()])
-.expect("unmount_covering /p");
-assert!(
-unmounted,
-"/p should have been unmounted (nothing holds it)"
-);
+		let unmounted = sb
+			.unmount_covering(c"/p", &[CString::new("/p/ssl").unwrap()])
+			.expect("unmount_covering /p");
+		assert!(
+			unmounted,
+			"/p should have been unmounted (nothing holds it)"
+		);
 
-let after = sb.read_m1_mountinfo().expect("read mountinfo after");
-assert!(
-!mountinfo_has_mountpoint(&after, b"/p"),
-"/p must be gone after unmount_covering"
-);
-assert!(
-mountinfo_has_mountpoint(&after, b"/p/ssl"),
-"/p/ssl child mount must be preserved after unmount_covering"
-);
-}
+		let after = sb.read_m1_mountinfo().expect("read mountinfo after");
+		assert!(
+			!mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must be gone after unmount_covering"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p/ssl"),
+			"/p/ssl child mount must be preserved after unmount_covering"
+		);
+	}
 
-/// End-to-end §6 check through the managed reconcile API: removing a
-/// parent mount that has a still-desired child preserves the child
-/// (the `Removed` branch routes through `unmount_covering`).
-#[test]
-fn managed_remove_preserves_child_mount() {
-let msb = match ManagedBindMountSandbox::new(false) {
-Ok(s) => s,
-Err(e) => {
-eprintln!("skipping privileged managed test: setup failed: {e}");
-return;
-}
-};
-let mp = ManagedMountPoint {
-host_path: CString::new("/etc").unwrap(),
-attrs: MountAttributes::ro(),
-};
-msb.add_or_update_mount(OsStr::new("/p"), mp.clone())
-.expect("add /p");
-msb.add_or_update_mount(OsStr::new("/p/ssl"), mp.clone())
-.expect("add /p/ssl");
+	/// End-to-end §6 check through the managed reconcile API: removing a
+	/// parent mount that has a still-desired child preserves the child
+	/// (the `Removed` branch routes through `unmount_covering`).
+	#[test]
+	fn managed_remove_preserves_child_mount() {
+		let msb = match ManagedBindMountSandbox::new(false) {
+			Ok(s) => s,
+			Err(e) => {
+				eprintln!("skipping privileged managed test: setup failed: {e}");
+				return;
+			}
+		};
+		let mp = ManagedMountPoint {
+			host_path: CString::new("/etc").unwrap(),
+			attrs: MountAttributes::ro(),
+		};
+		msb.add_or_update_mount(OsStr::new("/p"), mp.clone())
+			.expect("add /p");
+		msb.add_or_update_mount(OsStr::new("/p/ssl"), mp.clone())
+			.expect("add /p/ssl");
 
-let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
-assert!(mountinfo_has_mountpoint(&before, b"/p"), "/p mounted");
-assert!(
-mountinfo_has_mountpoint(&before, b"/p/ssl"),
-"/p/ssl mounted"
-);
+		let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
+		assert!(mountinfo_has_mountpoint(&before, b"/p"), "/p mounted");
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p/ssl"),
+			"/p/ssl mounted"
+		);
 
-msb.remove_mount(OsStr::new("/p")).expect("remove /p");
+		msb.remove_mount(OsStr::new("/p")).expect("remove /p");
 
-let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
-assert!(
-!mountinfo_has_mountpoint(&after, b"/p"),
-"/p must be removed"
-);
-assert!(
-mountinfo_has_mountpoint(&after, b"/p/ssl"),
-"/p/ssl child must be preserved through parent removal"
-);
-}
+		let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
+		assert!(
+			!mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must be removed"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p/ssl"),
+			"/p/ssl child must be preserved through parent removal"
+		);
+	}
 
-/// A host_path change is handled as a §5 split (Removed then Added).
-/// The mountpoint must survive and rebind to the new host source.
-#[test]
-fn managed_host_path_change_rebinds() {
-let msb = match ManagedBindMountSandbox::new(false) {
-Ok(s) => s,
-Err(e) => {
-eprintln!("skipping privileged managed test: setup failed: {e}");
-return;
-}
-};
-msb.add_or_update_mount(
-OsStr::new("/p"),
-ManagedMountPoint {
-host_path: CString::new("/etc").unwrap(),
-attrs: MountAttributes::ro(),
-},
-)
-.expect("add /p -> /etc");
-let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
-assert_eq!(
-mountinfo_root_for(&before, b"/p").as_deref(),
-Some(&b"/etc"[..]),
-"/p should bind /etc initially"
-);
+	/// A host_path change is handled as a §5 split (Removed then Added).
+	/// The mountpoint must survive and rebind to the new host source.
+	#[test]
+	fn managed_host_path_change_rebinds() {
+		let msb = match ManagedBindMountSandbox::new(false) {
+			Ok(s) => s,
+			Err(e) => {
+				eprintln!("skipping privileged managed test: setup failed: {e}");
+				return;
+			}
+		};
+		msb.add_or_update_mount(
+			OsStr::new("/p"),
+			ManagedMountPoint {
+				host_path: CString::new("/etc").unwrap(),
+				attrs: MountAttributes::ro(),
+			},
+		)
+		.expect("add /p -> /etc");
+		let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
+		assert_eq!(
+			mountinfo_root_for(&before, b"/p").as_deref(),
+			Some(&b"/etc"[..]),
+			"/p should bind /etc initially"
+		);
 
-// Change the host source for the same sandbox path.
-msb.add_or_update_mount(
-OsStr::new("/p"),
-ManagedMountPoint {
-host_path: CString::new("/usr").unwrap(),
-attrs: MountAttributes::ro(),
-},
-)
-.expect("rebind /p -> /usr");
+		// Change the host source for the same sandbox path.
+		msb.add_or_update_mount(
+			OsStr::new("/p"),
+			ManagedMountPoint {
+				host_path: CString::new("/usr").unwrap(),
+				attrs: MountAttributes::ro(),
+			},
+		)
+		.expect("rebind /p -> /usr");
 
-let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
-assert!(
-mountinfo_has_mountpoint(&after, b"/p"),
-"/p must still be mounted after host_path change"
-);
-assert_eq!(
-mountinfo_root_for(&after, b"/p").as_deref(),
-Some(&b"/usr"[..]),
-"/p should bind /usr after the host_path change"
-);
-}
+		let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must still be mounted after host_path change"
+		);
+		assert_eq!(
+			mountinfo_root_for(&after, b"/p").as_deref(),
+			Some(&b"/usr"[..]),
+			"/p should bind /usr after the host_path change"
+		);
+	}
 }
