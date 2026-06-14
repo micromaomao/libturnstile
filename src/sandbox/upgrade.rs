@@ -191,7 +191,7 @@ impl ManagedBindMountSandbox {
 
 		// Resolve the *canonical* absolute path by reopening the target
 		// (or, when creating, its parent directory) and reading the
-		// /proc/self/fd symlink — the same normalisation the supervisor
+		// /proc/self/fd symlink — the same normalization the supervisor
 		// performed when deciding which mount to add.  A lexical
 		// `realpath()` would leave `..` and symlink components
 		// unresolved; those then resolve differently inside m1 (e.g. `..`
@@ -200,7 +200,7 @@ impl ManagedBindMountSandbox {
 		// the identity check would fail closed (e.g. `ls -la ..`).
 		let creating = params.flags & libc::O_CREAT as u64 != 0;
 		let (abspath, expected) = if creating {
-			// The leaf may not exist yet, so canonicalise the parent
+			// The leaf may not exist yet, so canonicalize the parent
 			// directory and re-append the final component.
 			let (dir_fd, leaf) = match op.target.open_target_dir() {
 				Ok(pair) => pair,
