@@ -29,19 +29,10 @@ const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SeccompNotifAddfd {
-	/// The id of the notification being handled (the trapped syscall).
 	id: u64,
-	/// `SECCOMP_ADDFD_FLAG_*` bits (e.g. `SETFD`, `SEND`).
 	flags: u32,
-	/// The source descriptor, valid in *this* (the supervisor) process,
-	/// to be duplicated into the traced process.
 	srcfd: u32,
-	/// When `SETFD` is set, the exact descriptor number to install at in
-	/// the traced process; ignored otherwise (kernel picks the lowest
-	/// free number).
 	newfd: u32,
-	/// `O_CLOEXEC`-style flags to apply to the installed descriptor in
-	/// the traced process.
 	newfd_flags: u32,
 }
 
@@ -72,23 +63,6 @@ const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = _ioc(
 	3,
 	std::mem::size_of::<SeccompNotifAddfd>() as u32,
 );
-
-/// Raw `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper.  Returns the new fd
-/// number installed in the target on success.
-fn notif_addfd(notify_fd: ScmpFd, addfd: &SeccompNotifAddfd) -> io::Result<libc::c_int> {
-	let ret = unsafe {
-		libc::ioctl(
-			notify_fd,
-			SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
-			addfd as *const SeccompNotifAddfd,
-		)
-	};
-	if ret < 0 {
-		Err(io::Error::last_os_error())
-	} else {
-		Ok(ret)
-	}
-}
 
 macro_rules! syscall_transform_tuple {
 	($sys:expr, $t:expr, $ty1:ty) => {
@@ -138,6 +112,23 @@ macro_rules! lazy_syscall_table_name_to_number {
 	};
 }
 pub(crate) use lazy_syscall_table_name_to_number;
+
+/// Raw `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper.  Returns the new fd
+/// number installed in the target on success.
+fn notif_addfd(notify_fd: ScmpFd, addfd: &SeccompNotifAddfd) -> io::Result<libc::c_int> {
+	let ret = unsafe {
+		libc::ioctl(
+			notify_fd,
+			SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+			addfd as *const SeccompNotifAddfd,
+		)
+	};
+	if ret < 0 {
+		Err(io::Error::last_os_error())
+	} else {
+		Ok(ret)
+	}
+}
 
 #[derive(Debug)]
 pub struct RequestContext<'a> {
@@ -211,9 +202,8 @@ impl<'a> RequestContext<'a> {
 		self.sreq.data.syscall
 	}
 
-	/// Install `srcfd` (a descriptor valid in *this* — the supervisor —
-	/// process) into the traced process and atomically complete the
-	/// notification, so the trapped syscall returns the newly installed
+	/// Install `srcfd` into the traced process and atomically complete the
+	/// notification, so the traced syscall returns the newly installed
 	/// descriptor number.  Used to substitute a freshly-resolved fd for
 	/// the result of `openat`-family syscalls (§11.2).
 	///
