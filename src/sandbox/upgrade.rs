@@ -199,6 +199,12 @@ impl ManagedBindMountSandbox {
 				return ctx.send_continue();
 			}
 		};
+		debug!(
+			"openat(fd => {:?}, {:?}) abspath = {:?}",
+			op.target.dfd().readlink(),
+			op.target.path(),
+			abspath
+		);
 		let Some(abspath_c) = to_cstring(abspath.as_bytes()) else {
 			return ctx.send_continue();
 		};
@@ -493,6 +499,9 @@ impl<'s, 't> RequestHandle<'s, 't> {
 
 	/// Allow the request, transparently upgrading or proxying fds so the
 	/// traced process's view matches the live mount layout (§11.2).
+	///
+	/// If the request requires any additional mounts, the caller must have
+	/// already added them.
 	pub fn allow(mut self) -> Result<(), AccessRequestError> {
 		// Disjoint field borrows: `request` immutably, `req_ctx` mutably.
 		self.sandbox.allow_request(&self.request, &mut self.req_ctx)

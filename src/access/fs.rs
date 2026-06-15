@@ -76,6 +76,11 @@ impl ForeignFd {
 			return Err(io::Error::last_os_error());
 		}
 		buf.truncate(ret as usize);
+		debug!(
+			"readlink of fd {} returned {:?}",
+			self.local_fd,
+			OsStr::from_bytes(&buf)
+		);
 		// readlink does not include a NUL terminator
 		if buf.len() > 1 && buf.last().copied() == Some(b'/') {
 			buf.pop();
