@@ -23,9 +23,9 @@
 //!   there, and return the result directly (no CONTINUE).
 //! * anything else — CONTINUE.
 
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 
 use libc::open_how;
 use log::{debug, error, warn};
@@ -189,76 +189,31 @@ impl ManagedBindMountSandbox {
 			return ctx.send_continue();
 		};
 
-		// Resolve the *canonical* absolute path by reopening the target
-		// (or, when creating, its parent directory) and reading the
-		// /proc/self/fd symlink — the same normalization the supervisor
-		// performed when deciding which mount to add.  A lexical
-		// `realpath()` would leave `..` and symlink components
-		// unresolved; those then resolve differently inside m1 (e.g. `..`
-		// from a bind-mount root climbs to m1's placeholder parent rather
-		// than the host parent), so the reopened inode wouldn't match and
-		// the identity check would fail closed (e.g. `ls -la ..`).
-		let creating = params.flags & libc::O_CREAT as u64 != 0;
-		let (abspath, expected) = if creating {
-			// The leaf may not exist yet, so canonicalize the parent
-			// directory and re-append the final component.
-			let (dir_fd, leaf) = match op.target.open_target_dir() {
-				Ok(pair) => pair,
-				Err(e) => {
-					warn!(
-						"openat upgrade: cannot open parent dir for {}: {} — continuing natively",
-						op.target, e
-					);
-					return ctx.send_continue();
-				}
-			};
-			let mut p = match dir_fd.readlink() {
-				Ok(p) => p.into_encoded_bytes(),
-				Err(e) => {
-					warn!(
-						"openat upgrade: cannot resolve parent dir for {}: {} — continuing natively",
-						op.target, e
-					);
-					return ctx.send_continue();
-				}
-			};
-			let leaf = leaf.to_bytes();
-			if !leaf.is_empty() && leaf != b"." {
-				if p.last().copied() != Some(b'/') {
-					p.push(b'/');
-				}
-				p.extend_from_slice(leaf);
+		let abspath = match op.target.realpath() {
+			Ok(p) => p,
+			Err(e) => {
+				warn!(
+					"openat upgrade: cannot resolve abspath for {}: {} — continuing natively",
+					op.target, e
+				);
+				return ctx.send_continue();
 			}
-			(OsString::from_vec(p), None)
-		} else {
-			// For an existing target the identity reference and the path
-			// both come from the very same fd, so they're guaranteed
-			// consistent.
-			let fd = match op.target.open_target() {
-				Ok(fd) => fd,
-				Err(e) => {
-					warn!(
-						"openat upgrade: cannot open target for {}: {} — continuing natively",
-						op.target, e
-					);
-					return ctx.send_continue();
-				}
-			};
-			let expected = fd.inode_id().ok();
-			let abspath = match fd.readlink() {
-				Ok(p) => p,
-				Err(e) => {
-					warn!(
-						"openat upgrade: cannot resolve abspath for {}: {} — continuing natively",
-						op.target, e
-					);
-					return ctx.send_continue();
-				}
-			};
-			(abspath, expected)
 		};
 		let Some(abspath_c) = to_cstring(abspath.as_bytes()) else {
 			return ctx.send_continue();
+		};
+
+		// For a fresh open the identity reference is what the app's own
+		// path resolves to right now (post-grant); skip it when creating
+		// (the leaf may not exist yet).
+		let creating = params.flags & libc::O_CREAT as u64 != 0;
+		let expected = if creating {
+			None
+		} else {
+			op.target
+				.open_target()
+				.ok()
+				.and_then(|fd| fd.inode_id().ok())
 		};
 
 		let how = build_open_how(&params);

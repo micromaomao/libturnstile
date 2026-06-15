@@ -2008,6 +2008,11 @@ impl ManagedBindMountSandbox {
 
 	/// Convenience: update a single entry (placeholder or mount) and
 	/// reconcile.
+	///
+	/// Reconciliation may touch other paths (ancestors, shadowed
+	/// sub-mounts, previously-tracked entries).  Only an error related to
+	/// `path` itself is surfaced to the caller; failures on unrelated
+	/// paths are logged by `reconcile` but do not fail this call.
 	pub fn add_or_update_entry(
 		&self,
 		path: &OsStr,
@@ -2017,7 +2022,22 @@ impl ManagedBindMountSandbox {
 		let (mut pt, mut mt) = self.lock_trees();
 		let mut desired_entries = self.entries_from_state(&pt, &mt);
 		desired_entries.insert(path, entry);
-		self.reconcile(&mut pt, &mut mt, &desired_entries)
+		let errors = self.reconcile(&mut pt, &mut mt, &desired_entries);
+		Self::error_for_path(errors, path)
+	}
+
+	/// Pick out the reconcile error (if any) that relates to `path`,
+	/// discarding errors on unrelated paths.
+	fn error_for_path(
+		errors: Vec<(OsString, BindMountSandboxError)>,
+		path: &OsStr,
+	) -> Result<(), BindMountSandboxError> {
+		for (p, e) in errors {
+			if p.as_os_str() == path {
+				return Err(e);
+			}
+		}
+		Ok(())
 	}
 
 	pub fn add_or_update_mount(
@@ -2042,7 +2062,8 @@ impl ManagedBindMountSandbox {
 		let (mut pt, mut mt) = self.lock_trees();
 		let mut desired_entries = self.entries_from_state(&pt, &mt);
 		desired_entries.remove(path);
-		self.reconcile(&mut pt, &mut mt, &desired_entries)
+		let errors = self.reconcile(&mut pt, &mut mt, &desired_entries);
+		Self::error_for_path(errors, path)
 	}
 
 	pub fn remove_mount(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
@@ -2054,7 +2075,13 @@ impl ManagedBindMountSandbox {
 		desired_tree: &FsTree<ManagedTreeEntry>,
 	) -> Result<(), BindMountSandboxError> {
 		let (mut pt, mut mt) = self.lock_trees();
-		self.reconcile(&mut pt, &mut mt, desired_tree)
+		let errors = self.reconcile(&mut pt, &mut mt, desired_tree);
+		// A bulk update has no single "target" path, so surface the
+		// first error encountered (all are logged by `reconcile`).
+		match errors.into_iter().next() {
+			Some((_, e)) => Err(e),
+			None => Ok(()),
+		}
 	}
 
 	pub fn update_from_list<'a>(
@@ -2144,19 +2171,25 @@ impl ManagedBindMountSandbox {
 	///      apply unmount / mount / set_mount_attr accordingly.
 	///   5. Diff current_placeholder_tree -> desired_placeholder_tree
 	///      again and remove now-unused placeholders (ignoring adds).
+	///
+	/// Reconciliation is best-effort and does not stop at the first
+	/// failure: an error applying one path is recorded (annotated by the
+	/// sandbox path it relates to) and the remaining pending
+	/// modifications are still attempted.  The accumulated errors are
+	/// returned to the caller, which decides which ones are relevant.
 	fn reconcile(
 		&self,
 		current_pt: &mut FsTree<ManagedPlaceholder>,
 		current_mt: &mut FsTree<MountInternal>,
 		desired_entries: &FsTree<ManagedTreeEntry>,
-	) -> Result<(), BindMountSandboxError> {
+	) -> Vec<(OsString, BindMountSandboxError)> {
 		// §13: refresh the mount tree from m1's mountinfo so the diff
 		// input is kernel-truthful (drops vanished mounts, tracks renamed
 		// bind sources, flags unlinked sources as expired).  Best-effort:
 		// on any read/parse failure we keep the current tree as-is.
 		self.refresh_mount_tree(current_mt);
 
-		let (desired_pt, desired_mt) = self.build_desired_trees(desired_entries)?;
+		let (desired_pt, desired_mt, mut errors) = self.build_desired_trees(desired_entries);
 		debug!("Current placeholder tree: {:?}", current_pt);
 		debug!("Desired placeholder tree: {:?}", desired_pt);
 		debug!("Current mount tree: {:?}", current_mt);
@@ -2166,26 +2199,22 @@ impl ManagedBindMountSandbox {
 		let mut new_mt = current_mt.clone();
 
 		// Phase 1: create / update placeholders top-down.
-		let mut err: Option<BindMountSandboxError> = None;
 		current_pt.diff(
 			&desired_pt,
 			|sandbox_path, diff| {
-				if err.is_some() {
-					return;
-				}
 				let ns_path =
 					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
 					crate::fstree::DiffTree::Added(new) => {
 						if let Err(e) = self.apply_placeholder(&ns_path, new) {
-							err = Some(e);
+							errors.push((sandbox_path.to_owned(), e));
 							return;
 						}
 						new_pt.insert(sandbox_path, new.clone());
 					}
 					crate::fstree::DiffTree::Updated(_, new) => {
 						if let Err(e) = self.apply_placeholder(&ns_path, new) {
-							err = Some(e);
+							errors.push((sandbox_path.to_owned(), e));
 							return;
 						}
 						*new_pt.get_mut(sandbox_path).expect("must exist") = new.clone();
@@ -2196,19 +2225,11 @@ impl ManagedBindMountSandbox {
 			|_, _, _| false,
 			false,
 		);
-		if let Some(e) = err {
-			*current_pt = new_pt;
-			return Err(e);
-		}
 
 		// Phase 2: mounts diff.
-		let mut err: Option<BindMountSandboxError> = None;
 		current_mt.diff(
 			&desired_mt,
 			|sandbox_path, diff| {
-				if err.is_some() {
-					return;
-				}
 				let ns_path =
 					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
@@ -2223,7 +2244,7 @@ impl ManagedBindMountSandbox {
 						// would leave the new bind shadowing the old one.
 						if desired_mt.get(sandbox_path).is_some() {
 							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
-								err = Some(e);
+								errors.push((sandbox_path.to_owned(), e));
 								return;
 							}
 							new_mt.remove(sandbox_path);
@@ -2260,7 +2281,7 @@ impl ManagedBindMountSandbox {
 										covering,
 										old.user.attrs,
 									) {
-										err = Some(e);
+										errors.push((sandbox_path.to_owned(), e));
 										return;
 									}
 								}
@@ -2268,7 +2289,7 @@ impl ManagedBindMountSandbox {
 								entry.user.attrs = covering;
 							}
 							Err(e) => {
-								err = Some(e);
+								errors.push((sandbox_path.to_owned(), e));
 								return;
 							}
 						}
@@ -2289,7 +2310,7 @@ impl ManagedBindMountSandbox {
 							new.attrs,
 							&children,
 						) {
-							err = Some(e);
+							errors.push((sandbox_path.to_owned(), e));
 							return;
 						}
 						let mnt_id = self.capture_mnt_id(&ns_path);
@@ -2309,7 +2330,7 @@ impl ManagedBindMountSandbox {
 						// any freshly created host dentry at the same path.
 						if old.expired {
 							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
-								err = Some(e);
+								errors.push((sandbox_path.to_owned(), e));
 								return;
 							}
 							if let Err(e) = self.sandbox.mount_host_into_sandbox_impl(
@@ -2320,7 +2341,7 @@ impl ManagedBindMountSandbox {
 								false,
 								false,
 							) {
-								err = Some(e);
+								errors.push((sandbox_path.to_owned(), e));
 								return;
 							}
 							let mnt_id = self.capture_mnt_id(&ns_path);
@@ -2334,7 +2355,7 @@ impl ManagedBindMountSandbox {
 								self.sandbox
 									.set_mount_attr(&ns_path, new.attrs, old.user.attrs)
 							{
-								err = Some(e);
+								errors.push((sandbox_path.to_owned(), e));
 								return;
 							}
 							let entry = new_mt.get_mut(sandbox_path).expect("must exist");
@@ -2346,20 +2367,11 @@ impl ManagedBindMountSandbox {
 			|_, old, new| old.user.host_path != new.host_path,
 			true,
 		);
-		if let Some(e) = err {
-			*current_pt = new_pt;
-			*current_mt = new_mt;
-			return Err(e);
-		}
 
 		// Phase 3: remove placeholders no longer desired (bottom-up).
-		let mut err: Option<BindMountSandboxError> = None;
 		current_pt.diff(
 			&desired_pt,
 			|sandbox_path, diff| {
-				if err.is_some() {
-					return;
-				}
 				if matches!(diff, crate::fstree::DiffTree::Removed(_)) {
 					let ns_path = CString::new(sandbox_path.as_encoded_bytes())
 						.expect("checked for NUL byte");
@@ -2367,7 +2379,7 @@ impl ManagedBindMountSandbox {
 						return;
 					}
 					if let Err(e) = self.sandbox.remove_placeholder(&ns_path) {
-						err = Some(e);
+						errors.push((sandbox_path.to_owned(), e));
 						return;
 					}
 					new_pt.remove(sandbox_path);
@@ -2379,10 +2391,10 @@ impl ManagedBindMountSandbox {
 
 		*current_pt = new_pt;
 		*current_mt = new_mt;
-		match err {
-			Some(e) => Err(e),
-			None => Ok(()),
+		for (path, err) in &errors {
+			warn!("reconcile: error applying {:?}: {}", path, err);
 		}
+		errors
 	}
 
 	/// Apply (create or update) a placeholder at `ns_path`.  The parent
@@ -2411,14 +2423,15 @@ impl ManagedBindMountSandbox {
 	fn build_desired_trees(
 		&self,
 		desired_entries: &FsTree<ManagedTreeEntry>,
-	) -> Result<(FsTree<ManagedPlaceholder>, FsTree<ManagedMountPoint>), BindMountSandboxError> {
+	) -> (
+		FsTree<ManagedPlaceholder>,
+		FsTree<ManagedMountPoint>,
+		Vec<(OsString, BindMountSandboxError)>,
+	) {
 		let mut placeholders: FsTree<ManagedPlaceholder> = FsTree::new();
 		let mut mounts: FsTree<ManagedMountPoint> = FsTree::new();
-		let mut err: Option<BindMountSandboxError> = None;
+		let mut errors: Vec<(OsString, BindMountSandboxError)> = Vec::new();
 		desired_entries.walk_top_down(|path, entry| {
-			if err.is_some() {
-				return;
-			}
 			if path.as_encoded_bytes() == b"/" {
 				// Root: never a placeholder.  May be a mount target.
 				if let ManagedTreeEntry::BindMount(mp) = entry {
@@ -2432,10 +2445,15 @@ impl ManagedBindMountSandbox {
 				}
 				ManagedTreeEntry::BindMount(mp) => {
 					if placeholders.get(path).is_none() {
+						// Skip (and record) this single entry on a stat
+						// failure rather than aborting the whole
+						// reconcile: an unrelated mount whose host source
+						// has vanished must not block updates to other
+						// paths.
 						let stat = match stat_host(&mp.host_path) {
 							Ok(s) => s,
 							Err(e) => {
-								err = Some(e);
+								errors.push((path.to_owned(), e));
 								return;
 							}
 						};
@@ -2446,11 +2464,8 @@ impl ManagedBindMountSandbox {
 				}
 			}
 		});
-		if let Some(e) = err {
-			return Err(e);
-		}
 		placeholders.fill_incomplete_parent(|_| placeholder_default_no_metadata(true));
-		Ok((placeholders, mounts))
+		(placeholders, mounts, errors)
 	}
 
 	/// Capture the kernel `mnt_id` of the mount currently topmost at
