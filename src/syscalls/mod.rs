@@ -16,33 +16,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 pub mod fs;
 pub mod net;
 
-// `_IOC`-style ioctl number for `SECCOMP_IOCTL_NOTIF_ADDFD`, computed
-// with the asm-generic encoding used by all architectures libseccomp
-// supports natively here (x86-64 / aarch64 / etc.).  This evaluates to
-// 0x40182103 on those platforms, which a unit test below asserts.
-const _IOC_NRBITS: u32 = 8;
-const _IOC_TYPEBITS: u32 = 8;
-const _IOC_SIZEBITS: u32 = 14;
-const _IOC_NRSHIFT: u32 = 0;
-const _IOC_TYPESHIFT: u32 = _IOC_NRSHIFT + _IOC_NRBITS;
-const _IOC_SIZESHIFT: u32 = _IOC_TYPESHIFT + _IOC_TYPEBITS;
-const _IOC_DIRSHIFT: u32 = _IOC_SIZESHIFT + _IOC_SIZEBITS;
-const _IOC_WRITE: u32 = 1;
-
-const fn _ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u32 {
-	(dir << _IOC_DIRSHIFT)
-		| (ty << _IOC_TYPESHIFT)
-		| (nr << _IOC_NRSHIFT)
-		| (size << _IOC_SIZESHIFT)
-}
-
-const SECCOMP_IOC_MAGIC: u32 = b'!' as u32;
-const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = _ioc(
-	_IOC_WRITE,
-	SECCOMP_IOC_MAGIC,
-	3,
-	std::mem::size_of::<libc::seccomp_notif_addfd>() as u32,
-);
+// `_IOW('!', 3, struct seccomp_notif_addfd)` — the ioctl number for
+// `SECCOMP_IOCTL_NOTIF_ADDFD`, which libc does not expose.  The Linux
+// uAPI is stable, so this is a fixed constant on every architecture
+// using the asm-generic ioctl encoding (x86-64 / aarch64 / etc.).
+const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = 0x4018_2103;
 
 macro_rules! syscall_transform_tuple {
 	($sys:expr, $t:expr, $ty1:ty) => {
