@@ -458,28 +458,6 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 /// process (matches the kernel's `XATTR_SIZE_MAX`).
 const XATTR_SIZE_MAX: usize = 65536;
 
-/// Read exactly `len` bytes from the traced process's memory at `ptr`.
-///
-/// Safety: the `MaybeUninit` slice aliases `buf`'s spare capacity (`len`
-/// bytes were just reserved).  `read_target_memory` fully initialises it
-/// (or returns `Err`, in which case we never call `set_len`), so the
-/// subsequent `set_len(len)` only exposes initialised bytes.
-fn read_target_bytes(
-	req: &mut RequestContext,
-	ptr: *const u8,
-	len: usize,
-) -> Result<Vec<u8>, AccessRequestError> {
-	let mut buf: Vec<u8> = Vec::with_capacity(len);
-	{
-		let uninit = unsafe {
-			std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>, len)
-		};
-		req.read_target_memory(ptr, uninit)?;
-	}
-	unsafe { buf.set_len(len) };
-	Ok(buf)
-}
-
 fn handle_modify_fd(target: FsTarget, kind: ModifyFdKind) -> Result<Operation, AccessRequestError> {
 	Ok(fsop(FsModifyFd(ModifyFdOperation { target, kind })))
 }
@@ -537,7 +515,7 @@ const FS_SYSCALLS_FD_MODIFY: &[(&str, SyscallHandler1, u8)] = &[
 				));
 			}
 			let value_ptr = req.arg(2) as *const u8;
-			let value = read_target_bytes(req, value_ptr, size)?;
+			let value = req.bytes_from_target_memory(value_ptr, size)?;
 			handle_modify_fd(
 				target,
 				ModifyFdKind::SetXattr {
