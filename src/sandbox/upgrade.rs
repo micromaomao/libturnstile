@@ -1,4 +1,4 @@
-//! §11 — per-request fd upgrade machinery.
+//! §11 - per-request fd upgrade machinery.
 //!
 //! [`ManagedBindMountSandbox::new_request_handle`] wraps a yielded
 //! `(AccessRequest, RequestContext)` pair into a [`RequestHandle`].  The
@@ -9,19 +9,19 @@
 //! `allow()` transparently makes the traced process's view match the
 //! live bind-mount layout, per the dispatch table in §11.2:
 //!
-//! * `openat`-family — re-resolve the abspath, open it fresh in m1 (so
+//! * `openat`-family - re-resolve the abspath, open it fresh in m1 (so
 //!   it resolves through the *current* layout), identity-check it, and
 //!   hand the new fd to the app as the syscall's return value via
 //!   `SECCOMP_IOCTL_NOTIF_ADDFD` (SEND).
-//! * `chdir` / `fchdir` — preemptively ensure a mount exists on the
+//! * `chdir` / `fchdir` - preemptively ensure a mount exists on the
 //!   target (cwd can't be upgraded after the fact, §11.5), then CONTINUE.
-//! * any other `*at` with a real `dirfd` — if the dirfd is stale relative
+//! * any other `*at` with a real `dirfd` - if the dirfd is stale relative
 //!   to the current layout (`mnt_id` mismatch), m1-open the dirfd's path,
 //!   identity-check, and replace it in place (ADDFD SETFD), then CONTINUE.
 //! * `fchmod` / `fchown` / `ftruncate` / `fsetxattr` / `fremovexattr` on
-//!   a stale file fd — m1-open the path, identity-check, perform the op
+//!   a stale file fd - m1-open the path, identity-check, perform the op
 //!   there, and return the result directly (no CONTINUE).
-//! * anything else — CONTINUE.
+//! * anything else - CONTINUE.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::AsRawFd;

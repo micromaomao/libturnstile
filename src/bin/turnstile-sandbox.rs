@@ -166,7 +166,7 @@ fn mirror_intent_path_symlinks(
 		.filter(|c| !c.is_empty())
 		.collect();
 	if comps.len() < 2 {
-		// Only a leaf (or empty) — no ancestor components to walk.
+		// Only a leaf (or empty) - no ancestor components to walk.
 		return Ok(());
 	}
 	let mut resolved: Vec<u8> = Vec::new();

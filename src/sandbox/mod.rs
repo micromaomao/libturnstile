@@ -675,7 +675,7 @@ impl BindMountSandbox {
 	/// 1. (m0) `open_tree` the host source.
 	/// 2. (m1) open an `O_PATH` fd to every child (still reachable).
 	/// 3. (m1) `move_mount` the source over `ns_path` (shadows children).
-	/// 4. (m1) `move_mount` each child back onto its own path — now
+	/// 4. (m1) `move_mount` each child back onto its own path - now
 	///    resolved *inside* the new bind mount, reattaching the **same**
 	///    `struct mount` so held fds / cwd / `..` keep working.
 	///
@@ -802,7 +802,7 @@ impl BindMountSandbox {
 				}
 				// Step 4: move each child back onto its path inside the
 				// new bind mount.  A failure here (mountpoint dentry
-				// missing) leaves the child detached — its fd close below
+				// missing) leaves the child detached - its fd close below
 				// reclaims it; we don't fail the whole op.
 				for i in 0..n_children {
 					let fd = *child_fds_ptr.add(i);
@@ -1360,7 +1360,7 @@ impl BindMountSandbox {
 	/// fds / cwd resolving through them remain valid).
 	///
 	/// `child_ns_paths` must list the *direct* (topmost) sub-mounts of
-	/// `ns_path` in the live mount tree — parking all present children
+	/// `ns_path` in the live mount tree - parking all present children
 	/// (not just still-desired ones) is required so that none of them
 	/// pins the parent and causes a spurious `EBUSY` (see §6).  Their
 	/// mountpoint dentries must exist on the layer revealed by the umount
@@ -2240,7 +2240,7 @@ impl ManagedBindMountSandbox {
 						// Added(P).  Its identity is being discarded and
 						// the following Added re-covers P, so detach the
 						// old bind unconditionally (MNT_DETACH) rather than
-						// running the §6 keep-on-EBUSY dance — keeping it
+						// running the §6 keep-on-EBUSY dance - keeping it
 						// would leave the new bind shadowing the old one.
 						if desired_mt.get(sandbox_path).is_some() {
 							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
@@ -2254,7 +2254,7 @@ impl ManagedBindMountSandbox {
 						// still present under this path in the live tree
 						// and hand them to the Unmount choreography, which
 						// parks them out of the way, does a non-detach
-						// umount, then restores them — preserving each
+						// umount, then restores them - preserving each
 						// child's `struct mount` identity instead of
 						// detaching the whole subtree.
 						let mut children: Vec<CString> = Vec::new();

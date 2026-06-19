@@ -27,7 +27,7 @@ pub(crate) struct MountinfoEntry {
 	/// location of this mount's root dentry within its superblock (i.e.
 	/// the live host path of a bind source, octal-unescaped).
 	pub root: OsString,
-	/// True when field 4 ended in `//deleted` — the bind source was
+	/// True when field 4 ended in `//deleted` - the bind source was
 	/// unlinked on the host while still mounted.
 	pub deleted: bool,
 	/// Field 5: the mount point within the (m1) mount namespace,

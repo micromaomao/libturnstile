@@ -123,8 +123,8 @@ impl ForeignFd {
 	/// Note: the kernel only fills in `stx_mnt_id` when `STATX_MNT_ID`
 	/// is requested *and* set in the returned `stx_mask`.  If the
 	/// running kernel does not support it, an `ENOSYS`/`EINVAL`-style
-	/// error is surfaced, or — if the syscall succeeds but the mask bit
-	/// is unset — `ENODATA` is returned.
+	/// error is surfaced, or - if the syscall succeeds but the mask bit
+	/// is unset - `ENODATA` is returned.
 	pub fn mnt_id(&self) -> Result<u64, io::Error> {
 		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
 		let ret = unsafe {
