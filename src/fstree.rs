@@ -588,19 +588,14 @@ impl<T> FsTree<T> {
 		self.walk_impl(&mut f, false, &mut vec![b'/'], &self.root);
 	}
 
-	/// Walk the data entries strictly *under* `root` (the entry at
-	/// `root` itself, if any, is never visited) in top-down order,
-	/// calling `f(path, data)` for each.
+	/// Walk the data entries under (but not including) `root` in top-down
+	/// order, calling `f(path, data)` for each.
 	///
-	/// If `topmost_only` is true, descent into a branch stops as soon as
-	/// the first data entry in that branch is visited.  This yields the
-	/// "direct-most" descendants of `root` — e.g. the topmost sub-mounts
-	/// directly beneath a path, used by the reconcile choreography to
-	/// find a mount's immediate children.  With `topmost_only` false,
-	/// every data entry in the subtree is visited.
+	/// If `topmost_only` is true, only the "topmost" children of `root` are
+	/// visited.  For example, for a tree containing /a, /a/b/c, /a/b/c/d, the
+	/// only topmost child of /a is /a/b/c.
 	///
-	/// If `root` is not present in the tree (as either a data entry or an
-	/// intermediate node), nothing is visited.
+	/// If no path in the tree starts with `root`, `f` is not called.
 	///
 	/// ## Example
 	///
@@ -613,8 +608,6 @@ impl<T> FsTree<T> {
 	/// tree.insert(OsStr::new("/a/b/c/d"), 2);
 	/// tree.insert(OsStr::new("/a/e"), 3);
 	///
-	/// // topmost_only: the immediate sub-entries of /a are /a/b and /a/e
-	/// // (but not /a itself, nor /a/b/c/d which is buried under /a/b).
 	/// let mut topmost = Vec::new();
 	/// tree.walk_subtree_top_down(OsStr::new("/a"), true, |p, _| {
 	///     topmost.push(p.to_str().unwrap().to_string());
@@ -622,7 +615,6 @@ impl<T> FsTree<T> {
 	/// topmost.sort();
 	/// assert_eq!(topmost, &["/a/b", "/a/e"]);
 	///
-	/// // all data entries strictly under /a
 	/// let mut all = Vec::new();
 	/// tree.walk_subtree_top_down(OsStr::new("/a"), false, |p, _| {
 	///     all.push(p.to_str().unwrap().to_string());
@@ -636,7 +628,6 @@ impl<T> FsTree<T> {
 		topmost_only: bool,
 		mut f: F,
 	) {
-		// Navigate to the node at `root`.
 		let mut current = &self.root;
 		for comp in path_to_components(root) {
 			match current.children.get(comp.name) {
@@ -644,23 +635,15 @@ impl<T> FsTree<T> {
 				None => return,
 			}
 		}
-		// Build the path buffer for `root` so visited descendants get
-		// absolute paths.
+
 		let mut path: Vec<u8> = root.as_encoded_bytes().to_vec();
-		// Strip any trailing slash (other than a lone "/") so we can
-		// append "/child" uniformly.
-		while path.len() > 1 && path.last().copied() == Some(b'/') {
+		// Strip any trailing slash so descendants can uniformly append
+		// "/child".  Path will be empty if root is "/".
+		while !path.is_empty() && path.last().copied() == Some(b'/') {
 			path.pop();
 		}
-		for (name, child) in current.children.iter() {
-			let orig_len = path.len();
-			if path.last().copied() != Some(b'/') {
-				path.push(b'/');
-			}
-			path.extend_from_slice(name.as_bytes());
-			Self::walk_subtree_impl(&mut f, topmost_only, &mut path, child);
-			path.truncate(orig_len);
-		}
+		// Walk the children of `root`, but not `root` itself.
+		Self::walk_subtree_impl(&mut f, topmost_only, &mut path, current);
 	}
 
 	fn walk_subtree_impl<F: FnMut(&OsStr, &T)>(
@@ -669,21 +652,18 @@ impl<T> FsTree<T> {
 		path: &mut Vec<u8>,
 		node: &FsTreeNode<T>,
 	) {
-		if let Some(data) = &node.data {
-			f(OsStr::from_bytes(path), data);
-			if topmost_only {
-				// Stop descending into this branch — we've found its
-				// topmost data entry.
-				return;
-			}
-		}
 		for (name, child) in node.children.iter() {
 			let orig_len = path.len();
-			if path.last().copied() != Some(b'/') {
-				path.push(b'/');
-			}
+			path.push(b'/');
 			path.extend_from_slice(name.as_bytes());
-			Self::walk_subtree_impl(f, topmost_only, path, child);
+			if let Some(data) = &child.data {
+				f(OsStr::from_bytes(path), data);
+			}
+			// When topmost_only, stop descending once we've found a child
+			// with data - it is the topmost entry of this branch.
+			if !topmost_only || child.data.is_none() {
+				Self::walk_subtree_impl(f, topmost_only, path, child);
+			}
 			path.truncate(orig_len);
 		}
 	}
