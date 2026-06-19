@@ -305,6 +305,12 @@ impl FsTarget {
 			));
 		}
 
+		// An empty path here (only reachable with AT_EMPTY_PATH, checked
+		// above) means the operation targets `dfd` directly, so the dfd
+		// is the file itself.  This must be captured at construction:
+		// `from_path` produces empty-path targets whose `dfd` is the
+		// process root/cwd (not the file), so the bare-fd property cannot
+		// be recomputed from `path` alone later.
 		let bare_fd = path.as_bytes().is_empty();
 		Ok(Self {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,

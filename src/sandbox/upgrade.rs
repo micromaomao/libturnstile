@@ -489,8 +489,13 @@ fn perform_modify(fsop: &FsOperation, fd: libc::c_int) -> Result<(), libc::c_int
 			FsOperation::FsRemoveXattr(RemoveXattrOperation { name, .. }) => {
 				libc::removexattr(p, name.as_ptr())
 			}
-			// `allow_modify_fd` only calls this for the variants above.
-			_ => return Err(libc::EIO),
+			// `allow_modify_fd` only calls this for the variants above;
+			// any other op reaching here is a programming error.  Fail
+			// closed rather than panicking inside the supervisor.
+			_ => {
+				debug_assert!(false, "perform_modify called with non-modify op {:?}", fsop);
+				return Err(libc::EIO);
+			}
 		}
 	};
 	if ret < 0 {
