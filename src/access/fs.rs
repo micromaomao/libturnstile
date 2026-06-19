@@ -210,6 +210,13 @@ pub struct FsTarget {
 	/// Whether to avoid following the final symlink component when resolving
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
+
+	/// Whether the target refers directly to an already-open file
+	/// descriptor (i.e. [`dfd`](Self::dfd) is the file itself, as for
+	/// `fchmod`/`fchown`/... or an `*at` call with `AT_EMPTY_PATH`),
+	/// rather than a path to be resolved.  Used by the fd-upgrade path to
+	/// decide whether an operation must be proxied in m1 (§11.2).
+	pub(crate) bare_fd: bool,
 }
 
 fn trim_leading_slashes(path: &CStr) -> &CStr {
@@ -259,6 +266,7 @@ impl FsTarget {
 			dfd,
 			path: path.to_owned(),
 			no_follow: false,
+			bare_fd: false,
 		})
 	}
 
@@ -287,6 +295,7 @@ impl FsTarget {
 					.map_err(|e| AccessRequestError::OpenFd(root_path, e))?,
 				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
+				bare_fd: false,
 			});
 		}
 
@@ -296,10 +305,12 @@ impl FsTarget {
 			));
 		}
 
+		let bare_fd = path.as_bytes().is_empty();
 		Ok(Self {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
+			bare_fd,
 		})
 	}
 
@@ -312,6 +323,7 @@ impl FsTarget {
 			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
+			bare_fd: true,
 		})
 	}
 
@@ -432,6 +444,7 @@ impl FsTarget {
 			dfd: self.open_target_dfd_in_root(root)?,
 			path: self.path.clone(),
 			no_follow: self.no_follow,
+			bare_fd: self.bare_fd,
 		})
 	}
 
@@ -535,6 +548,13 @@ impl FsTarget {
 
 	pub fn dfd(&self) -> &ForeignFd {
 		&self.dfd
+	}
+
+	/// Whether this target refers directly to an already-open file
+	/// descriptor rather than a path to resolve (see
+	/// [`bare_fd`](Self::bare_fd)).
+	pub fn is_bare_fd(&self) -> bool {
+		self.bare_fd
 	}
 
 	pub fn path(&self) -> &CStr {
@@ -653,51 +673,44 @@ pub struct UnixBindOperation {
 	pub target: FsTarget,
 }
 
-/// A metadata- or content-modifying operation issued against an
-/// already-open file descriptor (`fchmod`, `fchown`, `ftruncate`,
-/// `fsetxattr`, `fremovexattr`).  These are mediated so that, after a
-/// grant changes the live mount layout, a descriptor opened against a
-/// now-stale mount can be transparently re-resolved and the operation
-/// re-issued through the current layout (§11.2).
+/// Metadata- or content-modifying operations (`chmod`, `chown`,
+/// `truncate`, `setxattr`, `removexattr` and their `f`/`l`/`*at`
+/// variants).  These are mediated so that, after a grant changes the
+/// live mount layout, a descriptor opened against a now-stale mount can
+/// be transparently re-resolved and the operation re-issued through the
+/// current layout (§11.2).  Path-based variants resolve afresh when the
+/// syscall continues, so only the bare-fd (`f*`) variants need proxying.
 #[derive(Debug)]
-pub struct ModifyFdOperation {
-	/// The file the descriptor refers to (a `from_fd` target).
+pub struct ChmodOperation {
 	pub target: FsTarget,
-	pub kind: ModifyFdKind,
+	pub mode: u32,
 }
 
 #[derive(Debug)]
-pub enum ModifyFdKind {
-	Chmod {
-		mode: u32,
-	},
-	Chown {
-		uid: u32,
-		gid: u32,
-	},
-	Truncate {
-		length: i64,
-	},
-	SetXattr {
-		name: CString,
-		value: Vec<u8>,
-		flags: i32,
-	},
-	RemoveXattr {
-		name: CString,
-	},
+pub struct ChownOperation {
+	pub target: FsTarget,
+	pub uid: u32,
+	pub gid: u32,
 }
 
-impl ModifyFdKind {
-	pub fn as_str(&self) -> &'static str {
-		match self {
-			ModifyFdKind::Chmod { .. } => "fchmod",
-			ModifyFdKind::Chown { .. } => "fchown",
-			ModifyFdKind::Truncate { .. } => "ftruncate",
-			ModifyFdKind::SetXattr { .. } => "fsetxattr",
-			ModifyFdKind::RemoveXattr { .. } => "fremovexattr",
-		}
-	}
+#[derive(Debug)]
+pub struct TruncateOperation {
+	pub target: FsTarget,
+	pub length: i64,
+}
+
+#[derive(Debug)]
+pub struct SetXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+	pub value: Vec<u8>,
+	pub flags: i32,
+}
+
+#[derive(Debug)]
+pub struct RemoveXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
 }
 
 #[derive(Debug)]
@@ -712,7 +725,11 @@ pub enum FsOperation {
 	FsReadlink(FsTarget),
 	FsChdir(FsTarget),
 	FsStat(StatOperation),
-	FsModifyFd(ModifyFdOperation),
+	FsChmod(ChmodOperation),
+	FsChown(ChownOperation),
+	FsTruncate(TruncateOperation),
+	FsSetXattr(SetXattrOperation),
+	FsRemoveXattr(RemoveXattrOperation),
 	UnixConnect(FsTarget),
 	UnixBind(UnixBindOperation),
 	UnixSendto(FsTarget),
@@ -848,8 +865,20 @@ impl std::fmt::Display for FsOperation {
 			Self::FsStat(StatOperation { target, lstat }) => {
 				write!(f, "{} {}", if *lstat { "lstat" } else { "stat" }, target)?;
 			}
-			Self::FsModifyFd(ModifyFdOperation { target, kind }) => {
-				write!(f, "{} {}", kind.as_str(), target)?;
+			Self::FsChmod(ChmodOperation { target, mode }) => {
+				write!(f, "chmod {:o} {}", mode, target)?;
+			}
+			Self::FsChown(ChownOperation { target, uid, gid }) => {
+				write!(f, "chown {}:{} {}", uid, gid, target)?;
+			}
+			Self::FsTruncate(TruncateOperation { target, length }) => {
+				write!(f, "truncate {} {}", length, target)?;
+			}
+			Self::FsSetXattr(SetXattrOperation { target, name, .. }) => {
+				write!(f, "setxattr {} {}", name.to_string_lossy(), target)?;
+			}
+			Self::FsRemoveXattr(RemoveXattrOperation { target, name }) => {
+				write!(f, "removexattr {} {}", name.to_string_lossy(), target)?;
 			}
 			Self::UnixConnect(target) => {
 				write!(f, "connect unix:{}", target)?;
@@ -936,7 +965,11 @@ impl FsOperation {
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
 			}
-			Self::FsModifyFd(ModifyFdOperation { target, .. }) => {
+			Self::FsChmod(ChmodOperation { target, .. })
+			| Self::FsChown(ChownOperation { target, .. })
+			| Self::FsTruncate(TruncateOperation { target, .. })
+			| Self::FsSetXattr(SetXattrOperation { target, .. })
+			| Self::FsRemoveXattr(RemoveXattrOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), write)]
 			}
 			Self::UnixConnect(target) => {

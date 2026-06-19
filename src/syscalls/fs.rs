@@ -6,8 +6,9 @@ use std::sync::OnceLock;
 use crate::{
 	AccessRequestError, TurnstileTracerError,
 	access::fs::{
-		CreateKind, CreateOperation, ExecOperation, FsTarget, LinkOperation, ModifyFdKind,
-		ModifyFdOperation, OpenOperation, RenameOperation, UnlinkOperation,
+		ChmodOperation, ChownOperation, CreateKind, CreateOperation, ExecOperation, FsTarget,
+		LinkOperation, OpenOperation, RemoveXattrOperation, RenameOperation, SetXattrOperation,
+		TruncateOperation, UnlinkOperation,
 	},
 	access::{
 		AccessRequest, Operation,
@@ -226,6 +227,78 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 		|req, target| handle_stat_like(req, target, true),
 		0,
 	),
+	(
+		"chmod",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(1) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"chown",
+		|req, target| {
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"lchown",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"truncate",
+		|req, target| {
+			Ok(fsop(FsTruncate(TruncateOperation {
+				target,
+				length: req.arg(1) as i64,
+			})))
+		},
+		0,
+	),
+	(
+		"setxattr",
+		|req, target| handle_setxattr(req, target, 1, 2, 3, 4),
+		0,
+	),
+	(
+		"lsetxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_setxattr(req, target, 1, 2, 3, 4)
+		},
+		0,
+	),
+	(
+		"removexattr",
+		|req, target| handle_removexattr(req, target, 1),
+		0,
+	),
+	(
+		"lremovexattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_removexattr(req, target, 1)
+		},
+		0,
+	),
 ];
 
 // (name, handler, arg index of the dfd, arg index of the path, arg index of AT_* flags or None if no such flag)
@@ -305,6 +378,46 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	),
 	("execveat", handle_exec_like, 0, 1, Some(4)),
 	("readlinkat", handle_readlink_like, 0, 1, None),
+	(
+		"fchmodat",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(2) as u32,
+			})))
+		},
+		0,
+		1,
+		// The raw `fchmodat` syscall takes no flags argument (only
+		// `dfd`, `path`, `mode`); AT_SYMLINK_NOFOLLOW is emulated by
+		// glibc.  `fchmodat2` below carries the real flags.
+		None,
+	),
+	(
+		"fchmodat2",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(2) as u32,
+			})))
+		},
+		0,
+		1,
+		Some(3),
+	),
+	(
+		"fchownat",
+		|req, target| {
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(2) as u32,
+				gid: req.arg(3) as u32,
+			})))
+		},
+		0,
+		1,
+		Some(4),
+	),
 	(
 		"newfstatat",
 		|req, target| {
@@ -440,6 +553,11 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 ];
 
 // (name, handler, fd)
+//
+// `fchmod`/`fchown`/`ftruncate`/`fsetxattr`/`fremovexattr` operate on an
+// already-open descriptor (argument 0); the remaining arguments carry
+// the payload.  Their targets are bare fds, so the fd-upgrade path
+// proxies them in m1 when the descriptor's mount is stale (§11.2).
 const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 	("fchdir", handle_chdir_like, 0),
 	(
@@ -452,91 +570,92 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 		|req, target| handle_stat_like(req, target, false),
 		0,
 	),
-];
-
-/// Maximum xattr value size we are willing to copy out of the traced
-/// process (matches the kernel's `XATTR_SIZE_MAX`).
-const XATTR_SIZE_MAX: usize = 65536;
-
-fn handle_modify_fd(target: FsTarget, kind: ModifyFdKind) -> Result<Operation, AccessRequestError> {
-	Ok(fsop(FsModifyFd(ModifyFdOperation { target, kind })))
-}
-
-// File-descriptor metadata/content modifying syscalls.  The descriptor
-// is always argument 0; remaining arguments carry the operation
-// payload.  (name, handler, fd arg index)
-const FS_SYSCALLS_FD_MODIFY: &[(&str, SyscallHandler1, u8)] = &[
 	(
 		"fchmod",
 		|req, target| {
-			handle_modify_fd(
+			Ok(fsop(FsChmod(ChmodOperation {
 				target,
-				ModifyFdKind::Chmod {
-					mode: req.arg(1) as u32,
-				},
-			)
+				mode: req.arg(1) as u32,
+			})))
 		},
 		0,
 	),
 	(
 		"fchown",
 		|req, target| {
-			handle_modify_fd(
+			Ok(fsop(FsChown(ChownOperation {
 				target,
-				ModifyFdKind::Chown {
-					uid: req.arg(1) as u32,
-					gid: req.arg(2) as u32,
-				},
-			)
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
 		},
 		0,
 	),
 	(
 		"ftruncate",
 		|req, target| {
-			handle_modify_fd(
+			Ok(fsop(FsTruncate(TruncateOperation {
 				target,
-				ModifyFdKind::Truncate {
-					length: req.arg(1) as i64,
-				},
-			)
+				length: req.arg(1) as i64,
+			})))
 		},
 		0,
 	),
 	(
 		"fsetxattr",
-		|req, target| {
-			let name_ptr = req.arg(1) as *const libc::c_char;
-			let name = req.cstr_from_target_memory(name_ptr)?;
-			let size = req.arg(3) as usize;
-			if size > XATTR_SIZE_MAX {
-				return Err(AccessRequestError::InvalidSyscallData(
-					"fsetxattr value exceeds XATTR_SIZE_MAX",
-				));
-			}
-			let value_ptr = req.arg(2) as *const u8;
-			let value = req.bytes_from_target_memory(value_ptr, size)?;
-			handle_modify_fd(
-				target,
-				ModifyFdKind::SetXattr {
-					name,
-					value,
-					flags: req.arg(4) as i32,
-				},
-			)
-		},
+		|req, target| handle_setxattr(req, target, 1, 2, 3, 4),
 		0,
 	),
 	(
 		"fremovexattr",
-		|req, target| {
-			let name_ptr = req.arg(1) as *const libc::c_char;
-			let name = req.cstr_from_target_memory(name_ptr)?;
-			handle_modify_fd(target, ModifyFdKind::RemoveXattr { name })
-		},
+		|req, target| handle_removexattr(req, target, 1),
 		0,
 	),
 ];
+
+/// Maximum xattr value size we are willing to copy out of the traced
+/// process (matches the kernel's `XATTR_SIZE_MAX`).
+const XATTR_SIZE_MAX: usize = 65536;
+
+/// Parse a `setxattr`-family syscall into a [`SetXattrOperation`].  The
+/// `*_arg` indices select the name/value/size/flags arguments, which
+/// differ only by whether argument 0 is a path or a descriptor.
+fn handle_setxattr(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+	value_arg: usize,
+	size_arg: usize,
+	flags_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	let size = req.arg(size_arg) as usize;
+	if size > XATTR_SIZE_MAX {
+		return Err(AccessRequestError::InvalidSyscallData(
+			"setxattr value exceeds XATTR_SIZE_MAX",
+		));
+	}
+	let value_ptr = req.arg(value_arg) as *const u8;
+	let value = req.bytes_from_target_memory(value_ptr, size)?;
+	Ok(fsop(FsSetXattr(SetXattrOperation {
+		target,
+		name,
+		value,
+		flags: req.arg(flags_arg) as i32,
+	})))
+}
+
+/// Parse a `removexattr`-family syscall into a [`RemoveXattrOperation`].
+fn handle_removexattr(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	Ok(fsop(FsRemoveXattr(RemoveXattrOperation { target, name })))
+}
 
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
@@ -562,11 +681,6 @@ pub(crate) fn add_filter_rules(
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	for &(sys, ..) in fs_syscalls_fd_table() {
-		filter_ctx
-			.add_rule(libseccomp::ScmpAction::Notify, sys)
-			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
-	}
-	for &(sys, ..) in fs_syscalls_fd_modify_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
@@ -606,12 +720,6 @@ lazy_syscall_table_name_to_number!(
 	Option<u8>
 );
 lazy_syscall_table_name_to_number!(FS_SYSCALLS_FD, fs_syscalls_fd_table, SyscallHandler1, u8);
-lazy_syscall_table_name_to_number!(
-	FS_SYSCALLS_FD_MODIFY,
-	fs_syscalls_fd_modify_table,
-	SyscallHandler1,
-	u8
-);
 
 pub(crate) fn handle_notification<'a>(
 	request_ctx: &mut RequestContext<'a>,
@@ -669,14 +777,6 @@ pub(crate) fn handle_notification<'a>(
 	}
 
 	for &(sys, handler, fd_arg_index) in fs_syscalls_fd_table() {
-		if syscall == sys {
-			let target = FsTarget::from_fd(request_ctx, fd_arg_index)?;
-			let op = handler(request_ctx, target)?;
-			return Ok(Some(AccessRequest { operation: op }));
-		}
-	}
-
-	for &(sys, handler, fd_arg_index) in fs_syscalls_fd_modify_table() {
 		if syscall == sys {
 			let target = FsTarget::from_fd(request_ctx, fd_arg_index)?;
 			let op = handler(request_ctx, target)?;

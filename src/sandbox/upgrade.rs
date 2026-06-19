@@ -34,7 +34,10 @@ use crate::{
 	AccessRequestError, RequestContext,
 	access::{
 		AccessRequest, Operation,
-		fs::{ForeignFd, FsOperation, InodeId, ModifyFdKind, ModifyFdOperation},
+		fs::{
+			ChmodOperation, ChownOperation, ForeignFd, FsOperation, FsTarget, InodeId,
+			RemoveXattrOperation, SetXattrOperation, TruncateOperation,
+		},
 	},
 	syscalls::fs as syscalls_fs,
 };
@@ -161,9 +164,12 @@ impl ManagedBindMountSandbox {
 			return self.allow_chdir(fsop, ctx);
 		}
 
-		// File-fd metadata/content ops: proxy in m1 if the fd is stale.
-		if let FsOperation::FsModifyFd(op) = fsop {
-			return self.allow_modify_fd(op, ctx);
+		// File-fd metadata/content ops on a bare fd: proxy in m1 if the
+		// fd is stale.  Path-based variants resolve afresh when the
+		// syscall continues, so they fall through to the dirfd-upgrade /
+		// CONTINUE paths below.
+		if let Some(target) = modify_op_bare_fd_target(fsop) {
+			return self.allow_modify_fd(fsop, target, ctx);
 		}
 
 		// Any other *at with a real dirfd: upgrade it in place if stale.
@@ -370,15 +376,17 @@ impl ManagedBindMountSandbox {
 		ctx.send_continue()
 	}
 
-	/// `fchmod` / `fchown` / `ftruncate` / `fsetxattr` / `fremovexattr`:
-	/// if the file fd is stale, perform the op in m1 against the current
-	/// layout and return the result directly.
+	/// `fchmod` / `fchown` / `ftruncate` / `fsetxattr` / `fremovexattr`
+	/// (and any `*at` modify call with `AT_EMPTY_PATH`): if the file fd
+	/// is stale, perform the op in m1 against the current layout and
+	/// return the result directly.
 	fn allow_modify_fd(
 		&self,
-		op: &ModifyFdOperation,
+		fsop: &FsOperation,
+		target: &FsTarget,
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
-		let app_fd = op.target.dfd();
+		let app_fd = target.dfd();
 		let cur_mnt = match app_fd.mnt_id() {
 			Ok(m) => m,
 			Err(_) => return ctx.send_continue(),
@@ -401,7 +409,7 @@ impl ManagedBindMountSandbox {
 			Some(fd) => fd,
 			None => return ctx.send_error(-libc::EIO),
 		};
-		match perform_modify(&op.kind, m1fd.as_raw_fd()) {
+		match perform_modify(fsop, m1fd.as_raw_fd()) {
 			Ok(()) => ctx.send_value(0),
 			Err(errno) => ctx.send_error(-errno),
 		}
@@ -428,10 +436,29 @@ fn build_path_open_how() -> open_how {
 	how
 }
 
-/// Re-issue a file-fd modifying op against the m1-opened handle `fd`
-/// (an `O_PATH` fd, addressed via its `/proc/self/fd` magic symlink so
-/// the op resolves through m1's mount).  Returns the `errno` on failure.
-fn perform_modify(kind: &ModifyFdKind, fd: libc::c_int) -> Result<(), libc::c_int> {
+/// If `fsop` is one of the metadata/content-modifying operations and its
+/// target refers directly to an already-open descriptor (an `f*` call or
+/// an `*at` call with `AT_EMPTY_PATH`), return that target so the op can
+/// be proxied through m1.  Path-based variants return `None` (they
+/// resolve afresh when the syscall continues).
+fn modify_op_bare_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
+	let target = match fsop {
+		FsOperation::FsChmod(ChmodOperation { target, .. })
+		| FsOperation::FsChown(ChownOperation { target, .. })
+		| FsOperation::FsTruncate(TruncateOperation { target, .. })
+		| FsOperation::FsSetXattr(SetXattrOperation { target, .. })
+		| FsOperation::FsRemoveXattr(RemoveXattrOperation { target, .. }) => target,
+		_ => return None,
+	};
+	target.is_bare_fd().then_some(target)
+}
+
+/// Re-issue a metadata/content-modifying op against the m1-opened handle
+/// `fd` (an `O_PATH` fd, addressed via its `/proc/self/fd` magic symlink
+/// so the op resolves through m1's mount).  Returns the `errno` on
+/// failure.  Only the bare-fd (`f*`) variants are proxied; other
+/// `FsOperation`s are never passed here.
+fn perform_modify(fsop: &FsOperation, fd: libc::c_int) -> Result<(), libc::c_int> {
 	// `fd` is a freshly m1-opened O_PATH handle returned by
 	// `m1_open_checked`, so it is always a valid non-negative descriptor;
 	// its /proc/self/fd magic symlink redirects the path-based ops below
@@ -440,20 +467,30 @@ fn perform_modify(kind: &ModifyFdKind, fd: libc::c_int) -> Result<(), libc::c_in
 	let proc_path = format!("/proc/self/fd/{}\0", fd);
 	let p = proc_path.as_ptr() as *const libc::c_char;
 	let ret = unsafe {
-		match kind {
-			ModifyFdKind::Chmod { mode } => {
+		match fsop {
+			FsOperation::FsChmod(ChmodOperation { mode, .. }) => {
 				libc::fchmodat(libc::AT_FDCWD, p, *mode as libc::mode_t, 0)
 			}
-			ModifyFdKind::Chown { uid, gid } => libc::fchownat(libc::AT_FDCWD, p, *uid, *gid, 0),
-			ModifyFdKind::Truncate { length } => libc::truncate(p, *length as libc::off_t),
-			ModifyFdKind::SetXattr { name, value, flags } => libc::setxattr(
+			FsOperation::FsChown(ChownOperation { uid, gid, .. }) => {
+				libc::fchownat(libc::AT_FDCWD, p, *uid, *gid, 0)
+			}
+			FsOperation::FsTruncate(TruncateOperation { length, .. }) => {
+				libc::truncate(p, *length as libc::off_t)
+			}
+			FsOperation::FsSetXattr(SetXattrOperation {
+				name, value, flags, ..
+			}) => libc::setxattr(
 				p,
 				name.as_ptr(),
 				value.as_ptr() as *const libc::c_void,
 				value.len(),
 				*flags,
 			) as libc::c_int,
-			ModifyFdKind::RemoveXattr { name } => libc::removexattr(p, name.as_ptr()),
+			FsOperation::FsRemoveXattr(RemoveXattrOperation { name, .. }) => {
+				libc::removexattr(p, name.as_ptr())
+			}
+			// `allow_modify_fd` only calls this for the variants above.
+			_ => return Err(libc::EIO),
 		}
 	};
 	if ret < 0 {

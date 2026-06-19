@@ -349,7 +349,8 @@ fds or proxy a syscall so the app's view matches the live mount layout.
 | `openat` / `openat2` | Re-resolve abspath, open fresh in m1 with the requested flags, identity-check, return the new fd via `ADDFD`. |
 | `chdir` / `fchdir` | Ensure a bind mount exists on the target (§11.5), then CONTINUE. |
 | Any other `*at` with a real `dirfd` (≠ `AT_FDCWD`) | `statx(dirfd).mnt_id` vs the expected mnt_id for the dirfd's path; if stale, m1-open the dirfd's path, identity-check, replace at the same fd number via `ADDFD_SETFD`, CONTINUE. |
-| `fchmod`, `fchown`, `fsetxattr`, `fremovexattr`, `ftruncate` (file fd) | `statx(fd).mnt_id`; if stale, m1-open the path, identity-check, perform the op there, return the result via `notif_resp` (no CONTINUE).  Don't touch the app's fd. |
+| `fchmod`, `fchown`, `fsetxattr`, `fremovexattr`, `ftruncate` (file fd; also `*at` modify calls with `AT_EMPTY_PATH`) | `statx(fd).mnt_id`; if stale, m1-open the path, identity-check, perform the op there, return the result via `notif_resp` (no CONTINUE).  Don't touch the app's fd. |
+| Path-based `chmod`/`chown`/`truncate`/`setxattr`/`removexattr` (and `l*`/`*at` variants) | Resolved afresh by the kernel when the syscall CONTINUEs against the live layout, so they are mediated as ordinary write ops and need no proxy. |
 | Anything else | CONTINUE. |
 
 `openat` needs to always returns a fresh fd via `ADDFD` so the result is
