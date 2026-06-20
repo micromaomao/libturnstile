@@ -230,15 +230,9 @@ pub struct FsTarget {
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
 
-	/// When set, the target refers directly to an already-open file
-	/// descriptor (i.e. [`dfd`](Self::dfd) is the file itself, as for
-	/// `fchmod`/`fchown`/... or an `*at` call with `AT_EMPTY_PATH`),
-	/// rather than a path to be resolved; the value is the raw fd
-	/// *number* in the traced process that the operation targets
-	/// (argument 0 of an `f*` call, or the `dirfd` of an `AT_EMPTY_PATH`
-	/// `*at`).  The fd-upgrade path uses it both to identify a held-fd
-	/// target (whose upgradability decides whether to swap the fd or
-	/// proxy the operation) and to swap the descriptor in place.
+	/// When set, the target refers directly to an already-open file descriptor
+	/// (either via AT_EMPTY_PATH or some f* syscalls), rather than a dfd +
+	/// path.  The value is the raw fd number in the traced process.
 	pub(crate) held_fd_num: Option<libc::c_int>,
 }
 
