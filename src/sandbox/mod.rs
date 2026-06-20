@@ -364,17 +364,9 @@ impl BindMountSandbox {
 					//    outer user namespace) can still create parking
 					//    directories inside it.
 					let scratch = MountObj::new_tmpfs_mode(Some(c"0777"))?;
-					// 2. move_mount it onto "/" so it is attached inside
-					//    m1's mount namespace (check_mnt passes), which
-					//    qualifies it as a move_mount target parent for
-					//    parking.  Note this overmounts m1's root but does
-					//    not change this process's fs->root, so "/" still
-					//    resolves to the original root; we therefore keep
-					//    the fsmount handle itself as the scratch dirfd
-					//    rather than re-opening "/".
+					// 2. move_mount it onto "/" of m1.
 					scratch.mount(libc::AT_FDCWD, c"/", false)?;
-					// 3. Keep the fsmount fd (an O_PATH-style handle to the
-					//    scratch root) as the scratch dirfd.
+					// 3. Return the fd of the scratch tmpfs.
 					Ok(scratch.into_raw_fd())
 				},
 				BindMountSandboxError::SetupScratchFailed,
@@ -634,6 +626,7 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
+				// setns changes the process's root, so this chdir "/" is correct.
 				let res = libc::chdir(c"/".as_ptr());
 				if res != 0 {
 					return perror!("chdir");
