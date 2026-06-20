@@ -71,8 +71,7 @@ pub(crate) use lazy_syscall_table_name_to_number;
 const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = 0x40182103;
 
 /// `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper since libseccomp does not expose
-/// this.  Builds the `seccomp_notif_addfd` request from the given fields and
-/// returns the new fd number installed in the target on success.
+/// this.  Returns the new fd number installed in the target on success.
 fn notif_addfd(
 	notify_fd: ScmpFd,
 	id: u64,
