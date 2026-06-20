@@ -722,6 +722,45 @@ pub struct UnixBindOperation {
 }
 
 #[derive(Debug)]
+pub struct ChmodOperation {
+	pub target: FsTarget,
+	pub mode: u32,
+}
+
+#[derive(Debug)]
+pub struct ChownOperation {
+	pub target: FsTarget,
+	pub uid: u32,
+	pub gid: u32,
+}
+
+#[derive(Debug)]
+pub struct TruncateOperation {
+	pub target: FsTarget,
+	pub length: i64,
+}
+
+#[derive(Debug)]
+pub struct GetXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+}
+
+#[derive(Debug)]
+pub struct SetXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+	pub value: Vec<u8>,
+	pub flags: i32,
+}
+
+#[derive(Debug)]
+pub struct RemoveXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+}
+
+#[derive(Debug)]
 pub enum FsOperation {
 	FsOpen(OpenOperation),
 	FsAccess(AccessOperation),
@@ -733,6 +772,12 @@ pub enum FsOperation {
 	FsReadlink(FsTarget),
 	FsChdir(FsTarget),
 	FsStat(StatOperation),
+	FsChmod(ChmodOperation),
+	FsChown(ChownOperation),
+	FsTruncate(TruncateOperation),
+	FsGetXattr(GetXattrOperation),
+	FsSetXattr(SetXattrOperation),
+	FsRemoveXattr(RemoveXattrOperation),
 	UnixConnect(FsTarget),
 	UnixBind(UnixBindOperation),
 	UnixSendto(FsTarget),
@@ -868,6 +913,24 @@ impl std::fmt::Display for FsOperation {
 			Self::FsStat(StatOperation { target, lstat }) => {
 				write!(f, "{} {}", if *lstat { "lstat" } else { "stat" }, target)?;
 			}
+			Self::FsChmod(ChmodOperation { target, mode }) => {
+				write!(f, "chmod {:o} {}", mode, target)?;
+			}
+			Self::FsChown(ChownOperation { target, uid, gid }) => {
+				write!(f, "chown {}:{} {}", uid, gid, target)?;
+			}
+			Self::FsTruncate(TruncateOperation { target, length }) => {
+				write!(f, "truncate {} {}", length, target)?;
+			}
+			Self::FsGetXattr(GetXattrOperation { target, name }) => {
+				write!(f, "getxattr {} {}", name.to_string_lossy(), target)?;
+			}
+			Self::FsSetXattr(SetXattrOperation { target, name, .. }) => {
+				write!(f, "setxattr {} {}", name.to_string_lossy(), target)?;
+			}
+			Self::FsRemoveXattr(RemoveXattrOperation { target, name }) => {
+				write!(f, "removexattr {} {}", name.to_string_lossy(), target)?;
+			}
 			Self::UnixConnect(target) => {
 				write!(f, "connect unix:{}", target)?;
 			}
@@ -952,6 +1015,16 @@ impl FsOperation {
 			}
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
+			}
+			Self::FsGetXattr(GetXattrOperation { target, .. }) => {
+				smallvec![make_rwx!(target.clone(), read)]
+			}
+			Self::FsChmod(ChmodOperation { target, .. })
+			| Self::FsChown(ChownOperation { target, .. })
+			| Self::FsTruncate(TruncateOperation { target, .. })
+			| Self::FsSetXattr(SetXattrOperation { target, .. })
+			| Self::FsRemoveXattr(RemoveXattrOperation { target, .. }) => {
+				smallvec![make_rwx!(target.clone(), write)]
 			}
 			Self::UnixConnect(target) => {
 				smallvec![make_rwx!(target.clone(), read, write)]
