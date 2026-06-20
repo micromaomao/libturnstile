@@ -16,10 +16,11 @@ impl MountObj {
 		Self::new_tmpfs_mode(None)
 	}
 
-	/// Create a new tmpfs mount object. When `mode` is provided (e.g. `c"0777"`),
-	/// the tmpfs root inode is created with that permission mode. This is used for
-	/// the hidden scratch tmpfs, whose root is owned by an unmapped uid and would
-	/// otherwise be unwritable by the supervisor's credentials.
+	/// Create a new tmpfs mount object. When `mode` is provided (e.g.
+	/// `c"0777"`), the tmpfs root inode is created with that permission
+	/// mode. This is used for the hidden scratch tmpfs, whose root is
+	/// owned by an unmapped uid and would otherwise be unwritable by the
+	/// supervisor's credentials.
 	pub fn new_tmpfs_mode(mode: Option<&std::ffi::CStr>) -> io::Result<Self> {
 		unsafe {
 			// libc::FSOPEN_CLOEXEC does not exist yet

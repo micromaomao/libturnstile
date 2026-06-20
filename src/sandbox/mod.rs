@@ -147,20 +147,20 @@ impl std::fmt::Display for MountAttributes {
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	namespaces: ManagedNamespaces,
-	/// A fd to the root tmpfs opened inside m0 (the outer mount namespace).
+	/// A fd to the placeholder tmpfs opened inside m0 (the outer mount
+	/// namespace).
 	root_tmpfs: MountObj,
 	/// O_PATH fd to the actual, outside-sandbox "/" opened inside m0.  Used as
 	/// the dirfd when resolving caller-provided host paths so that the
 	/// resulting fd is associated with m0's mount namespace and is therefore
 	/// acceptable to `open_tree()` once the helper process enters m0.
 	host_root_fd: ForeignFd,
-	/// O_PATH fd to the scratch tmpfs root inside m1.  The scratch is
-	/// a brand-new tmpfs (distinct from `root_tmpfs`) that is made m1's
-	/// root and then shadowed beneath the `root_tmpfs` bind mount, so
-	/// the sandboxed app never sees it.  It serves as a hidden,
-	/// m1-owned parent into which mounts can be temporarily parked
-	/// during reconcile (see `park_to_scratch`).  Resolving this fd from
-	/// the supervisor side reaches the scratch directly.
+	/// O_PATH fd to the scratch tmpfs root inside m1.  The scratch is a
+	/// separate tmpfs (distinct from `root_tmpfs`) that is first mounted
+	/// into m1, and then by mounting root_tmpfs on top, it eventually is
+	/// shadowed, so the sandboxed app never sees it.  It is used by
+	/// [`Self::park_to_scratch`] to temporarily park a mount, in order to
+	/// unmount a parent, before moving it back.
 	m1_scratch_fd: ForeignFd,
 }
 
@@ -348,12 +348,11 @@ impl BindMountSandbox {
 			ForeignFd { local_fd: raw_fd }
 		};
 		// Create the scratch tmpfs inside m1 and make it m1's root, then
-		// capture an O_PATH handle to it.  This happens *before* the
+		// capture an O_PATH handle to it.  This happens before the
 		// root_tmpfs bind below, so the scratch ends up shadowed beneath
-		// the placeholder root and is invisible to the app.  We enter
-		// l0_user (for privilege over the nested user/mount namespaces)
-		// and l1_mnt (m1).
+		// the placeholder tmpfs and is invisible to the app.
 		let m1_scratch_fd = unsafe {
+			// Enter the first users and then m1
 			let nsenter_fn = namespaces.nsenter_fn(true, false, true, false);
 			let raw_fd = send_fd_from_ns(
 				nsenter_fn,
