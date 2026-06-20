@@ -522,10 +522,9 @@ impl ManagedBindMountSandbox {
 		// place.  Without a real fd number (e.g. `AT_FDCWD`, whose cwd is
 		// kept current by the chdir path) there is nothing to address, so
 		// CONTINUE.
-		let raw = target.original_fd_num();
-		if raw < 0 {
+		let Some(target_fd) = target.original_fd_num() else {
 			return ctx.send_continue();
-		}
+		};
 
 		let cur_mnt = match app_fd.mnt_id() {
 			Ok(m) => m,
@@ -545,7 +544,7 @@ impl ManagedBindMountSandbox {
 		};
 		let expected = app_fd.inode_id().ok();
 
-		let kind = fd_upgrade_kind(ctx.pid(), raw, app_fd);
+		let kind = fd_upgrade_kind(ctx.pid(), target_fd, app_fd);
 		if kind.is_upgradable() {
 			// Swap a fresh fd in at the same number and CONTINUE.  Open
 			// it `O_PATH` for an `O_PATH` fd (preserving its native
@@ -565,9 +564,9 @@ impl ManagedBindMountSandbox {
 			};
 			warn!(
 				"upgrading stale held fd {} ({:?}): mnt_id {} no longer current",
-				raw, sandbox_path, cur_mnt
+				target_fd, sandbox_path, cur_mnt
 			);
-			if let Err(e) = ctx.replace_fd(m1fd.as_raw_fd(), raw, false) {
+			if let Err(e) = ctx.replace_fd(m1fd.as_raw_fd(), target_fd, false) {
 				if ctx.still_valid()? {
 					return Err(e);
 				}

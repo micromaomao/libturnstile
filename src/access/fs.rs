@@ -230,8 +230,11 @@ pub struct FsTarget {
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
 
-	/// The original fd number from the syscall.
-	pub(crate) original_fd_num: libc::c_int,
+	/// If available, the original fd number from the syscall.
+	pub(crate) original_fd_num: Option<libc::c_int>,
+
+	/// Whether the original syscall was made with AT_FDCWD.
+	pub(crate) at_fdcwd: bool,
 }
 
 fn trim_leading_slashes(path: &CStr) -> &CStr {
@@ -281,7 +284,8 @@ impl FsTarget {
 			dfd,
 			path: path.to_owned(),
 			no_follow: false,
-			original_fd_num: libc::AT_FDCWD,
+			original_fd_num: None,
+			at_fdcwd: !absolute,
 		})
 	}
 
@@ -310,7 +314,8 @@ impl FsTarget {
 					.map_err(|e| AccessRequestError::OpenFd(root_path, e))?,
 				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
-				original_fd_num: req.arg(dfd_arg_index as usize) as libc::c_int,
+				original_fd_num: None,
+				at_fdcwd: false,
 			});
 		}
 
@@ -320,11 +325,14 @@ impl FsTarget {
 			));
 		}
 
+		let dfd_arg = req.arg(dfd_arg_index as usize) as libc::c_int;
+		let at_fdcwd = dfd_arg == libc::AT_FDCWD;
 		Ok(Self {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
-			original_fd_num: req.arg(dfd_arg_index as usize) as libc::c_int,
+			original_fd_num: if at_fdcwd { None } else { Some(dfd_arg) },
+			at_fdcwd,
 		})
 	}
 
@@ -338,7 +346,8 @@ impl FsTarget {
 			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
-			original_fd_num,
+			original_fd_num: Some(original_fd_num),
+			at_fdcwd: false,
 		})
 	}
 
@@ -460,6 +469,7 @@ impl FsTarget {
 			path: self.path.clone(),
 			no_follow: self.no_follow,
 			original_fd_num: self.original_fd_num,
+			at_fdcwd: self.at_fdcwd,
 		})
 	}
 
@@ -573,11 +583,16 @@ impl FsTarget {
 	}
 
 	/// The raw fd number in the traced process this target's base was derived
-	/// from (see [`original_fd_num`](Self::original_fd_num)): the `dirfd` of an
-	/// `*at` syscall, the fd of an `f*` syscall, or `AT_FDCWD` for a plain
-	/// path-based syscall.
-	pub fn original_fd_num(&self) -> libc::c_int {
+	/// from, if any: the `dirfd` of an `*at` syscall or the fd of an `f*`
+	/// syscall.  `None` for `AT_FDCWD` and for absolute paths, where no fd
+	/// upgrade is needed.
+	pub fn original_fd_num(&self) -> Option<libc::c_int> {
 		self.original_fd_num
+	}
+
+	/// Whether the original syscall resolved against the cwd (`AT_FDCWD`).
+	pub fn at_fdcwd(&self) -> bool {
+		self.at_fdcwd
 	}
 
 	pub fn path(&self) -> &CStr {
