@@ -71,13 +71,28 @@ pub(crate) use lazy_syscall_table_name_to_number;
 const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = 0x40182103;
 
 /// `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper since libseccomp does not expose
-/// this.  Returns the new fd number installed in the target on success.
-fn notif_addfd(notify_fd: ScmpFd, addfd: &libc::seccomp_notif_addfd) -> io::Result<libc::c_int> {
+/// this.  Builds the `seccomp_notif_addfd` request from the given fields and
+/// returns the new fd number installed in the target on success.
+fn notif_addfd(
+	notify_fd: ScmpFd,
+	id: u64,
+	flags: u32,
+	srcfd: RawFd,
+	newfd: RawFd,
+	newfd_flags: u32,
+) -> io::Result<libc::c_int> {
+	let addfd = libc::seccomp_notif_addfd {
+		id,
+		flags,
+		srcfd: srcfd as u32,
+		newfd: newfd as u32,
+		newfd_flags,
+	};
 	let ret = unsafe {
 		libc::ioctl(
 			notify_fd,
 			SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
-			addfd as *const libc::seccomp_notif_addfd,
+			&addfd as *const libc::seccomp_notif_addfd,
 		)
 	};
 	if ret < 0 {
@@ -189,14 +204,15 @@ impl<'a> RequestContext<'a> {
 			warn!("install_fd_and_respond called on a no longer valid notification");
 			return Err(AccessRequestError::NotificationAlreadyAnswered);
 		}
-		let addfd = libc::seccomp_notif_addfd {
-			id: self.sreq.id,
-			flags: libc::SECCOMP_ADDFD_FLAG_SEND as u32,
-			srcfd: srcfd as u32,
-			newfd: 0,
-			newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
-		};
-		let newfd = notif_addfd(self.notify_fd, &addfd).map_err(AccessRequestError::AddFd)?;
+		let newfd = notif_addfd(
+			self.notify_fd,
+			self.sreq.id,
+			libc::SECCOMP_ADDFD_FLAG_SEND as u32,
+			srcfd,
+			0,
+			if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+		)
+		.map_err(AccessRequestError::AddFd)?;
 		// SECCOMP_ADDFD_FLAG_SEND completes the notification for us.
 		self.valid = false;
 		Ok(newfd as i64)
@@ -218,14 +234,15 @@ impl<'a> RequestContext<'a> {
 			warn!("replace_fd called on a no longer valid notification");
 			return Err(AccessRequestError::NotificationAlreadyAnswered);
 		}
-		let addfd = libc::seccomp_notif_addfd {
-			id: self.sreq.id,
-			flags: libc::SECCOMP_ADDFD_FLAG_SETFD as u32,
-			srcfd: srcfd as u32,
-			newfd: newfd as u32,
-			newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
-		};
-		notif_addfd(self.notify_fd, &addfd).map_err(AccessRequestError::AddFd)?;
+		notif_addfd(
+			self.notify_fd,
+			self.sreq.id,
+			libc::SECCOMP_ADDFD_FLAG_SETFD as u32,
+			srcfd,
+			newfd,
+			if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+		)
+		.map_err(AccessRequestError::AddFd)?;
 		Ok(())
 	}
 

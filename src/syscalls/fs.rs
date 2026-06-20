@@ -553,12 +553,9 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 //
 // `fchmod`/`fchown`/`ftruncate`/`fsetxattr`/`fremovexattr` only take an
 // already-open descriptor (argument 0); the remaining arguments carry
-// the payload.  When such a call lands on a stale fd — one still pinned
-// to an old, read-only mount after the file has since been made
-// read-write to the sandbox — the descriptor cannot be re-pointed via
-// `ADDFD` without losing the app's read/write position and open state,
-// so `ManagedBindMountSandbox` proxies the operation against the live
-// layout instead.
+// the payload.  When such a call lands on a stale fd, `ManagedBindMountSandbox`
+// upgrades or proxies it so it operates against the live layout (see the
+// held-fd dispatch in `sandbox::upgrade`).
 const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 	("fchdir", handle_chdir_like, 0),
 	(

@@ -350,9 +350,9 @@ impl BindMountSandbox {
 		// Create the scratch tmpfs inside m1 and make it m1's root, then
 		// capture an O_PATH handle to it.  This happens *before* the
 		// root_tmpfs bind below, so the scratch ends up shadowed beneath
-		// the placeholder root and is invisible to the app (see §1 of
-		// design.fd-upgrade.md).  We enter l0_user (for privilege over
-		// the nested user/mount namespaces) and l1_mnt (m1).
+		// the placeholder root and is invisible to the app.  We enter
+		// l0_user (for privilege over the nested user/mount namespaces)
+		// and l1_mnt (m1).
 		let m1_scratch_fd = unsafe {
 			let nsenter_fn = namespaces.nsenter_fn(true, false, true, false);
 			let raw_fd = send_fd_from_ns(
