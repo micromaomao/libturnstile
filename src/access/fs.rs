@@ -125,12 +125,12 @@ impl ForeignFd {
 			)
 		};
 		if ret < 0 {
+			let err = io::Error::last_os_error();
 			error!(
 				"statx(AT_EMPTY_PATH) failed on fd {}: {}",
-				self.local_fd,
-				io::Error::last_os_error()
+				self.local_fd, err
 			);
-			return Err(io::Error::last_os_error());
+			return Err(err);
 		}
 		if stx.stx_mask & libc::STATX_MNT_ID == 0 {
 			let try_realpath = self
