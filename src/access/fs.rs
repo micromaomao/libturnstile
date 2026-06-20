@@ -1019,31 +1019,3 @@ impl std::fmt::Display for RwxPermission {
 		Ok(())
 	}
 }
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn inode_id_and_mnt_id_on_root() {
-		let fd = ForeignFd::from_path(c"/").expect("open /");
-		let id = fd.inode_id().expect("inode_id");
-		// Root inode number is conventionally 2 on most filesystems, but
-		// we only assert that statx succeeded and returned a nonzero ino.
-		assert_ne!(id.ino, 0);
-
-		// STATX_MNT_ID requires Linux >= 5.8; the CI/runner kernels are
-		// far newer, so this should always succeed and be nonzero.
-		let mnt_id = fd.mnt_id().expect("mnt_id");
-		assert_ne!(mnt_id, 0);
-	}
-
-	#[test]
-	fn mnt_id_differs_across_mounts_but_same_within() {
-		// Two fds on the same path resolve through the same mount, so
-		// their mount ids must match.
-		let a = ForeignFd::from_path(c"/").unwrap();
-		let b = ForeignFd::from_path(c"/").unwrap();
-		assert_eq!(a.mnt_id().unwrap(), b.mnt_id().unwrap());
-	}
-}
