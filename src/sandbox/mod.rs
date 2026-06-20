@@ -29,7 +29,7 @@ const ENABLE_LOG_IN_FORK: bool = cfg!(debug_assertions);
 /// into the hidden scratch tmpfs (see [`BindMountSandbox::park_to_scratch`]).
 /// The name need only be unique among concurrently-parked mounts within
 /// this process; a monotonic counter combined with the pid suffices.
-fn next_scratch_uuid() -> CString {
+fn next_scratch_name() -> CString {
 	use std::sync::atomic::{AtomicU64, Ordering};
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1213,15 +1213,15 @@ impl BindMountSandbox {
 	}
 
 	/// Move the mount currently at `ns_path` into the hidden scratch
-	/// tmpfs at `scratch/<uuid>`, preserving its `struct mount` identity.
+	/// tmpfs at `scratch/<name>`, preserving its `struct mount` identity.
 	/// Used to temporarily "park" a child (or a soon-to-be-rebuilt
 	/// parent's descendants) out of the way during reconcile so a
 	/// non-`MNT_DETACH` umount of its old location can proceed.  The
-	/// `uuid` must be a single path component (no slashes).
+	/// `name` must be a single path component (no slashes).
 	pub fn park_to_scratch(
 		&self,
 		ns_path: &CStr,
-		uuid: &CStr,
+		name: &CStr,
 	) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(ns_path)?;
 		let scratch_fd = self.m1_scratch_fd.as_raw_fd();
@@ -1235,11 +1235,11 @@ impl BindMountSandbox {
 				if libc::chdir(c"/".as_ptr()) != 0 {
 					return perror!("chdir");
 				}
-				// Create scratch/<uuid> to receive the parked mount.
-				if libc::mkdirat(scratch_fd, uuid.as_ptr(), 0o700) != 0 {
+				// Create scratch/<name> to receive the parked mount.
+				if libc::mkdirat(scratch_fd, name.as_ptr(), 0o700) != 0 {
 					let err = libc::__errno_location().read();
 					if err != libc::EEXIST {
-						return perror!("mkdirat(scratch/uuid)");
+						return perror!("mkdirat(scratch/name)");
 					}
 				}
 				let mut openhow: libc::open_how = mem::zeroed();
@@ -1260,7 +1260,7 @@ impl BindMountSandbox {
 					src_fd,
 					c"".as_ptr(),
 					scratch_fd,
-					uuid.as_ptr(),
+					name.as_ptr(),
 					libc::MOVE_MOUNT_F_EMPTY_PATH,
 				);
 				libc::close(src_fd);
@@ -1277,13 +1277,13 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// Move a previously parked mount at `scratch/<uuid>` back to
+	/// Move a previously parked mount at `scratch/<name>` back to
 	/// `dest` (an absolute m1 path whose mountpoint dentry must exist),
-	/// then remove the now-empty `scratch/<uuid>` directory.  The inverse
+	/// then remove the now-empty `scratch/<name>` directory.  The inverse
 	/// of [`Self::park_to_scratch`].
 	pub fn restore_from_scratch(
 		&self,
-		uuid: &CStr,
+		name: &CStr,
 		dest: &CStr,
 	) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(dest)?;
@@ -1304,12 +1304,12 @@ impl BindMountSandbox {
 				let src_fd = libc::syscall(
 					libc::SYS_openat2,
 					scratch_fd,
-					uuid.as_ptr(),
+					name.as_ptr(),
 					&openhow as *const _,
 					std::mem::size_of::<libc::open_how>(),
 				) as libc::c_int;
 				if src_fd < 0 {
-					return perror!("openat2(scratch/uuid)");
+					return perror!("openat2(scratch/name)");
 				}
 				let mut dest_openhow: libc::open_how = mem::zeroed();
 				dest_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
@@ -1339,7 +1339,7 @@ impl BindMountSandbox {
 					return perror!("move_mount(restore)");
 				}
 				// Best-effort cleanup of the now-empty scratch dir.
-				libc::unlinkat(scratch_fd, uuid.as_ptr(), libc::AT_REMOVEDIR);
+				libc::unlinkat(scratch_fd, name.as_ptr(), libc::AT_REMOVEDIR);
 				0
 			})
 		}
@@ -1375,16 +1375,16 @@ impl BindMountSandbox {
 		// parent; each gets a unique scratch directory.
 		let mut parked: Vec<(CString, &CStr)> = Vec::with_capacity(child_ns_paths.len());
 		for child in child_ns_paths {
-			let uuid = next_scratch_uuid();
-			if let Err(e) = self.park_to_scratch(child, &uuid) {
+			let name = next_scratch_name();
+			if let Err(e) = self.park_to_scratch(child, &name) {
 				// Best-effort: restore anything already parked before
 				// propagating the failure.
-				for (uuid, dest) in &parked {
-					let _ = self.restore_from_scratch(uuid, dest);
+				for (name, dest) in &parked {
+					let _ = self.restore_from_scratch(name, dest);
 				}
 				return Err(e);
 			}
-			parked.push((uuid, child.as_c_str()));
+			parked.push((name, child.as_c_str()));
 		}
 		// Attempt a non-detach unmount.  With every child parked, only the
 		// app's own references on `ns_path` can still pin it.
@@ -1392,8 +1392,8 @@ impl BindMountSandbox {
 			Ok(()) => true,
 			Err(BindMountSandboxError::UnmountFailed(e)) if e == libc::EBUSY => false,
 			Err(e) => {
-				for (uuid, dest) in &parked {
-					let _ = self.restore_from_scratch(uuid, dest);
+				for (name, dest) in &parked {
+					let _ = self.restore_from_scratch(name, dest);
 				}
 				return Err(e);
 			}
@@ -1401,8 +1401,8 @@ impl BindMountSandbox {
 		// Restore each parked child onto its original path: on the
 		// revealed placeholder layer when unmounted, or under the kept
 		// mount on EBUSY.
-		for (uuid, dest) in &parked {
-			self.restore_from_scratch(uuid, dest)?;
+		for (name, dest) in &parked {
+			self.restore_from_scratch(name, dest)?;
 		}
 		Ok(unmounted)
 	}

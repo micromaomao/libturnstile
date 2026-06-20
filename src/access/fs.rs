@@ -230,18 +230,15 @@ pub struct FsTarget {
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
 
-	/// Whether the target refers directly to an already-open file
+	/// When set, the target refers directly to an already-open file
 	/// descriptor (i.e. [`dfd`](Self::dfd) is the file itself, as for
 	/// `fchmod`/`fchown`/... or an `*at` call with `AT_EMPTY_PATH`),
-	/// rather than a path to be resolved.  Used by the fd-upgrade path to
-	/// identify a held-fd target whose upgradability decides whether to
-	/// swap the fd or proxy the operation.
-	pub(crate) bare_fd: bool,
-
-	/// When [`bare_fd`](Self::bare_fd) is set, the raw fd *number* in the
-	/// traced process that the operation targets (argument 0 of an `f*`
-	/// call, or the `dirfd` of an `AT_EMPTY_PATH` `*at`).  The fd-upgrade
-	/// path needs it to swap the descriptor in place.
+	/// rather than a path to be resolved; the value is the raw fd
+	/// *number* in the traced process that the operation targets
+	/// (argument 0 of an `f*` call, or the `dirfd` of an `AT_EMPTY_PATH`
+	/// `*at`).  The fd-upgrade path uses it both to identify a held-fd
+	/// target (whose upgradability decides whether to swap the fd or
+	/// proxy the operation) and to swap the descriptor in place.
 	pub(crate) held_fd_num: Option<libc::c_int>,
 }
 
@@ -292,7 +289,6 @@ impl FsTarget {
 			dfd,
 			path: path.to_owned(),
 			no_follow: false,
-			bare_fd: false,
 			held_fd_num: None,
 		})
 	}
@@ -322,7 +318,6 @@ impl FsTarget {
 					.map_err(|e| AccessRequestError::OpenFd(root_path, e))?,
 				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
-				bare_fd: false,
 				held_fd_num: None,
 			});
 		}
@@ -337,10 +332,9 @@ impl FsTarget {
 		// above) means the operation targets `dfd` directly, so the dfd
 		// is the file itself.  This must be captured at construction:
 		// `from_path` produces empty-path targets whose `dfd` is the
-		// process root/cwd (not the file), so the bare-fd property cannot
+		// process root/cwd (not the file), so the held-fd property cannot
 		// be recomputed from `path` alone later.
-		let bare_fd = path.as_bytes().is_empty();
-		let held_fd_num = if bare_fd {
+		let held_fd_num = if path.as_bytes().is_empty() {
 			Some(req.arg(dfd_arg_index as usize) as libc::c_int)
 		} else {
 			None
@@ -349,7 +343,6 @@ impl FsTarget {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
-			bare_fd,
 			held_fd_num,
 		})
 	}
@@ -364,7 +357,6 @@ impl FsTarget {
 			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
-			bare_fd: true,
 			held_fd_num,
 		})
 	}
@@ -486,7 +478,6 @@ impl FsTarget {
 			dfd: self.open_target_dfd_in_root(root)?,
 			path: self.path.clone(),
 			no_follow: self.no_follow,
-			bare_fd: self.bare_fd,
 			held_fd_num: self.held_fd_num,
 		})
 	}
@@ -594,14 +585,14 @@ impl FsTarget {
 	}
 
 	/// Whether this target refers directly to an already-open file
-	/// descriptor rather than a path to resolve (see
-	/// [`bare_fd`](Self::bare_fd)).
+	/// descriptor rather than a path to resolve (i.e. it carries a
+	/// [`held_fd_num`](Self::held_fd_num)).
 	pub fn is_bare_fd(&self) -> bool {
-		self.bare_fd
+		self.held_fd_num.is_some()
 	}
 
-	/// For a [`bare_fd`](Self::bare_fd) target, the raw fd number in the
-	/// traced process the operation targets (see
+	/// For a [`bare_fd`](Self::is_bare_fd) target, the raw fd number in
+	/// the traced process the operation targets (see
 	/// [`held_fd_num`](Self::held_fd_num)).
 	pub fn held_fd_num(&self) -> Option<libc::c_int> {
 		self.held_fd_num
