@@ -401,7 +401,7 @@ impl FsTarget {
 		// once.  This works across bind mounts as st_dev identifies a
 		// filesystem, not a mount.
 		//
-		// Since we current hold a fd to the target, the inode number
+		// Since we currently hold a fd to the target, the inode number
 		// can't be reused, so this comparison is sound.
 
 		// This can't change across retries, since a fd points to a
