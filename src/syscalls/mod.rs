@@ -65,8 +65,13 @@ macro_rules! lazy_syscall_table_name_to_number {
 }
 pub(crate) use lazy_syscall_table_name_to_number;
 
-/// Raw `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper.  Returns the new fd
-/// number installed in the target on success.
+// _IOW('!', 3, struct seccomp_notif_addfd)
+// This value dos not depend on the architecture, and is stable because it is
+// part of the uAPI.
+const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = 0x40182103;
+
+/// `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper since libseccomp does not expose
+/// this.  Returns the new fd number installed in the target on success.
 fn notif_addfd(notify_fd: ScmpFd, addfd: &libc::seccomp_notif_addfd) -> io::Result<libc::c_int> {
 	let ret = unsafe {
 		libc::ioctl(
