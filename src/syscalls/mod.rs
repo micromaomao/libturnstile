@@ -44,7 +44,7 @@ pub(crate) use syscall_transform_tuple;
 /// are dropped.
 macro_rules! lazy_syscall_table_name_to_number {
 	($table:expr, $fn_name:ident, $($t:ty),*) => {
-		pub(crate) fn $fn_name() -> &'static Vec<(libseccomp::ScmpSyscall, $($t),*)> {
+		fn $fn_name() -> &'static Vec<(libseccomp::ScmpSyscall, $($t),*)> {
 			static ONCE: std::sync::OnceLock<Vec<(libseccomp::ScmpSyscall, $($t),*)>> =
 				std::sync::OnceLock::new();
 			ONCE.get_or_init(|| {

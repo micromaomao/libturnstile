@@ -230,10 +230,11 @@ pub struct FsTarget {
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
 
-	/// When set, the target refers directly to an already-open file descriptor
-	/// (either via AT_EMPTY_PATH or some f* syscalls), rather than a dfd +
-	/// path.  The value is the raw fd number in the traced process.
-	pub(crate) held_fd_num: Option<libc::c_int>,
+	/// The raw fd number in the traced process that this target's base was
+	/// derived from: the `dirfd` of an `*at` syscall, the fd of an `f*`
+	/// syscall, or `AT_FDCWD` for a plain path-based syscall that carries no
+	/// fd argument.
+	pub(crate) original_fd_num: libc::c_int,
 }
 
 fn trim_leading_slashes(path: &CStr) -> &CStr {
@@ -283,7 +284,7 @@ impl FsTarget {
 			dfd,
 			path: path.to_owned(),
 			no_follow: false,
-			held_fd_num: None,
+			original_fd_num: libc::AT_FDCWD,
 		})
 	}
 
@@ -312,7 +313,7 @@ impl FsTarget {
 					.map_err(|e| AccessRequestError::OpenFd(root_path, e))?,
 				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
-				held_fd_num: None,
+				original_fd_num: req.arg(dfd_arg_index as usize) as libc::c_int,
 			});
 		}
 
@@ -322,22 +323,11 @@ impl FsTarget {
 			));
 		}
 
-		// An empty path here (only reachable with AT_EMPTY_PATH, checked
-		// above) means the operation targets `dfd` directly, so the dfd
-		// is the file itself.  This must be captured at construction:
-		// `from_path` produces empty-path targets whose `dfd` is the
-		// process root/cwd (not the file), so the held-fd property cannot
-		// be recomputed from `path` alone later.
-		let held_fd_num = if path.as_bytes().is_empty() {
-			Some(req.arg(dfd_arg_index as usize) as libc::c_int)
-		} else {
-			None
-		};
 		Ok(Self {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
-			held_fd_num,
+			original_fd_num: req.arg(dfd_arg_index as usize) as libc::c_int,
 		})
 	}
 
@@ -345,13 +335,13 @@ impl FsTarget {
 		req: &mut RequestContext,
 		fd_arg_index: u8,
 	) -> Result<Self, AccessRequestError> {
-		let held_fd_num = Some(req.arg(fd_arg_index as usize) as libc::c_int);
+		let original_fd_num = req.arg(fd_arg_index as usize) as libc::c_int;
 		let fd = req.arg_to_fd(fd_arg_index as usize)?;
 		Ok(Self {
 			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
-			held_fd_num,
+			original_fd_num,
 		})
 	}
 
@@ -472,7 +462,7 @@ impl FsTarget {
 			dfd: self.open_target_dfd_in_root(root)?,
 			path: self.path.clone(),
 			no_follow: self.no_follow,
-			held_fd_num: self.held_fd_num,
+			original_fd_num: self.original_fd_num,
 		})
 	}
 
@@ -578,18 +568,19 @@ impl FsTarget {
 		&self.dfd
 	}
 
-	/// Whether this target refers directly to an already-open file
-	/// descriptor rather than a path to resolve (i.e. it carries a
-	/// [`held_fd_num`](Self::held_fd_num)).
-	pub fn is_bare_fd(&self) -> bool {
-		self.held_fd_num.is_some()
+	/// Whether this target carries an empty path, i.e. it refers directly to
+	/// an already-open file descriptor (an `f*` syscall, or an `*at` syscall
+	/// with `AT_EMPTY_PATH`) rather than a path to resolve.
+	pub fn is_empty_path(&self) -> bool {
+		self.path.is_empty()
 	}
 
-	/// For a [`bare_fd`](Self::is_bare_fd) target, the raw fd number in
-	/// the traced process the operation targets (see
-	/// [`held_fd_num`](Self::held_fd_num)).
-	pub fn held_fd_num(&self) -> Option<libc::c_int> {
-		self.held_fd_num
+	/// The raw fd number in the traced process this target's base was derived
+	/// from (see [`original_fd_num`](Self::original_fd_num)): the `dirfd` of an
+	/// `*at` syscall, the fd of an `f*` syscall, or `AT_FDCWD` for a plain
+	/// path-based syscall.
+	pub fn original_fd_num(&self) -> libc::c_int {
+		self.original_fd_num
 	}
 
 	pub fn path(&self) -> &CStr {

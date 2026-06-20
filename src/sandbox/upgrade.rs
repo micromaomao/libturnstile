@@ -42,7 +42,6 @@ use std::sync::OnceLock;
 use libc::open_how;
 use libseccomp::ScmpSyscall;
 use log::{debug, error, warn};
-use smallvec::{SmallVec, smallvec};
 
 use crate::{
 	AccessRequestError, RequestContext,
@@ -53,7 +52,7 @@ use crate::{
 			RemoveXattrOperation, SetXattrOperation, TruncateOperation,
 		},
 	},
-	syscalls::fs::{fs_syscall_dfd_path_dfd_path_table, fs_syscalls_dfd_path_table},
+	syscalls::fs as syscalls_fs,
 };
 
 use super::{ManagedBindMountSandbox, ManagedMountPoint, MountAttributes};
@@ -144,23 +143,6 @@ fn open_reopen_params(
 fn is_chdir(syscall: ScmpSyscall) -> bool {
 	let s = upgraded_syscalls();
 	Some(syscall) == s.chdir || Some(syscall) == s.fchdir
-}
-
-/// Argument indices of any real `dirfd`s this syscall accepts, derived
-/// from the existing request-parsing tables, for use by fd upgrade logic
-/// in ManagedBindMountSandbox.
-fn dfd_arg_indices(syscall: ScmpSyscall) -> SmallVec<[u8; 2]> {
-	for &(sys, _h, dfd, _path, _flags) in fs_syscalls_dfd_path_table() {
-		if sys == syscall {
-			return smallvec![dfd];
-		}
-	}
-	for &(sys, _h, dfd1, _p1, dfd2, _p2, _flags) in fs_syscall_dfd_path_dfd_path_table() {
-		if sys == syscall {
-			return smallvec![dfd1, dfd2];
-		}
-	}
-	smallvec![]
 }
 
 impl ManagedBindMountSandbox {
@@ -282,8 +264,8 @@ impl ManagedBindMountSandbox {
 		// descriptor (an `f*` call, or an `*at` with `AT_EMPTY_PATH`):
 		// the access is governed by that held fd, so whether we swap it
 		// or proxy the op depends on the fd's upgradability, not on the
-		// fact that it is a bare fd.  Path-based variants instead carry
-		// no target fd; they resolve afresh when the syscall continues
+		// fact that it carries an empty path.  Path-based variants instead
+		// carry no target fd; they resolve afresh when the syscall continues
 		// (any `dirfd` they do carry is handled by the dirfd-upgrade path
 		// below).
 		if let Some(target) = modify_op_held_fd_target(fsop) {
@@ -292,7 +274,7 @@ impl ManagedBindMountSandbox {
 
 		// Any other `*at` with a real dirfd: the dirfd governs the
 		// resolution, so upgrade it in place if its mount is stale.
-		let dfds = dfd_arg_indices(syscall);
+		let dfds = syscalls_fs::dfd_arg_indices(syscall);
 		if !dfds.is_empty() {
 			return self.allow_at_dirfds(&dfds, ctx);
 		}
@@ -540,10 +522,10 @@ impl ManagedBindMountSandbox {
 		// place.  Without a real fd number (e.g. `AT_FDCWD`, whose cwd is
 		// kept current by the chdir path) there is nothing to address, so
 		// CONTINUE.
-		let raw = match target.held_fd_num() {
-			Some(raw) if raw >= 0 => raw,
-			_ => return ctx.send_continue(),
-		};
+		let raw = target.original_fd_num();
+		if raw < 0 {
+			return ctx.send_continue();
+		}
 
 		let cur_mnt = match app_fd.mnt_id() {
 			Ok(m) => m,
@@ -713,7 +695,7 @@ fn modify_op_held_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
 		| FsOperation::FsRemoveXattr(RemoveXattrOperation { target, .. }) => target,
 		_ => return None,
 	};
-	target.is_bare_fd().then_some(target)
+	target.is_empty_path().then_some(target)
 }
 
 /// Re-issue a metadata/content-modifying op against the m1-opened handle
