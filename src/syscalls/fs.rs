@@ -497,6 +497,62 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 		1,
 		Some(2),
 	),
+	(
+		"setxattrat",
+		|req, target| {
+			let mut target = target;
+			let flags = req.arg(2);
+			if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 {
+				target.no_follow = true;
+			}
+			handle_setxattr_like(req, target, 3, 4, 5, 2)
+		},
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"getxattrat",
+		|req, target| {
+			let mut target = target;
+			let flags = req.arg(2);
+			if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 {
+				target.no_follow = true;
+			}
+			handle_getxattr_like(req, target, 3)
+		},
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"listxattrat",
+		|req, target| {
+			let mut target = target;
+			let flags = req.arg(2);
+			if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 {
+				target.no_follow = true;
+			}
+			handle_listxattr_like(req, target)
+		},
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"removexattrat",
+		|req, target| {
+			let mut target = target;
+			let flags = req.arg(2);
+			if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 {
+				target.no_follow = true;
+			}
+			handle_removexattr_like(req, target, 3)
+		},
+		0,
+		1,
+		Some(2),
+	),
 ];
 // (name, handler, arg index of the first path, arg index of the second path)
 const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
