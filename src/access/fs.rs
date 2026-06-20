@@ -357,36 +357,96 @@ impl FsTarget {
 	}
 
 	fn open_target_dfd_in_root(&self, root: libc::c_int) -> Result<ForeignFd, io::Error> {
-		let mut dfd_path = self.dfd.readlink()?.into_encoded_bytes();
-		dfd_path.push(b'\0');
-		if dfd_path.first().copied() != Some(b'/') {
-			error!(
-				"readlink of dfd did not return an absolute path: {:?} returned",
-				OsStr::from_bytes(&dfd_path)
+		// To re-open the dfd under a new `root` we readlink() the proc
+		// symlink to get a path, then openat2() it under `root` with
+		// RESOLVE_IN_ROOT.
+		//
+		// Between readlink and openat2, some component of the path could
+		// in principle be renamed, so the inode we reach via openat2 may
+		// not be the same one self.dfd refers to (or we might get an
+		// error).  We compare the (st_dev, st_ino) from statx() to ensure
+		// that we got the correct file, and if not, we retry at most
+		// once.  This works across bind mounts as st_dev identifies a
+		// filesystem, not a mount.
+		//
+		// Since we currently hold a fd to the target, the inode number
+		// can't be reused, so this comparison is sound.
+
+		// This can't change across retries, since a fd points to a
+		// specific inode.
+		let original_id = self.dfd.inode_id()?;
+		let mut attempts = 0;
+		loop {
+			let mut dfd_path = self.dfd.readlink()?.into_encoded_bytes();
+			dfd_path.push(b'\0');
+			if dfd_path.first().copied() != Some(b'/') {
+				error!(
+					"readlink of dfd did not return an absolute path: {:?} returned",
+					OsStr::from_bytes(&dfd_path)
+				);
+				return Err(io::Error::from_raw_os_error(libc::ENOENT));
+			}
+			let dfd_path = CString::from_vec_with_nul(dfd_path).unwrap();
+			let fd = unsafe {
+				let mut openhow: libc::open_how = std::mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				libc::syscall(
+					libc::SYS_openat2,
+					root,
+					dfd_path.as_ptr(),
+					&openhow,
+					std::mem::size_of_val(&openhow),
+				)
+			} as libc::c_int;
+			if fd < 0 {
+				let e = io::Error::last_os_error();
+				debug!(
+					"open_target_dfd_in_root: attempt {} openat2 of dfd path {:?} in root fd {} failed: {}",
+					attempts, dfd_path, root, e
+				);
+				attempts += 1;
+				if attempts >= 2 {
+					error!(
+						"open_target_dfd_in_root: errored on last attempt to open {:?}: {}",
+						dfd_path, e
+					);
+					return Err(e);
+				}
+				continue;
+			}
+			let opened = ForeignFd { local_fd: fd };
+			let new_id = opened.inode_id()?;
+			if new_id == original_id {
+				return Ok(opened);
+			}
+			debug!(
+				"open_target_dfd_in_root: attempt {} for {:?} got different inode \
+				 (expected id {:?}, got id {:?})",
+				attempts, dfd_path, original_id, new_id,
 			);
-			return Err(io::Error::from_raw_os_error(libc::ENOENT));
+			attempts += 1;
+			if attempts >= 2 {
+				error!(
+					"open_target_dfd_in_root: too many attempts to open {:?} before getting correct inode",
+					dfd_path
+				);
+				return Err(io::Error::from_raw_os_error(libc::ENOENT));
+			}
 		}
-		let dfd_path = CString::from_vec_with_nul(dfd_path).unwrap();
-		let dfd_in_new_root = unsafe {
-			let mut openhow: libc::open_how = std::mem::zeroed();
-			openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-			openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
-			libc::syscall(
-				libc::SYS_openat2,
-				root,
-				dfd_path.as_ptr(),
-				&openhow,
-				std::mem::size_of_val(&openhow),
-			)
-		} as libc::c_int;
-		if dfd_in_new_root < 0 {
-			return Err(io::Error::last_os_error());
-		}
-		Ok(ForeignFd {
-			local_fd: dfd_in_new_root,
-		})
 	}
 
+	/// The dfd was opened via /proc/<traced_process>/fd, which means that
+	/// it is created within the mount ns of the traced process.  In
+	/// situations where the traced process is sandboxed via mount
+	/// namespace and bind mounts, it might be useful to re-open this file
+	/// "outside", as the original dfd might, for example, point to a
+	/// read-only mount or a placeholder.
+	///
+	/// This function attempts to re-open the target but under the
+	/// provided root fd.  The target must exist on the same path within
+	/// this new root.  A check with statx() will ensure that the file is
+	/// the same, and if not, ENOENT is returned.
 	pub fn in_root(&self, root: libc::c_int) -> Result<Self, io::Error> {
 		Ok(Self {
 			dfd: self.open_target_dfd_in_root(root)?,
