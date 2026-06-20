@@ -65,6 +65,42 @@ macro_rules! lazy_syscall_table_name_to_number {
 }
 pub(crate) use lazy_syscall_table_name_to_number;
 
+// _IOW('!', 3, struct seccomp_notif_addfd)
+// This value does not depend on the architecture, and is stable because
+// it is part of the uAPI.
+const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = 0x40182103;
+
+/// `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper since libseccomp does not expose
+/// this.  Returns the new fd number installed in the target on success.
+fn notif_addfd(
+	notify_fd: ScmpFd,
+	id: u64,
+	flags: u32,
+	srcfd: libc::c_int,
+	newfd: libc::c_int,
+	newfd_flags: u32,
+) -> io::Result<libc::c_int> {
+	let addfd = libc::seccomp_notif_addfd {
+		id,
+		flags,
+		srcfd: srcfd as u32,
+		newfd: newfd as u32,
+		newfd_flags,
+	};
+	let ret = unsafe {
+		libc::ioctl(
+			notify_fd,
+			SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+			&addfd as *const libc::seccomp_notif_addfd,
+		)
+	};
+	if ret < 0 {
+		Err(io::Error::last_os_error())
+	} else {
+		Ok(ret)
+	}
+}
+
 #[derive(Debug)]
 pub struct RequestContext<'a> {
 	pub(crate) _tracer: &'a TurnstileTracer,
@@ -109,6 +145,8 @@ impl<'a> RequestContext<'a> {
 			resp.respond(self.notify_fd)
 				.map_err(AccessRequestError::NotifyRespond)?;
 			self.valid = false;
+		} else {
+			warn!("send_response_impl called on a no longer valid notification");
 		}
 		Ok(())
 	}
@@ -120,6 +158,9 @@ impl<'a> RequestContext<'a> {
 		))
 	}
 
+	/// Send an error value for the currently traced syscall (without
+	/// actually executing it).
+	///
 	/// Users are reminded that this should not be used to deny access
 	/// unless there is a separate sandboxing mechanism making sure that
 	/// the access would be denied should the traced process attempt to
@@ -130,6 +171,78 @@ impl<'a> RequestContext<'a> {
 			errno,
 			ScmpNotifRespFlags::empty(),
 		))
+	}
+
+	/// Send a non-error value for the currently traced syscall (without
+	/// actually executing it).
+	pub fn send_value(&mut self, val: i64) -> Result<(), AccessRequestError> {
+		self.send_response_impl(ScmpNotifResp::new_val(
+			self.sreq.id,
+			val,
+			ScmpNotifRespFlags::empty(),
+		))
+	}
+
+	/// Returns the syscall number that triggered this notification.
+	pub fn syscall(&self) -> libseccomp::ScmpSyscall {
+		self.sreq.data.syscall
+	}
+
+	/// Install `srcfd` into the traced process and atomically complete the
+	/// notification such that the newly installed fd is returned from the
+	/// syscall.
+	///
+	/// On success the new descriptor number (as seen by the traced process, but
+	/// may not be a valid fd for the caller) is returned.
+	pub fn install_fd_and_respond(
+		&mut self,
+		srcfd: libc::c_int,
+		cloexec: bool,
+	) -> Result<i64, AccessRequestError> {
+		if !self.valid {
+			warn!("install_fd_and_respond called on a no longer valid notification");
+			return Err(AccessRequestError::NotificationAlreadyAnswered);
+		}
+		let newfd = notif_addfd(
+			self.notify_fd,
+			self.sreq.id,
+			libc::SECCOMP_ADDFD_FLAG_SEND as u32,
+			srcfd,
+			0,
+			if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+		)
+		.map_err(AccessRequestError::AddFd)?;
+		// SECCOMP_ADDFD_FLAG_SEND completes the notification for us.
+		self.valid = false;
+		Ok(newfd as i64)
+	}
+
+	/// Install `srcfd` into the traced process as `newfd`, replacing any
+	/// existing fds in the traced process, but without sending any responses
+	/// for this syscall.
+	///
+	/// If the notification is no longer valid (already answered, or
+	/// invalidated by a signal), this returns an error.
+	pub fn replace_fd(
+		&mut self,
+		srcfd: libc::c_int,
+		newfd: libc::c_int,
+		cloexec: bool,
+	) -> Result<(), AccessRequestError> {
+		if !self.valid {
+			warn!("replace_fd called on a no longer valid notification");
+			return Err(AccessRequestError::NotificationAlreadyAnswered);
+		}
+		notif_addfd(
+			self.notify_fd,
+			self.sreq.id,
+			libc::SECCOMP_ADDFD_FLAG_SETFD as u32,
+			srcfd,
+			newfd,
+			if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+		)
+		.map_err(AccessRequestError::AddFd)?;
+		Ok(())
 	}
 
 	/// Read a NUL-terminated C string from the traced process's memory at
@@ -261,6 +374,21 @@ impl<'a> RequestContext<'a> {
 			self.read_target_memory(src as *const u8, buf)?;
 		}
 		Ok(unsafe { val.assume_init() })
+	}
+
+	/// Reads a `Vec<u8>` of length `len` from the traced process's memory at
+	/// `src`.
+	pub fn bytes_from_target_memory(
+		&mut self,
+		src: *const u8,
+		len: usize,
+	) -> Result<Vec<u8>, AccessRequestError> {
+		let mut buf = Vec::with_capacity(len);
+		let uninit_buf =
+			unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, len) };
+		self.read_target_memory(src, uninit_buf)?;
+		unsafe { buf.set_len(len) };
+		Ok(buf)
 	}
 
 	pub fn pid(&self) -> libc::pid_t {
