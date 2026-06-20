@@ -76,6 +76,11 @@ impl ForeignFd {
 			return Err(io::Error::last_os_error());
 		}
 		buf.truncate(ret as usize);
+		debug!(
+			"readlink of fd {} returned {:?}",
+			self.local_fd,
+			OsStr::from_bytes(&buf)
+		);
 		// readlink does not include a NUL terminator
 		if buf.len() > 1 && buf.last().copied() == Some(b'/') {
 			buf.pop();
@@ -104,6 +109,59 @@ impl ForeignFd {
 			dev_minor: stx.stx_dev_minor,
 			ino: stx.stx_ino,
 		})
+	}
+
+	/// Return the (non-unique) kernel mount id of this fd.  This matches with
+	/// the first field of /proc/.../mountinfo.
+	pub fn mnt_id(&self) -> Result<u64, io::Error> {
+		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+		let ret = unsafe {
+			libc::statx(
+				self.local_fd,
+				c"".as_ptr(),
+				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
+				libc::STATX_MNT_ID,
+				&mut stx,
+			)
+		};
+		if ret < 0 {
+			let err = io::Error::last_os_error();
+			error!(
+				"statx(AT_EMPTY_PATH) failed on fd {}: {}",
+				self.local_fd, err
+			);
+			return Err(err);
+		}
+		if stx.stx_mask & libc::STATX_MNT_ID == 0 {
+			let try_realpath = self
+				.readlink()
+				.ok()
+				.unwrap_or_else(|| OsString::from("???"));
+			error!(
+				"statx(AT_EMPTY_PATH) on fd {} (-> {:?}) did not return mount id",
+				self.local_fd, try_realpath
+			);
+			return Err(io::Error::from_raw_os_error(libc::ENODATA));
+		}
+		Ok(stx.stx_mnt_id)
+	}
+
+	/// Whether the inode this fd refers to is a directory.
+	pub fn is_dir(&self) -> Result<bool, io::Error> {
+		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+		let ret = unsafe {
+			libc::statx(
+				self.local_fd,
+				c"".as_ptr(),
+				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
+				libc::STATX_TYPE,
+				&mut stx,
+			)
+		};
+		if ret < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok((u32::from(stx.stx_mode) & libc::S_IFMT) == libc::S_IFDIR)
 	}
 }
 
@@ -150,8 +208,8 @@ impl Clone for ForeignFd {
 /// directory, or a completely non-existent place even ignoring the last
 /// component.
 ///
-/// Some syscalls also accepts an empty path, in which case the target is
-/// the base fd itself.
+/// Some syscalls also accepts an empty path or operates on the fd itself,
+/// in which case [`path()`](Self::path) returns an empty `CStr`.
 ///
 /// This struct preserves what was passed by the traced process, except
 /// that the base fd is opened by us from /proc, and so we have a local
@@ -171,6 +229,23 @@ pub struct FsTarget {
 	/// Whether to avoid following the final symlink component when resolving
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
+
+	/// Where the base fd of this target came from in the original syscall.
+	pub(crate) original_handle: OriginalHandle,
+}
+
+/// Describes where a target's base fd came from in the original syscall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginalHandle {
+	/// An explicit fd (the `dirfd` of an `*at` syscall or the fd of an
+	/// `f*` syscall) was passed.  This stores the passed in number.
+	Fd(libc::c_int),
+
+	/// AT_FDCWD, or a relative path was used with a path-only syscall.
+	Cwd,
+
+	/// An absolute path was used.
+	Root,
 }
 
 fn trim_leading_slashes(path: &CStr) -> &CStr {
@@ -220,6 +295,11 @@ impl FsTarget {
 			dfd,
 			path: path.to_owned(),
 			no_follow: false,
+			original_handle: if absolute {
+				OriginalHandle::Root
+			} else {
+				OriginalHandle::Cwd
+			},
 		})
 	}
 
@@ -248,6 +328,7 @@ impl FsTarget {
 					.map_err(|e| AccessRequestError::OpenFd(root_path, e))?,
 				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
+				original_handle: OriginalHandle::Root,
 			});
 		}
 
@@ -257,10 +338,17 @@ impl FsTarget {
 			));
 		}
 
+		let dfd_arg = req.arg(dfd_arg_index as usize) as libc::c_int;
+		let at_fdcwd = dfd_arg == libc::AT_FDCWD;
 		Ok(Self {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
+			original_handle: if at_fdcwd {
+				OriginalHandle::Cwd
+			} else {
+				OriginalHandle::Fd(dfd_arg)
+			},
 		})
 	}
 
@@ -268,11 +356,13 @@ impl FsTarget {
 		req: &mut RequestContext,
 		fd_arg_index: u8,
 	) -> Result<Self, AccessRequestError> {
+		let original_fd_num = req.arg(fd_arg_index as usize) as libc::c_int;
 		let fd = req.arg_to_fd(fd_arg_index as usize)?;
 		Ok(Self {
 			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
+			original_handle: OriginalHandle::Fd(original_fd_num),
 		})
 	}
 
@@ -311,10 +401,11 @@ impl FsTarget {
 		// once.  This works across bind mounts as st_dev identifies a
 		// filesystem, not a mount.
 		//
-		// Since we current hold a fd to the target, the inode number
+		// Since we currently hold a fd to the target, the inode number
 		// can't be reused, so this comparison is sound.
 
-		// This can't change across retries.
+		// This can't change across retries, since a fd points to a
+		// specific inode.
 		let original_id = self.dfd.inode_id()?;
 		let mut attempts = 0;
 		loop {
@@ -393,6 +484,7 @@ impl FsTarget {
 			dfd: self.open_target_dfd_in_root(root)?,
 			path: self.path.clone(),
 			no_follow: self.no_follow,
+			original_handle: self.original_handle,
 		})
 	}
 
@@ -494,8 +586,23 @@ impl FsTarget {
 		Ok(OsString::from_vec(result))
 	}
 
+	/// The base fd of the target, which may be the root of the process
+	/// being traced if the path is absolute, or a newly opened current
+	/// working directory of the traced process if AT_FDCWD is used.
 	pub fn dfd(&self) -> &ForeignFd {
 		&self.dfd
+	}
+
+	/// Whether this target carries an empty path, i.e. it refers directly to
+	/// an already-open file descriptor (an `f*` syscall, or an `*at` syscall
+	/// with `AT_EMPTY_PATH`) rather than a path to resolve.
+	pub fn is_empty_path(&self) -> bool {
+		self.path.is_empty()
+	}
+
+	/// The actual base as used by the original syscall.
+	pub fn get_original_handle(&self) -> OriginalHandle {
+		self.original_handle
 	}
 
 	pub fn path(&self) -> &CStr {
@@ -615,6 +722,45 @@ pub struct UnixBindOperation {
 }
 
 #[derive(Debug)]
+pub struct ChmodOperation {
+	pub target: FsTarget,
+	pub mode: u32,
+}
+
+#[derive(Debug)]
+pub struct ChownOperation {
+	pub target: FsTarget,
+	pub uid: u32,
+	pub gid: u32,
+}
+
+#[derive(Debug)]
+pub struct TruncateOperation {
+	pub target: FsTarget,
+	pub length: i64,
+}
+
+#[derive(Debug)]
+pub struct GetXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+}
+
+#[derive(Debug)]
+pub struct SetXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+	pub value: Vec<u8>,
+	pub flags: i32,
+}
+
+#[derive(Debug)]
+pub struct RemoveXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+}
+
+#[derive(Debug)]
 pub enum FsOperation {
 	FsOpen(OpenOperation),
 	FsAccess(AccessOperation),
@@ -626,6 +772,12 @@ pub enum FsOperation {
 	FsReadlink(FsTarget),
 	FsChdir(FsTarget),
 	FsStat(StatOperation),
+	FsChmod(ChmodOperation),
+	FsChown(ChownOperation),
+	FsTruncate(TruncateOperation),
+	FsGetXattr(GetXattrOperation),
+	FsSetXattr(SetXattrOperation),
+	FsRemoveXattr(RemoveXattrOperation),
 	UnixConnect(FsTarget),
 	UnixBind(UnixBindOperation),
 	UnixSendto(FsTarget),
@@ -761,6 +913,24 @@ impl std::fmt::Display for FsOperation {
 			Self::FsStat(StatOperation { target, lstat }) => {
 				write!(f, "{} {}", if *lstat { "lstat" } else { "stat" }, target)?;
 			}
+			Self::FsChmod(ChmodOperation { target, mode }) => {
+				write!(f, "chmod {:o} {}", mode, target)?;
+			}
+			Self::FsChown(ChownOperation { target, uid, gid }) => {
+				write!(f, "chown {}:{} {}", uid, gid, target)?;
+			}
+			Self::FsTruncate(TruncateOperation { target, length }) => {
+				write!(f, "truncate {} {}", length, target)?;
+			}
+			Self::FsGetXattr(GetXattrOperation { target, name }) => {
+				write!(f, "getxattr {} {}", name.to_string_lossy(), target)?;
+			}
+			Self::FsSetXattr(SetXattrOperation { target, name, .. }) => {
+				write!(f, "setxattr {} {}", name.to_string_lossy(), target)?;
+			}
+			Self::FsRemoveXattr(RemoveXattrOperation { target, name }) => {
+				write!(f, "removexattr {} {}", name.to_string_lossy(), target)?;
+			}
 			Self::UnixConnect(target) => {
 				write!(f, "connect unix:{}", target)?;
 			}
@@ -845,6 +1015,16 @@ impl FsOperation {
 			}
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
+			}
+			Self::FsGetXattr(GetXattrOperation { target, .. }) => {
+				smallvec![make_rwx!(target.clone(), read)]
+			}
+			Self::FsChmod(ChmodOperation { target, .. })
+			| Self::FsChown(ChownOperation { target, .. })
+			| Self::FsTruncate(TruncateOperation { target, .. })
+			| Self::FsSetXattr(SetXattrOperation { target, .. })
+			| Self::FsRemoveXattr(RemoveXattrOperation { target, .. }) => {
+				smallvec![make_rwx!(target.clone(), write)]
 			}
 			Self::UnixConnect(target) => {
 				smallvec![make_rwx!(target.clone(), read, write)]
