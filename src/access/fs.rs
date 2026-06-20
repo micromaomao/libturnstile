@@ -235,6 +235,9 @@ pub struct FsTarget {
 
 	/// Whether the original syscall was made with AT_FDCWD.
 	pub(crate) at_fdcwd: bool,
+
+	/// Whether the original syscalls was made with an absolute path.
+	pub(crate) absolute: bool,
 }
 
 fn trim_leading_slashes(path: &CStr) -> &CStr {
@@ -286,6 +289,7 @@ impl FsTarget {
 			no_follow: false,
 			original_fd_num: None,
 			at_fdcwd: !absolute,
+			absolute,
 		})
 	}
 
@@ -316,6 +320,7 @@ impl FsTarget {
 				no_follow,
 				original_fd_num: None,
 				at_fdcwd: false,
+				absolute: true,
 			});
 		}
 
@@ -333,6 +338,7 @@ impl FsTarget {
 			no_follow,
 			original_fd_num: if at_fdcwd { None } else { Some(dfd_arg) },
 			at_fdcwd,
+			absolute: false,
 		})
 	}
 
@@ -348,6 +354,7 @@ impl FsTarget {
 			no_follow: false,
 			original_fd_num: Some(original_fd_num),
 			at_fdcwd: false,
+			absolute: false,
 		})
 	}
 
@@ -389,7 +396,8 @@ impl FsTarget {
 		// Since we current hold a fd to the target, the inode number
 		// can't be reused, so this comparison is sound.
 
-		// This can't change across retries.
+		// This can't change across retries, since a fd points to a
+		// specific inode.
 		let original_id = self.dfd.inode_id()?;
 		let mut attempts = 0;
 		loop {
@@ -470,6 +478,7 @@ impl FsTarget {
 			no_follow: self.no_follow,
 			original_fd_num: self.original_fd_num,
 			at_fdcwd: self.at_fdcwd,
+			absolute: self.absolute,
 		})
 	}
 
