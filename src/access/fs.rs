@@ -230,14 +230,25 @@ pub struct FsTarget {
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
 
-	/// If available, the original fd number from the syscall.
-	pub(crate) original_fd_num: Option<libc::c_int>,
+	/// Where the base fd of this target came from in the original syscall.
+	pub(crate) original_handle: OriginalHandle,
+}
 
-	/// Whether the original syscall was made with AT_FDCWD.
-	pub(crate) at_fdcwd: bool,
+/// Describes where a target's base fd came from in the original syscall, used
+/// by the fd upgrade logic to decide whether (and how) a stale fd can be
+/// upgraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginalHandle {
+	/// The syscall passed an explicit fd (the `dirfd` of an `*at` syscall or
+	/// the fd of an `f*` syscall), carrying this raw fd number.
+	Fd(libc::c_int),
 
-	/// Whether the original syscalls was made with an absolute path.
-	pub(crate) absolute: bool,
+	/// The target resolved against the current working directory (`AT_FDCWD`
+	/// or a relative path with no `dirfd`).
+	Cwd,
+
+	/// The target used an absolute path, resolved against the process root.
+	Root,
 }
 
 fn trim_leading_slashes(path: &CStr) -> &CStr {
@@ -287,9 +298,11 @@ impl FsTarget {
 			dfd,
 			path: path.to_owned(),
 			no_follow: false,
-			original_fd_num: None,
-			at_fdcwd: !absolute,
-			absolute,
+			original_handle: if absolute {
+				OriginalHandle::Root
+			} else {
+				OriginalHandle::Cwd
+			},
 		})
 	}
 
@@ -318,9 +331,7 @@ impl FsTarget {
 					.map_err(|e| AccessRequestError::OpenFd(root_path, e))?,
 				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
-				original_fd_num: None,
-				at_fdcwd: false,
-				absolute: true,
+				original_handle: OriginalHandle::Root,
 			});
 		}
 
@@ -336,9 +347,11 @@ impl FsTarget {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
-			original_fd_num: if at_fdcwd { None } else { Some(dfd_arg) },
-			at_fdcwd,
-			absolute: false,
+			original_handle: if at_fdcwd {
+				OriginalHandle::Cwd
+			} else {
+				OriginalHandle::Fd(dfd_arg)
+			},
 		})
 	}
 
@@ -352,9 +365,7 @@ impl FsTarget {
 			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
-			original_fd_num: Some(original_fd_num),
-			at_fdcwd: false,
-			absolute: false,
+			original_handle: OriginalHandle::Fd(original_fd_num),
 		})
 	}
 
@@ -476,9 +487,7 @@ impl FsTarget {
 			dfd: self.open_target_dfd_in_root(root)?,
 			path: self.path.clone(),
 			no_follow: self.no_follow,
-			original_fd_num: self.original_fd_num,
-			at_fdcwd: self.at_fdcwd,
-			absolute: self.absolute,
+			original_handle: self.original_handle,
 		})
 	}
 
@@ -591,22 +600,13 @@ impl FsTarget {
 		self.path.is_empty()
 	}
 
-	/// Whether the original syscall resolved against the cwd (`AT_FDCWD`).
-	pub fn is_at_fdcwd(&self) -> bool {
-		self.at_fdcwd
-	}
-
-	/// Whether the original syscall used an absolute path.
-	pub fn is_absolute(&self) -> bool {
-		self.absolute
-	}
-
-	/// The raw fd number in the traced process this target's base was derived
-	/// from, if any: the `dirfd` of an `*at` syscall or the fd of an `f*`
-	/// syscall.  `None` for `AT_FDCWD` and for absolute paths, where no fd
-	/// upgrade is needed.
-	pub fn original_fd_num(&self) -> Option<libc::c_int> {
-		self.original_fd_num
+	/// Where the base fd of this target came from in the original syscall: an
+	/// explicit `dirfd`/`fd` ([`OriginalHandle::Fd`]), the current working
+	/// directory ([`OriginalHandle::Cwd`]), or the process root for an
+	/// absolute path ([`OriginalHandle::Root`]).  Used by the fd upgrade logic
+	/// to decide whether a stale fd can be upgraded.
+	pub fn get_original_handle(&self) -> OriginalHandle {
+		self.original_handle
 	}
 
 	pub fn path(&self) -> &CStr {

@@ -49,7 +49,7 @@ use crate::{
 		AccessRequest, Operation,
 		fs::{
 			ChmodOperation, ChownOperation, ForeignFd, FsOperation, FsTarget, InodeId,
-			RemoveXattrOperation, SetXattrOperation, TruncateOperation,
+			OriginalHandle, RemoveXattrOperation, SetXattrOperation, TruncateOperation,
 		},
 	},
 	syscalls::fs as syscalls_fs,
@@ -522,7 +522,7 @@ impl ManagedBindMountSandbox {
 		// place.  Without a real fd number (e.g. `AT_FDCWD`, whose cwd is
 		// kept current by the chdir path) there is nothing to address, so
 		// CONTINUE.
-		let Some(target_fd) = target.original_fd_num() else {
+		let OriginalHandle::Fd(target_fd) = target.get_original_handle() else {
 			return ctx.send_continue();
 		};
 
