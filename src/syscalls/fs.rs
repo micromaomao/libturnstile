@@ -4,8 +4,8 @@ use crate::{
 	AccessRequestError, TurnstileTracerError,
 	access::fs::{
 		ChmodOperation, ChownOperation, CreateKind, CreateOperation, ExecOperation, FsTarget,
-		GetXattrOperation, LinkOperation, OpenOperation, RemoveXattrOperation, RenameOperation,
-		SetXattrOperation, TruncateOperation, UnlinkOperation,
+		GetXattrOperation, LinkOperation, ListXattrOperation, OpenOperation, RemoveXattrOperation,
+		RenameOperation, SetXattrOperation, TruncateOperation, UnlinkOperation,
 	},
 	access::{
 		AccessRequest, Operation,
@@ -265,6 +265,20 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 				target,
 				length: req.arg(1) as i64,
 			})))
+		},
+		0,
+	),
+	(
+		"listxattr",
+		|req, target| handle_listxattr_like(req, target),
+		0,
+	),
+	(
+		"llistxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_listxattr_like(req, target)
 		},
 		0,
 	),
@@ -614,6 +628,11 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 		0,
 	),
 	(
+		"flistxattr",
+		|req, target| handle_listxattr_like(req, target),
+		0,
+	),
+	(
 		"fgetxattr",
 		|req, target| handle_getxattr_like(req, target, 1),
 		0,
@@ -629,6 +648,13 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 		0,
 	),
 ];
+
+fn handle_listxattr_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+) -> Result<Operation, AccessRequestError> {
+	Ok(fsop(FsListXattr(ListXattrOperation { target })))
+}
 
 fn handle_getxattr_like(
 	req: &mut RequestContext,
