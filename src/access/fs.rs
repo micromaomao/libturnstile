@@ -721,14 +721,6 @@ pub struct UnixBindOperation {
 	pub target: FsTarget,
 }
 
-/// Metadata- or content-modifying operations (`chmod`, `chown`,
-/// `truncate`, `setxattr`, `removexattr` and their `f`/`l`/`*at`
-/// variants).  These are mediated so that, after a grant changes the
-/// live mount layout, a descriptor opened against a now-stale mount can
-/// be transparently re-resolved and the operation re-issued through the
-/// current layout.  Path-based variants resolve afresh when the syscall
-/// continues; a held-fd target is swapped if upgradable, otherwise
-/// proxied.
 #[derive(Debug)]
 pub struct ChmodOperation {
 	pub target: FsTarget,
