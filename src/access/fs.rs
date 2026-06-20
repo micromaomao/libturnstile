@@ -234,20 +234,17 @@ pub struct FsTarget {
 	pub(crate) original_handle: OriginalHandle,
 }
 
-/// Describes where a target's base fd came from in the original syscall, used
-/// by the fd upgrade logic to decide whether (and how) a stale fd can be
-/// upgraded.
+/// Describes where a target's base fd came from in the original syscall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginalHandle {
-	/// The syscall passed an explicit fd (the `dirfd` of an `*at` syscall or
-	/// the fd of an `f*` syscall), carrying this raw fd number.
+	/// An explicit fd (the `dirfd` of an `*at` syscall or the fd of an
+	/// `f*` syscall) was passed.  This stores the passed in number.
 	Fd(libc::c_int),
 
-	/// The target resolved against the current working directory (`AT_FDCWD`
-	/// or a relative path with no `dirfd`).
+	/// AT_FDCWD, or a relative path was used with a path-only syscall.
 	Cwd,
 
-	/// The target used an absolute path, resolved against the process root.
+	/// An absolute path was used.
 	Root,
 }
 
@@ -589,6 +586,9 @@ impl FsTarget {
 		Ok(OsString::from_vec(result))
 	}
 
+	/// The base fd of the target, which may be the root of the process
+	/// being traced if the path is absolute, or a newly opened current
+	/// working directory of the traced process if AT_FDCWD is used.
 	pub fn dfd(&self) -> &ForeignFd {
 		&self.dfd
 	}
@@ -600,11 +600,7 @@ impl FsTarget {
 		self.path.is_empty()
 	}
 
-	/// Where the base fd of this target came from in the original syscall: an
-	/// explicit `dirfd`/`fd` ([`OriginalHandle::Fd`]), the current working
-	/// directory ([`OriginalHandle::Cwd`]), or the process root for an
-	/// absolute path ([`OriginalHandle::Root`]).  Used by the fd upgrade logic
-	/// to decide whether a stale fd can be upgraded.
+	/// The actual base as used by the original syscall.
 	pub fn get_original_handle(&self) -> OriginalHandle {
 		self.original_handle
 	}
