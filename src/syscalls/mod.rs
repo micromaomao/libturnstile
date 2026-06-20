@@ -16,12 +16,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 pub mod fs;
 pub mod net;
 
-// `_IOW('!', 3, struct seccomp_notif_addfd)` — the ioctl number for
-// `SECCOMP_IOCTL_NOTIF_ADDFD`, which libc does not expose.  The Linux
-// uAPI is stable, so this is a fixed constant on every architecture
-// using the asm-generic ioctl encoding (x86-64 / aarch64 / etc.).
-const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = 0x4018_2103;
-
 macro_rules! syscall_transform_tuple {
 	($sys:expr, $t:expr, $ty1:ty) => {
 		($sys, $t.1)
