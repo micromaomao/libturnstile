@@ -767,9 +767,10 @@ pub struct RemoveXattrOperation {
 }
 
 /// Reading an extended attribute (`getxattr`, `lgetxattr`, `fgetxattr`).
-/// This is a read-only op: like `stat`/`fstat`, it is mediated only to
-/// require read access on the target, and resolves afresh when the
-/// syscall continues against the live layout.
+/// This is a read-only op: it requires read access on the target (the
+/// symmetric counterpart of `setxattr`, which requires write), and like
+/// other read ops it resolves afresh against the live layout when the
+/// syscall continues.
 #[derive(Debug)]
 pub struct GetXattrOperation {
 	pub target: FsTarget,
