@@ -11,6 +11,7 @@ use libseccomp::{ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
 use log::warn;
 
 use crate::{AccessRequestError, TurnstileTracer, access::fs::ForeignFd};
+use std::os::unix::io::AsRawFd;
 
 pub mod fs;
 pub mod net;
