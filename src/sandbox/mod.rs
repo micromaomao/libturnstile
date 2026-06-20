@@ -388,7 +388,7 @@ impl BindMountSandbox {
 			host_root_fd,
 			m1_scratch_fd,
 		};
-		// 4. Bind-mount root_tmpfs over m1's "/", shadowing the scratch.
+		// Bind-mount root_tmpfs over m1's "/", shadowing the scratch.
 		s.mount_host_into_sandbox_impl(
 			CStr::from_bytes_with_nul(
 				format!("/proc/self/fd/{}\0", s.root_tmpfs.0.as_raw_fd()).as_bytes(),
