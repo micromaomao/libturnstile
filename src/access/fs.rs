@@ -208,8 +208,8 @@ impl Clone for ForeignFd {
 /// directory, or a completely non-existent place even ignoring the last
 /// component.
 ///
-/// Some syscalls also accepts an empty path or operates on the fd itself, in
-/// which case [`path()`](Self::path) returns an empty `CStr`.
+/// Some syscalls also accepts an empty path or operates on the fd itself,
+/// in which case [`path()`](Self::path) returns an empty `CStr`.
 ///
 /// This struct preserves what was passed by the traced process, except
 /// that the base fd is opened by us from /proc, and so we have a local
@@ -230,10 +230,7 @@ pub struct FsTarget {
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
 
-	/// The raw fd number in the traced process that this target's base was
-	/// derived from: the `dirfd` of an `*at` syscall, the fd of an `f*`
-	/// syscall, or `AT_FDCWD` for a plain path-based syscall that carries no
-	/// fd argument.
+	/// The original fd number from the syscall.
 	pub(crate) original_fd_num: libc::c_int,
 }
 
