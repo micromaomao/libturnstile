@@ -269,6 +269,20 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 		0,
 	),
 	(
+		"getxattr",
+		|req, target| handle_getxattr_like(req, target, 1),
+		0,
+	),
+	(
+		"lgetxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_getxattr_like(req, target, 1)
+		},
+		0,
+	),
+	(
 		"setxattr",
 		|req, target| handle_setxattr_like(req, target, 1, 2, 3, 4),
 		0,
@@ -293,20 +307,6 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 			let mut target = target;
 			target.no_follow = true;
 			handle_removexattr_like(req, target, 1)
-		},
-		0,
-	),
-	(
-		"getxattr",
-		|req, target| handle_getxattr_like(req, target, 1),
-		0,
-	),
-	(
-		"lgetxattr",
-		|req, target| {
-			let mut target = target;
-			target.no_follow = true;
-			handle_getxattr_like(req, target, 1)
 		},
 		0,
 	),
@@ -614,6 +614,11 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 		0,
 	),
 	(
+		"fgetxattr",
+		|req, target| handle_getxattr_like(req, target, 1),
+		0,
+	),
+	(
 		"fsetxattr",
 		|req, target| handle_setxattr_like(req, target, 1, 2, 3, 4),
 		0,
@@ -623,12 +628,17 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 		|req, target| handle_removexattr_like(req, target, 1),
 		0,
 	),
-	(
-		"fgetxattr",
-		|req, target| handle_getxattr_like(req, target, 1),
-		0,
-	),
 ];
+
+fn handle_getxattr_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	Ok(fsop(FsGetXattr(GetXattrOperation { target, name })))
+}
 
 fn handle_setxattr_like(
 	req: &mut RequestContext,
@@ -666,16 +676,6 @@ fn handle_removexattr_like(
 	let name_ptr = req.arg(name_arg) as *const libc::c_char;
 	let name = req.cstr_from_target_memory(name_ptr)?;
 	Ok(fsop(FsRemoveXattr(RemoveXattrOperation { target, name })))
-}
-
-fn handle_getxattr_like(
-	req: &mut RequestContext,
-	target: FsTarget,
-	name_arg: usize,
-) -> Result<Operation, AccessRequestError> {
-	let name_ptr = req.arg(name_arg) as *const libc::c_char;
-	let name = req.cstr_from_target_memory(name_ptr)?;
-	Ok(fsop(FsGetXattr(GetXattrOperation { target, name })))
 }
 
 pub(crate) fn add_filter_rules(
@@ -745,9 +745,7 @@ lazy_syscall_table_name_to_number!(FS_SYSCALLS_FD, fs_syscalls_fd_table, Syscall
 /// Argument indices of any real `dirfd`s this syscall accepts, derived from the
 /// existing request-parsing tables, for use by fd upgrade logic in
 /// ManagedBindMountSandbox.
-pub(crate) fn dfd_arg_indices(
-	syscall: libseccomp::ScmpSyscall,
-) -> smallvec::SmallVec<[u8; 2]> {
+pub(crate) fn dfd_arg_indices(syscall: libseccomp::ScmpSyscall) -> smallvec::SmallVec<[u8; 2]> {
 	for &(sys, _h, dfd, _path, _flags) in fs_syscalls_dfd_path_table() {
 		if sys == syscall {
 			return smallvec::smallvec![dfd];

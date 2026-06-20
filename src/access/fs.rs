@@ -753,6 +753,12 @@ pub struct TruncateOperation {
 }
 
 #[derive(Debug)]
+pub struct GetXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+}
+
+#[derive(Debug)]
 pub struct SetXattrOperation {
 	pub target: FsTarget,
 	pub name: CString,
@@ -762,17 +768,6 @@ pub struct SetXattrOperation {
 
 #[derive(Debug)]
 pub struct RemoveXattrOperation {
-	pub target: FsTarget,
-	pub name: CString,
-}
-
-/// Reading an extended attribute (`getxattr`, `lgetxattr`, `fgetxattr`).
-/// This is a read-only op: it requires read access on the target (the
-/// symmetric counterpart of `setxattr`, which requires write), and like
-/// other read ops it resolves afresh against the live layout when the
-/// syscall continues.
-#[derive(Debug)]
-pub struct GetXattrOperation {
 	pub target: FsTarget,
 	pub name: CString,
 }
@@ -792,9 +787,9 @@ pub enum FsOperation {
 	FsChmod(ChmodOperation),
 	FsChown(ChownOperation),
 	FsTruncate(TruncateOperation),
+	FsGetXattr(GetXattrOperation),
 	FsSetXattr(SetXattrOperation),
 	FsRemoveXattr(RemoveXattrOperation),
-	FsGetXattr(GetXattrOperation),
 	UnixConnect(FsTarget),
 	UnixBind(UnixBindOperation),
 	UnixSendto(FsTarget),
@@ -939,14 +934,14 @@ impl std::fmt::Display for FsOperation {
 			Self::FsTruncate(TruncateOperation { target, length }) => {
 				write!(f, "truncate {} {}", length, target)?;
 			}
+			Self::FsGetXattr(GetXattrOperation { target, name }) => {
+				write!(f, "getxattr {} {}", name.to_string_lossy(), target)?;
+			}
 			Self::FsSetXattr(SetXattrOperation { target, name, .. }) => {
 				write!(f, "setxattr {} {}", name.to_string_lossy(), target)?;
 			}
 			Self::FsRemoveXattr(RemoveXattrOperation { target, name }) => {
 				write!(f, "removexattr {} {}", name.to_string_lossy(), target)?;
-			}
-			Self::FsGetXattr(GetXattrOperation { target, name }) => {
-				write!(f, "getxattr {} {}", name.to_string_lossy(), target)?;
 			}
 			Self::UnixConnect(target) => {
 				write!(f, "connect unix:{}", target)?;
