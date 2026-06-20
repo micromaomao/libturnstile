@@ -208,8 +208,8 @@ impl Clone for ForeignFd {
 /// directory, or a completely non-existent place even ignoring the last
 /// component.
 ///
-/// Some syscalls also accepts an empty path, in which case the target is
-/// the base fd itself.
+/// Some syscalls also accepts an empty path or operates on the fd itself, in
+/// which case [`path()`](Self::path) returns an empty `CStr`.
 ///
 /// This struct preserves what was passed by the traced process, except
 /// that the base fd is opened by us from /proc, and so we have a local
