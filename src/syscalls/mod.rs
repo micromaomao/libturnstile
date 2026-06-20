@@ -65,8 +65,8 @@ macro_rules! lazy_syscall_table_name_to_number {
 pub(crate) use lazy_syscall_table_name_to_number;
 
 // _IOW('!', 3, struct seccomp_notif_addfd)
-// This value dos not depend on the architecture, and is stable because it is
-// part of the uAPI.
+// This value does not depend on the architecture, and is stable because
+// it is part of the uAPI.
 const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = 0x40182103;
 
 /// `ioctl(SECCOMP_IOCTL_NOTIF_ADDFD)` wrapper since libseccomp does not expose
