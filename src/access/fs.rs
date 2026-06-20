@@ -604,6 +604,11 @@ impl FsTarget {
 		self.at_fdcwd
 	}
 
+	/// Whether the original syscall used an absolute path.
+	pub fn absolute(&self) -> bool {
+		self.absolute
+	}
+
 	pub fn path(&self) -> &CStr {
 		&self.path
 	}
