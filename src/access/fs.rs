@@ -591,22 +591,22 @@ impl FsTarget {
 		self.path.is_empty()
 	}
 
+	/// Whether the original syscall resolved against the cwd (`AT_FDCWD`).
+	pub fn is_at_fdcwd(&self) -> bool {
+		self.at_fdcwd
+	}
+
+	/// Whether the original syscall used an absolute path.
+	pub fn is_absolute(&self) -> bool {
+		self.absolute
+	}
+
 	/// The raw fd number in the traced process this target's base was derived
 	/// from, if any: the `dirfd` of an `*at` syscall or the fd of an `f*`
 	/// syscall.  `None` for `AT_FDCWD` and for absolute paths, where no fd
 	/// upgrade is needed.
 	pub fn original_fd_num(&self) -> Option<libc::c_int> {
 		self.original_fd_num
-	}
-
-	/// Whether the original syscall resolved against the cwd (`AT_FDCWD`).
-	pub fn at_fdcwd(&self) -> bool {
-		self.at_fdcwd
-	}
-
-	/// Whether the original syscall used an absolute path.
-	pub fn absolute(&self) -> bool {
-		self.absolute
 	}
 
 	pub fn path(&self) -> &CStr {
