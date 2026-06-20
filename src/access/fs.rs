@@ -162,7 +162,7 @@ impl ForeignFd {
 		if ret < 0 {
 			return Err(io::Error::last_os_error());
 		}
-		Ok(u32::from(stx.stx_mode) & libc::S_IFMT == libc::S_IFDIR)
+		Ok((u32::from(stx.stx_mode) & libc::S_IFMT) == libc::S_IFDIR)
 	}
 }
 
