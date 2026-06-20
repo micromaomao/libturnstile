@@ -722,8 +722,8 @@ impl BindMountSandbox {
 			));
 		}
 
-		// Pre-build pointers and an fd scratch buffer *before* fork so the
-		// child closure does no allocation (fork_wait async-signal-safety).
+		// Pre-build pointers and an fd scratch buffer before we fork so
+		// the forked child does not allocate.
 		let child_ptrs: Vec<*const libc::c_char> =
 			child_ns_paths.iter().map(|c| c.as_ptr()).collect();
 		let mut child_fds: Vec<libc::c_int> = vec![-1; child_ns_paths.len()];
@@ -736,7 +736,6 @@ impl BindMountSandbox {
 		let host_fd_raw = host_fd.as_raw_fd();
 		let fork_res = unsafe {
 			fork_wait(|| {
-				// (m0) clone the host source mount.
 				if let Err(e) = nsenter_fn_m0() {
 					return e.raw_os_error().unwrap_or(libc::EIO);
 				}
@@ -744,7 +743,6 @@ impl BindMountSandbox {
 					Ok(tree) => tree,
 					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
 				};
-				// (m1) the rest of the choreography.
 				if let Err(e) = nsenter_fn_m1() {
 					return e.raw_os_error().unwrap_or(libc::EIO);
 				}
