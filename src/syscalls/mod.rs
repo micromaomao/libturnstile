@@ -11,7 +11,6 @@ use libseccomp::{ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
 use log::warn;
 
 use crate::{AccessRequestError, TurnstileTracer, access::fs::ForeignFd};
-use std::os::unix::io::{AsRawFd, RawFd};
 
 pub mod fs;
 pub mod net;
@@ -76,8 +75,8 @@ fn notif_addfd(
 	notify_fd: ScmpFd,
 	id: u64,
 	flags: u32,
-	srcfd: RawFd,
-	newfd: RawFd,
+	srcfd: libc::c_int,
+	newfd: libc::c_int,
 	newfd_flags: u32,
 ) -> io::Result<libc::c_int> {
 	let addfd = libc::seccomp_notif_addfd {
@@ -196,7 +195,7 @@ impl<'a> RequestContext<'a> {
 	/// may not be a valid fd for the caller) is returned.
 	pub fn install_fd_and_respond(
 		&mut self,
-		srcfd: RawFd,
+		srcfd: libc::c_int,
 		cloexec: bool,
 	) -> Result<i64, AccessRequestError> {
 		if !self.valid {
@@ -225,8 +224,8 @@ impl<'a> RequestContext<'a> {
 	/// invalidated by a signal), this is a no-op.
 	pub fn replace_fd(
 		&mut self,
-		srcfd: RawFd,
-		newfd: RawFd,
+		srcfd: libc::c_int,
+		newfd: libc::c_int,
 		cloexec: bool,
 	) -> Result<(), AccessRequestError> {
 		if !self.valid {
