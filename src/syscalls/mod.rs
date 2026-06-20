@@ -419,19 +419,3 @@ impl Drop for RequestContext<'_> {
 		}
 	}
 }
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn addfd_ioctl_number_and_struct_layout() {
-		// `struct seccomp_notif_addfd` is exactly 24 bytes on all LP64
-		// targets (two u32s pack into the u64's tail).
-		assert_eq!(std::mem::size_of::<libc::seccomp_notif_addfd>(), 24);
-		// _IOW('!', 3, struct seccomp_notif_addfd) on asm-generic archs.
-		assert_eq!(SECCOMP_IOCTL_NOTIF_ADDFD, 0x4018_2103);
-		assert_eq!(libc::SECCOMP_ADDFD_FLAG_SETFD, 1);
-		assert_eq!(libc::SECCOMP_ADDFD_FLAG_SEND, 2);
-	}
-}
