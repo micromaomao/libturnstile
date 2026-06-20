@@ -208,8 +208,8 @@ impl Clone for ForeignFd {
 /// directory, or a completely non-existent place even ignoring the last
 /// component.
 ///
-/// Some syscalls also accepts an empty path, in which case the target is
-/// the base fd itself.
+/// Some syscalls also accepts an empty path or operates on the fd itself,
+/// in which case [`path()`](Self::path) returns an empty `CStr`.
 ///
 /// This struct preserves what was passed by the traced process, except
 /// that the base fd is opened by us from /proc, and so we have a local
@@ -229,6 +229,23 @@ pub struct FsTarget {
 	/// Whether to avoid following the final symlink component when resolving
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
+
+	/// Where the base fd of this target came from in the original syscall.
+	pub(crate) original_handle: OriginalHandle,
+}
+
+/// Describes where a target's base fd came from in the original syscall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginalHandle {
+	/// An explicit fd (the `dirfd` of an `*at` syscall or the fd of an
+	/// `f*` syscall) was passed.  This stores the passed in number.
+	Fd(libc::c_int),
+
+	/// AT_FDCWD, or a relative path was used with a path-only syscall.
+	Cwd,
+
+	/// An absolute path was used.
+	Root,
 }
 
 fn trim_leading_slashes(path: &CStr) -> &CStr {
@@ -278,6 +295,11 @@ impl FsTarget {
 			dfd,
 			path: path.to_owned(),
 			no_follow: false,
+			original_handle: if absolute {
+				OriginalHandle::Root
+			} else {
+				OriginalHandle::Cwd
+			},
 		})
 	}
 
@@ -306,6 +328,7 @@ impl FsTarget {
 					.map_err(|e| AccessRequestError::OpenFd(root_path, e))?,
 				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
+				original_handle: OriginalHandle::Root,
 			});
 		}
 
@@ -315,10 +338,17 @@ impl FsTarget {
 			));
 		}
 
+		let dfd_arg = req.arg(dfd_arg_index as usize) as libc::c_int;
+		let at_fdcwd = dfd_arg == libc::AT_FDCWD;
 		Ok(Self {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
+			original_handle: if at_fdcwd {
+				OriginalHandle::Cwd
+			} else {
+				OriginalHandle::Fd(dfd_arg)
+			},
 		})
 	}
 
@@ -326,11 +356,13 @@ impl FsTarget {
 		req: &mut RequestContext,
 		fd_arg_index: u8,
 	) -> Result<Self, AccessRequestError> {
+		let original_fd_num = req.arg(fd_arg_index as usize) as libc::c_int;
 		let fd = req.arg_to_fd(fd_arg_index as usize)?;
 		Ok(Self {
 			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
+			original_handle: OriginalHandle::Fd(original_fd_num),
 		})
 	}
 
@@ -452,6 +484,7 @@ impl FsTarget {
 			dfd: self.open_target_dfd_in_root(root)?,
 			path: self.path.clone(),
 			no_follow: self.no_follow,
+			original_handle: self.original_handle,
 		})
 	}
 
@@ -465,8 +498,9 @@ impl FsTarget {
 	/// cases.  If the path ends with a ".", the returned "parent" will be
 	/// the part without the ".", and the returned "file name" will be "."
 	/// A path ending with a "/" or an empty path will be treated as if it
-	/// ended with "/.".  If the path ends with "/..", the parent of the
-	/// dfd will be returned, and the file name will be ".".
+	/// ended with "/.".  If the path ends with "/..", the dir after
+	/// resolving the .. will be returned as the "parent", and the file
+	/// name will be ".".
 	pub fn open_target_dir(&self) -> Result<(ForeignFd, &CStr), io::Error> {
 		let p = self.path.to_bytes();
 		let p_with_nul = self.path.to_bytes_with_nul();
@@ -552,8 +586,23 @@ impl FsTarget {
 		Ok(OsString::from_vec(result))
 	}
 
+	/// The base fd of the target, which may be the root of the process
+	/// being traced if the path is absolute, or a newly opened current
+	/// working directory of the traced process if AT_FDCWD is used.
 	pub fn dfd(&self) -> &ForeignFd {
 		&self.dfd
+	}
+
+	/// Whether this target carries an empty path, i.e. it refers directly to
+	/// an already-open file descriptor (an `f*` syscall, or an `*at` syscall
+	/// with `AT_EMPTY_PATH`) rather than a path to resolve.
+	pub fn is_empty_path(&self) -> bool {
+		self.path.is_empty()
+	}
+
+	/// The actual base as used by the original syscall.
+	pub fn get_original_handle(&self) -> OriginalHandle {
+		self.original_handle
 	}
 
 	pub fn path(&self) -> &CStr {
