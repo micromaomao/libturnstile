@@ -270,7 +270,7 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"setxattr",
-		|req, target| handle_setxattr(req, target, 1, 2, 3, 4),
+		|req, target| handle_setxattr_like(req, target, 1, 2, 3, 4),
 		0,
 	),
 	(
@@ -278,13 +278,13 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 		|req, target| {
 			let mut target = target;
 			target.no_follow = true;
-			handle_setxattr(req, target, 1, 2, 3, 4)
+			handle_setxattr_like(req, target, 1, 2, 3, 4)
 		},
 		0,
 	),
 	(
 		"removexattr",
-		|req, target| handle_removexattr(req, target, 1),
+		|req, target| handle_removexattr_like(req, target, 1),
 		0,
 	),
 	(
@@ -292,7 +292,7 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 		|req, target| {
 			let mut target = target;
 			target.no_follow = true;
-			handle_removexattr(req, target, 1)
+			handle_removexattr_like(req, target, 1)
 		},
 		0,
 	),
@@ -604,24 +604,17 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"fsetxattr",
-		|req, target| handle_setxattr(req, target, 1, 2, 3, 4),
+		|req, target| handle_setxattr_like(req, target, 1, 2, 3, 4),
 		0,
 	),
 	(
 		"fremovexattr",
-		|req, target| handle_removexattr(req, target, 1),
+		|req, target| handle_removexattr_like(req, target, 1),
 		0,
 	),
 ];
 
-/// Maximum xattr value size we are willing to copy out of the traced
-/// process (matches the kernel's `XATTR_SIZE_MAX`).
-const XATTR_SIZE_MAX: usize = 65536;
-
-/// Parse a `setxattr`-family syscall into a [`SetXattrOperation`].  The
-/// `*_arg` indices select the name/value/size/flags arguments, which
-/// differ only by whether argument 0 is a path or a descriptor.
-fn handle_setxattr(
+fn handle_setxattr_like(
 	req: &mut RequestContext,
 	target: FsTarget,
 	name_arg: usize,
@@ -632,9 +625,11 @@ fn handle_setxattr(
 	let name_ptr = req.arg(name_arg) as *const libc::c_char;
 	let name = req.cstr_from_target_memory(name_ptr)?;
 	let size = req.arg(size_arg) as usize;
+	// include/uapi/linux/limits.h
+	const XATTR_SIZE_MAX: usize = 65536;
 	if size > XATTR_SIZE_MAX {
 		return Err(AccessRequestError::InvalidSyscallData(
-			"setxattr value exceeds XATTR_SIZE_MAX",
+			"setxattr value size exceeds XATTR_SIZE_MAX",
 		));
 	}
 	let value_ptr = req.arg(value_arg) as *const u8;
@@ -647,8 +642,7 @@ fn handle_setxattr(
 	})))
 }
 
-/// Parse a `removexattr`-family syscall into a [`RemoveXattrOperation`].
-fn handle_removexattr(
+fn handle_removexattr_like(
 	req: &mut RequestContext,
 	target: FsTarget,
 	name_arg: usize,
