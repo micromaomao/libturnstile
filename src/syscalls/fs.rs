@@ -3,8 +3,9 @@ use libseccomp::ScmpFilterContext;
 use crate::{
 	AccessRequestError, TurnstileTracerError,
 	access::fs::{
-		CreateKind, CreateOperation, ExecOperation, FsTarget, LinkOperation, OpenOperation,
-		RenameOperation, UnlinkOperation,
+		ChmodOperation, ChownOperation, CreateKind, CreateOperation, ExecOperation, FsTarget,
+		GetXattrOperation, LinkOperation, OpenOperation, RemoveXattrOperation, RenameOperation,
+		SetXattrOperation, TruncateOperation, UnlinkOperation,
 	},
 	access::{
 		AccessRequest, Operation,
@@ -223,6 +224,92 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 		|req, target| handle_stat_like(req, target, true),
 		0,
 	),
+	(
+		"chmod",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(1) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"chown",
+		|req, target| {
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"lchown",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"truncate",
+		|req, target| {
+			Ok(fsop(FsTruncate(TruncateOperation {
+				target,
+				length: req.arg(1) as i64,
+			})))
+		},
+		0,
+	),
+	(
+		"getxattr",
+		|req, target| handle_getxattr_like(req, target, 1),
+		0,
+	),
+	(
+		"lgetxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_getxattr_like(req, target, 1)
+		},
+		0,
+	),
+	(
+		"setxattr",
+		|req, target| handle_setxattr_like(req, target, 1, 2, 3, 4),
+		0,
+	),
+	(
+		"lsetxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_setxattr_like(req, target, 1, 2, 3, 4)
+		},
+		0,
+	),
+	(
+		"removexattr",
+		|req, target| handle_removexattr_like(req, target, 1),
+		0,
+	),
+	(
+		"lremovexattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_removexattr_like(req, target, 1)
+		},
+		0,
+	),
 ];
 
 // (name, handler, arg index of the dfd, arg index of the path, arg index of AT_* flags or None if no such flag)
@@ -302,6 +389,46 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	),
 	("execveat", handle_exec_like, 0, 1, Some(4)),
 	("readlinkat", handle_readlink_like, 0, 1, None),
+	(
+		"fchmodat",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(2) as u32,
+			})))
+		},
+		0,
+		1,
+		// The raw `fchmodat` syscall takes no flags argument (only
+		// `dfd`, `path`, `mode`); AT_SYMLINK_NOFOLLOW is emulated by
+		// glibc.  `fchmodat2` below carries the real flags.
+		None,
+	),
+	(
+		"fchmodat2",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(2) as u32,
+			})))
+		},
+		0,
+		1,
+		Some(3),
+	),
+	(
+		"fchownat",
+		|req, target| {
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(2) as u32,
+				gid: req.arg(3) as u32,
+			})))
+		},
+		0,
+		1,
+		Some(4),
+	),
 	(
 		"newfstatat",
 		|req, target| {
@@ -437,6 +564,12 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 ];
 
 // (name, handler, fd)
+//
+// `fchmod`/`fchown`/`ftruncate`/`fsetxattr`/`fremovexattr` only take an
+// already-open descriptor (argument 0); the remaining arguments carry
+// the payload.  When such a call lands on a stale fd, `ManagedBindMountSandbox`
+// upgrades or proxies it so it operates against the live layout (see the
+// held-fd dispatch in `sandbox::upgrade`).
 const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 	("fchdir", handle_chdir_like, 0),
 	(
@@ -449,7 +582,101 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 		|req, target| handle_stat_like(req, target, false),
 		0,
 	),
+	(
+		"fchmod",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(1) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"fchown",
+		|req, target| {
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"ftruncate",
+		|req, target| {
+			Ok(fsop(FsTruncate(TruncateOperation {
+				target,
+				length: req.arg(1) as i64,
+			})))
+		},
+		0,
+	),
+	(
+		"fgetxattr",
+		|req, target| handle_getxattr_like(req, target, 1),
+		0,
+	),
+	(
+		"fsetxattr",
+		|req, target| handle_setxattr_like(req, target, 1, 2, 3, 4),
+		0,
+	),
+	(
+		"fremovexattr",
+		|req, target| handle_removexattr_like(req, target, 1),
+		0,
+	),
 ];
+
+fn handle_getxattr_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	Ok(fsop(FsGetXattr(GetXattrOperation { target, name })))
+}
+
+fn handle_setxattr_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+	value_arg: usize,
+	size_arg: usize,
+	flags_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	let size = req.arg(size_arg) as usize;
+	// include/uapi/linux/limits.h
+	const XATTR_SIZE_MAX: usize = 65536;
+	if size > XATTR_SIZE_MAX {
+		return Err(AccessRequestError::InvalidSyscallData(
+			"setxattr value size exceeds XATTR_SIZE_MAX",
+		));
+	}
+	let value_ptr = req.arg(value_arg) as *const u8;
+	let value = req.bytes_from_target_memory(value_ptr, size)?;
+	Ok(fsop(FsSetXattr(SetXattrOperation {
+		target,
+		name,
+		value,
+		flags: req.arg(flags_arg) as i32,
+	})))
+}
+
+fn handle_removexattr_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	Ok(fsop(FsRemoveXattr(RemoveXattrOperation { target, name })))
+}
 
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
