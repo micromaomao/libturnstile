@@ -147,12 +147,12 @@ impl std::fmt::Display for MountAttributes {
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	namespaces: ManagedNamespaces,
+	/// A fd to the root tmpfs opened inside m0 (the outer mount namespace).
 	root_tmpfs: MountObj,
-	/// O_PATH fd to "/" opened inside the m0 (outer) mount namespace.
-	/// Used as the dirfd when resolving caller-provided host paths so
-	/// that the resulting fd is associated with m0's mount namespace and
-	/// is therefore acceptable to `open_tree()` once the helper process
-	/// enters m0.
+	/// O_PATH fd to the actual, outside-sandbox "/" opened inside m0.  Used as
+	/// the dirfd when resolving caller-provided host paths so that the
+	/// resulting fd is associated with m0's mount namespace and is therefore
+	/// acceptable to `open_tree()` once the helper process enters m0.
 	host_root_fd: ForeignFd,
 	/// O_PATH fd to the scratch tmpfs root inside m1.  The scratch is
 	/// a brand-new tmpfs (distinct from `root_tmpfs`) that is made m1's

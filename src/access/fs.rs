@@ -111,20 +111,8 @@ impl ForeignFd {
 		})
 	}
 
-	/// Return the kernel mount id (`STATX_MNT_ID`) of the mount this fd
-	/// is resolved through, using `statx(2)` with `AT_EMPTY_PATH`.
-	///
-	/// The mount id uniquely identifies a `struct mount` for the
-	/// lifetime of that mount and is used to detect when a held fd has
-	/// become "stale" relative to the current mount layout (see the
-	/// fd-upgrade design), as well as to join entries when refreshing
-	/// the mount tree from `/proc/<pid>/mountinfo`.
-	///
-	/// Note: the kernel only fills in `stx_mnt_id` when `STATX_MNT_ID`
-	/// is requested *and* set in the returned `stx_mask`.  If the
-	/// running kernel does not support it, an `ENOSYS`/`EINVAL`-style
-	/// error is surfaced, or - if the syscall succeeds but the mask bit
-	/// is unset - `ENODATA` is returned.
+	/// Return the (non-unique) kernel mount id of this fd.  This matches with
+	/// the first field of /proc/.../mountinfo.
 	pub fn mnt_id(&self) -> Result<u64, io::Error> {
 		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
 		let ret = unsafe {
@@ -137,17 +125,28 @@ impl ForeignFd {
 			)
 		};
 		if ret < 0 {
+			error!(
+				"statx(AT_EMPTY_PATH) failed on fd {}: {}",
+				self.local_fd,
+				io::Error::last_os_error()
+			);
 			return Err(io::Error::last_os_error());
 		}
 		if stx.stx_mask & libc::STATX_MNT_ID == 0 {
+			let try_realpath = self
+				.readlink()
+				.ok()
+				.unwrap_or_else(|| OsString::from("???"));
+			error!(
+				"statx(AT_EMPTY_PATH) on fd {} (-> {:?}) did not return mount id",
+				self.local_fd, try_realpath
+			);
 			return Err(io::Error::from_raw_os_error(libc::ENODATA));
 		}
 		Ok(stx.stx_mnt_id)
 	}
 
-	/// Whether the inode this fd refers to is a directory, via `statx(2)`
-	/// with `AT_EMPTY_PATH`.  Works on an `O_PATH` fd (directory-ness is
-	/// an inode property).
+	/// Whether the inode this fd refers to is a directory.
 	pub fn is_dir(&self) -> Result<bool, io::Error> {
 		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
 		let ret = unsafe {
