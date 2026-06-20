@@ -27,6 +27,17 @@ pub struct ForeignFd {
 	pub(crate) local_fd: libc::c_int,
 }
 
+/// `(st_dev, st_ino)` identity of an inode, as returned by `statx(2)`.
+/// Two fds compare equal iff they refer to the same inode on the same
+/// superblock.  In particular, bind mounts of the same inode compare
+/// equal, which is what we want.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InodeId {
+	pub dev_major: u32,
+	pub dev_minor: u32,
+	pub ino: u64,
+}
+
 impl ForeignFd {
 	pub(crate) fn from_path_with_flags<P: AsRef<CStr>>(
 		path: P,
@@ -44,7 +55,11 @@ impl ForeignFd {
 		Self::from_path_with_flags(path, libc::O_PATH | libc::O_CLOEXEC)
 	}
 
-	/// Read the path of an open file descriptor via /proc/self/fd.
+	/// Read the path of an open file descriptor via /proc/self/fd.  Note
+	/// that the result might not be a real path, for example if the file
+	/// is deleted, " (deleted)" will be added.  For things like pipes or
+	/// sockets, the result will be e.g. "pipe:[12345]" or
+	/// "socket:[12345]".
 	pub fn readlink(&self) -> Result<OsString, io::Error> {
 		// /proc/self/fd/{fd} is always valid ASCII, so a format! string with a
 		// manual NUL terminator is safe to pass to readlink.
@@ -61,11 +76,92 @@ impl ForeignFd {
 			return Err(io::Error::last_os_error());
 		}
 		buf.truncate(ret as usize);
+		debug!(
+			"readlink of fd {} returned {:?}",
+			self.local_fd,
+			OsStr::from_bytes(&buf)
+		);
 		// readlink does not include a NUL terminator
 		if buf.len() > 1 && buf.last().copied() == Some(b'/') {
 			buf.pop();
 		}
 		Ok(OsString::from_vec(buf))
+	}
+
+	/// Return the `(st_dev, st_ino)` identity of the inode this fd
+	/// refers to, using `statx(2)` with `AT_EMPTY_PATH`.
+	pub fn inode_id(&self) -> Result<InodeId, io::Error> {
+		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+		let ret = unsafe {
+			libc::statx(
+				self.local_fd,
+				c"".as_ptr(),
+				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
+				libc::STATX_INO,
+				&mut stx,
+			)
+		};
+		if ret < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(InodeId {
+			dev_major: stx.stx_dev_major,
+			dev_minor: stx.stx_dev_minor,
+			ino: stx.stx_ino,
+		})
+	}
+
+	/// Return the (non-unique) kernel mount id of this fd.  This matches with
+	/// the first field of /proc/.../mountinfo.
+	pub fn mnt_id(&self) -> Result<u64, io::Error> {
+		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+		let ret = unsafe {
+			libc::statx(
+				self.local_fd,
+				c"".as_ptr(),
+				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
+				libc::STATX_MNT_ID,
+				&mut stx,
+			)
+		};
+		if ret < 0 {
+			let err = io::Error::last_os_error();
+			error!(
+				"statx(AT_EMPTY_PATH) failed on fd {}: {}",
+				self.local_fd, err
+			);
+			return Err(err);
+		}
+		if stx.stx_mask & libc::STATX_MNT_ID == 0 {
+			let try_realpath = self
+				.readlink()
+				.ok()
+				.unwrap_or_else(|| OsString::from("???"));
+			error!(
+				"statx(AT_EMPTY_PATH) on fd {} (-> {:?}) did not return mount id",
+				self.local_fd, try_realpath
+			);
+			return Err(io::Error::from_raw_os_error(libc::ENODATA));
+		}
+		Ok(stx.stx_mnt_id)
+	}
+
+	/// Whether the inode this fd refers to is a directory.
+	pub fn is_dir(&self) -> Result<bool, io::Error> {
+		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+		let ret = unsafe {
+			libc::statx(
+				self.local_fd,
+				c"".as_ptr(),
+				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
+				libc::STATX_TYPE,
+				&mut stx,
+			)
+		};
+		if ret < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok((u32::from(stx.stx_mode) & libc::S_IFMT) == libc::S_IFDIR)
 	}
 }
 
