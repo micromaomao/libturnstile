@@ -1,7 +1,4 @@
-use libseccomp::{ScmpFilterContext, ScmpSyscall};
-use smallvec::{SmallVec, smallvec};
-
-use std::sync::OnceLock;
+use libseccomp::ScmpFilterContext;
 
 use crate::{
 	AccessRequestError, TurnstileTracerError,
@@ -554,10 +551,14 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 
 // (name, handler, fd)
 //
-// `fchmod`/`fchown`/`ftruncate`/`fsetxattr`/`fremovexattr` operate on an
+// `fchmod`/`fchown`/`ftruncate`/`fsetxattr`/`fremovexattr` only take an
 // already-open descriptor (argument 0); the remaining arguments carry
-// the payload.  Their targets are bare fds, so the fd-upgrade path
-// proxies them in m1 when the descriptor's mount is stale (§11.2).
+// the payload.  When such a call lands on a stale fd — one still pinned
+// to an old, read-only mount after the file has since been made
+// read-write to the sandbox — the descriptor cannot be re-pointed via
+// `ADDFD` without losing the app's read/write position and open state,
+// so `ManagedBindMountSandbox` proxies the operation against the live
+// layout instead.
 const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 	("fchdir", handle_chdir_like, 0),
 	(
@@ -785,107 +786,4 @@ pub(crate) fn handle_notification<'a>(
 	}
 
 	Ok(None)
-}
-
-/// Cache of the syscall numbers the §11 fd-upgrade dispatch needs to
-/// special-case, resolved once for the native architecture.
-struct UpgradeSyscalls {
-	open: Option<ScmpSyscall>,
-	openat: Option<ScmpSyscall>,
-	openat2: Option<ScmpSyscall>,
-	creat: Option<ScmpSyscall>,
-	chdir: Option<ScmpSyscall>,
-	fchdir: Option<ScmpSyscall>,
-}
-
-fn upgrade_syscalls() -> &'static UpgradeSyscalls {
-	static ONCE: OnceLock<UpgradeSyscalls> = OnceLock::new();
-	ONCE.get_or_init(|| {
-		let n = |name: &str| ScmpSyscall::from_name(name).ok();
-		UpgradeSyscalls {
-			open: n("open"),
-			openat: n("openat"),
-			openat2: n("openat2"),
-			creat: n("creat"),
-			chdir: n("chdir"),
-			fchdir: n("fchdir"),
-		}
-	})
-}
-
-/// How a freshly-resolved `openat`-family syscall should be re-opened in
-/// m1: the open flags, creation mode, and `openat2` resolve flags (0 for
-/// the non-`openat2` variants).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ReopenParams {
-	pub flags: u64,
-	pub mode: u64,
-	pub resolve: u64,
-}
-
-/// If `syscall` is an `open`-family syscall, return the parameters needed
-/// to faithfully re-open the target in m1.  Reuses the same argument
-/// layout the request-parsing handlers use, rather than re-parsing.
-pub(crate) fn open_reopen_params(
-	req: &mut RequestContext,
-) -> Result<Option<ReopenParams>, AccessRequestError> {
-	let s = upgrade_syscalls();
-	let syscall = req.syscall();
-	if Some(syscall) == s.open {
-		Ok(Some(ReopenParams {
-			flags: req.arg(1),
-			mode: req.arg(2),
-			resolve: 0,
-		}))
-	} else if Some(syscall) == s.openat {
-		Ok(Some(ReopenParams {
-			flags: req.arg(2),
-			mode: req.arg(3),
-			resolve: 0,
-		}))
-	} else if Some(syscall) == s.openat2 {
-		let open_how_ptr = req.arg(2) as *const libc::open_how;
-		let how = req.value_from_target_memory(open_how_ptr)?;
-		Ok(Some(ReopenParams {
-			flags: how.flags,
-			mode: how.mode,
-			resolve: how.resolve,
-		}))
-	} else if Some(syscall) == s.creat {
-		Ok(Some(ReopenParams {
-			flags: (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64,
-			mode: req.arg(1),
-			resolve: 0,
-		}))
-	} else {
-		Ok(None)
-	}
-}
-
-/// Whether `syscall` is `chdir` or `fchdir`.
-pub(crate) fn is_chdir(syscall: ScmpSyscall) -> bool {
-	let s = upgrade_syscalls();
-	Some(syscall) == s.chdir || Some(syscall) == s.fchdir
-}
-
-/// Argument indices of any real `dirfd`s this syscall accepts, derived
-/// from the existing request-parsing tables so the fd-upgrade path does
-/// not re-implement syscall parsing.  `openat`-family syscalls are
-/// excluded (they are handled by re-opening the result instead).
-pub(crate) fn dfd_arg_indices(syscall: ScmpSyscall) -> SmallVec<[u8; 2]> {
-	let s = upgrade_syscalls();
-	if Some(syscall) == s.openat || Some(syscall) == s.openat2 {
-		return smallvec![];
-	}
-	for &(sys, _h, dfd, _path, _flags) in fs_syscalls_dfd_path_table() {
-		if sys == syscall {
-			return smallvec![dfd];
-		}
-	}
-	for &(sys, _h, dfd1, _p1, dfd2, _p2, _flags) in fs_syscall_dfd_path_dfd_path_table() {
-		if sys == syscall {
-			return smallvec![dfd1, dfd2];
-		}
-	}
-	smallvec![]
 }

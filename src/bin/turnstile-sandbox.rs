@@ -464,8 +464,8 @@ fn tracing_thread(context: &'static Context) {
 					continue;
 				}
 				// Finalize via the sandbox, which transparently upgrades
-				// the traced process's fd view (§11) on allow, or fails
-				// the syscall on deny.
+				// the traced process's fd view on allow, or fails the
+				// syscall on deny.
 				let handle = context.sandbox.new_request_handle(request, req_ctx);
 				let res = if send_eperm {
 					handle.deny(libc::EPERM)

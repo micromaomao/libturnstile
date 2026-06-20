@@ -144,6 +144,26 @@ impl ForeignFd {
 		}
 		Ok(stx.stx_mnt_id)
 	}
+
+	/// Whether the inode this fd refers to is a directory, via `statx(2)`
+	/// with `AT_EMPTY_PATH`.  Works on an `O_PATH` fd (directory-ness is
+	/// an inode property).
+	pub fn is_dir(&self) -> Result<bool, io::Error> {
+		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+		let ret = unsafe {
+			libc::statx(
+				self.local_fd,
+				c"".as_ptr(),
+				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
+				libc::STATX_TYPE,
+				&mut stx,
+			)
+		};
+		if ret < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(u32::from(stx.stx_mode) & libc::S_IFMT == libc::S_IFDIR)
+	}
 }
 
 impl AsRawFd for ForeignFd {
@@ -215,8 +235,15 @@ pub struct FsTarget {
 	/// descriptor (i.e. [`dfd`](Self::dfd) is the file itself, as for
 	/// `fchmod`/`fchown`/... or an `*at` call with `AT_EMPTY_PATH`),
 	/// rather than a path to be resolved.  Used by the fd-upgrade path to
-	/// decide whether an operation must be proxied in m1 (§11.2).
+	/// identify a held-fd target whose upgradability decides whether to
+	/// swap the fd or proxy the operation.
 	pub(crate) bare_fd: bool,
+
+	/// When [`bare_fd`](Self::bare_fd) is set, the raw fd *number* in the
+	/// traced process that the operation targets (argument 0 of an `f*`
+	/// call, or the `dirfd` of an `AT_EMPTY_PATH` `*at`).  The fd-upgrade
+	/// path needs it to swap the descriptor in place.
+	pub(crate) held_fd_num: Option<libc::c_int>,
 }
 
 fn trim_leading_slashes(path: &CStr) -> &CStr {
@@ -267,6 +294,7 @@ impl FsTarget {
 			path: path.to_owned(),
 			no_follow: false,
 			bare_fd: false,
+			held_fd_num: None,
 		})
 	}
 
@@ -296,6 +324,7 @@ impl FsTarget {
 				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
 				bare_fd: false,
+				held_fd_num: None,
 			});
 		}
 
@@ -312,11 +341,17 @@ impl FsTarget {
 		// process root/cwd (not the file), so the bare-fd property cannot
 		// be recomputed from `path` alone later.
 		let bare_fd = path.as_bytes().is_empty();
+		let held_fd_num = if bare_fd {
+			Some(req.arg(dfd_arg_index as usize) as libc::c_int)
+		} else {
+			None
+		};
 		Ok(Self {
 			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
 			bare_fd,
+			held_fd_num,
 		})
 	}
 
@@ -324,12 +359,14 @@ impl FsTarget {
 		req: &mut RequestContext,
 		fd_arg_index: u8,
 	) -> Result<Self, AccessRequestError> {
+		let held_fd_num = Some(req.arg(fd_arg_index as usize) as libc::c_int);
 		let fd = req.arg_to_fd(fd_arg_index as usize)?;
 		Ok(Self {
 			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
 			bare_fd: true,
+			held_fd_num,
 		})
 	}
 
@@ -451,6 +488,7 @@ impl FsTarget {
 			path: self.path.clone(),
 			no_follow: self.no_follow,
 			bare_fd: self.bare_fd,
+			held_fd_num: self.held_fd_num,
 		})
 	}
 
@@ -561,6 +599,13 @@ impl FsTarget {
 	/// [`bare_fd`](Self::bare_fd)).
 	pub fn is_bare_fd(&self) -> bool {
 		self.bare_fd
+	}
+
+	/// For a [`bare_fd`](Self::bare_fd) target, the raw fd number in the
+	/// traced process the operation targets (see
+	/// [`held_fd_num`](Self::held_fd_num)).
+	pub fn held_fd_num(&self) -> Option<libc::c_int> {
+		self.held_fd_num
 	}
 
 	pub fn path(&self) -> &CStr {
@@ -684,8 +729,9 @@ pub struct UnixBindOperation {
 /// variants).  These are mediated so that, after a grant changes the
 /// live mount layout, a descriptor opened against a now-stale mount can
 /// be transparently re-resolved and the operation re-issued through the
-/// current layout (§11.2).  Path-based variants resolve afresh when the
-/// syscall continues, so only the bare-fd (`f*`) variants need proxying.
+/// current layout.  Path-based variants resolve afresh when the syscall
+/// continues; a held-fd target is swapped if upgradable, otherwise
+/// proxied.
 #[derive(Debug)]
 pub struct ChmodOperation {
 	pub target: FsTarget,

@@ -1,4 +1,4 @@
-//! §11 - per-request fd upgrade machinery.
+//! Per-request fd upgrade machinery.
 //!
 //! [`ManagedBindMountSandbox::new_request_handle`] wraps a yielded
 //! `(AccessRequest, RequestContext)` pair into a [`RequestHandle`].  The
@@ -7,28 +7,42 @@
 //! [`RequestHandle::allow`] or [`RequestHandle::deny`].
 //!
 //! `allow()` transparently makes the traced process's view match the
-//! live bind-mount layout, per the dispatch table in §11.2:
+//! live bind-mount layout:
 //!
 //! * `openat`-family - re-resolve the abspath, open it fresh in m1 (so
 //!   it resolves through the *current* layout), identity-check it, and
 //!   hand the new fd to the app as the syscall's return value via
 //!   `SECCOMP_IOCTL_NOTIF_ADDFD` (SEND).
 //! * `chdir` / `fchdir` - preemptively ensure a mount exists on the
-//!   target (cwd can't be upgraded after the fact, §11.5), then CONTINUE.
-//! * any other `*at` with a real `dirfd` - if the dirfd is stale relative
-//!   to the current layout (`mnt_id` mismatch), m1-open the dirfd's path,
-//!   identity-check, and replace it in place (ADDFD SETFD), then CONTINUE.
-//! * `fchmod` / `fchown` / `ftruncate` / `fsetxattr` / `fremovexattr` on
-//!   a stale file fd - m1-open the path, identity-check, perform the op
-//!   there, and return the result directly (no CONTINUE).
+//!   target (cwd can't be upgraded after the fact), then CONTINUE.
+//! * any other access governed by a held fd whose mount is stale (the
+//!   dirfd of an `*at(dirfd, relpath)`, or the target fd of an
+//!   `f*` / `*at(fd, "", AT_EMPTY_PATH)` metadata op) - the choice
+//!   between swapping the fd and proxying the op comes down to whether
+//!   the held fd is *upgradable* (see [`fd_upgrade_kind`]).  An
+//!   **upgradable** fd (a directory, or an `O_PATH` fd) carries no
+//!   read/write position to lose, so we m1-open its abspath,
+//!   identity-check, and swap a fresh fd in at the same number
+//!   (`ADDFD SETFD`) before CONTINUE - the kernel then resolves / acts
+//!   through the live layout (a swapped `O_PATH` fd reproduces the
+//!   syscall's native `O_PATH` semantics against that layout).  An
+//!   **unupgradable**
+//!   fd (a regular file, …) would lose its `f_pos`/open state on a swap,
+//!   so for the metadata ops we instead perform the op in m1 and return
+//!   the result directly (no swap, no CONTINUE).  `ftruncate` is exempt
+//!   entirely (always CONTINUE): it needs a writable fd, which can only
+//!   sit on a still-writable mount.
 //! * anything else - CONTINUE.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::OnceLock;
 
 use libc::open_how;
+use libseccomp::ScmpSyscall;
 use log::{debug, error, warn};
+use smallvec::{SmallVec, smallvec};
 
 use crate::{
 	AccessRequestError, RequestContext,
@@ -39,7 +53,7 @@ use crate::{
 			RemoveXattrOperation, SetXattrOperation, TruncateOperation,
 		},
 	},
-	syscalls::fs as syscalls_fs,
+	syscalls::fs::{fs_syscall_dfd_path_dfd_path_table, fs_syscalls_dfd_path_table},
 };
 
 use super::{ManagedBindMountSandbox, ManagedMountPoint, MountAttributes};
@@ -50,10 +64,109 @@ fn to_cstring(bytes: &[u8]) -> Option<CString> {
 	CString::new(bytes.to_vec()).ok()
 }
 
+/// Cache of the syscall numbers the fd-upgrade dispatch needs to
+/// special-case, resolved once for the native architecture.
+struct UpgradeSyscalls {
+	open: Option<ScmpSyscall>,
+	openat: Option<ScmpSyscall>,
+	openat2: Option<ScmpSyscall>,
+	creat: Option<ScmpSyscall>,
+	chdir: Option<ScmpSyscall>,
+	fchdir: Option<ScmpSyscall>,
+}
+
+fn upgraded_syscalls() -> &'static UpgradeSyscalls {
+	static ONCE: OnceLock<UpgradeSyscalls> = OnceLock::new();
+	ONCE.get_or_init(|| {
+		let n = |name: &str| ScmpSyscall::from_name(name).ok();
+		UpgradeSyscalls {
+			open: n("open"),
+			openat: n("openat"),
+			openat2: n("openat2"),
+			creat: n("creat"),
+			chdir: n("chdir"),
+			fchdir: n("fchdir"),
+		}
+	})
+}
+
+/// How a freshly-resolved `openat`-family syscall should be re-opened in
+/// m1: the open flags, creation mode, and `openat2` resolve flags (0 for
+/// the non-`openat2` variants).
+#[derive(Debug, Clone, Copy)]
+struct ReopenParams {
+	flags: u64,
+	mode: u64,
+	resolve: u64,
+}
+
+/// If the request's syscall is an `open`-family syscall, return the
+/// parameters needed to faithfully re-open the target in m1.  Reuses the
+/// same argument layout the request-parsing handlers use, rather than
+/// re-parsing.
+fn open_reopen_params(
+	req: &mut RequestContext,
+) -> Result<Option<ReopenParams>, AccessRequestError> {
+	let s = upgraded_syscalls();
+	let syscall = req.syscall();
+	if Some(syscall) == s.open {
+		Ok(Some(ReopenParams {
+			flags: req.arg(1),
+			mode: req.arg(2),
+			resolve: 0,
+		}))
+	} else if Some(syscall) == s.openat {
+		Ok(Some(ReopenParams {
+			flags: req.arg(2),
+			mode: req.arg(3),
+			resolve: 0,
+		}))
+	} else if Some(syscall) == s.openat2 {
+		let open_how_ptr = req.arg(2) as *const libc::open_how;
+		let how = req.value_from_target_memory(open_how_ptr)?;
+		Ok(Some(ReopenParams {
+			flags: how.flags,
+			mode: how.mode,
+			resolve: how.resolve,
+		}))
+	} else if Some(syscall) == s.creat {
+		Ok(Some(ReopenParams {
+			flags: (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64,
+			mode: req.arg(1),
+			resolve: 0,
+		}))
+	} else {
+		Ok(None)
+	}
+}
+
+/// Whether `syscall` is `chdir` or `fchdir`.
+fn is_chdir(syscall: ScmpSyscall) -> bool {
+	let s = upgraded_syscalls();
+	Some(syscall) == s.chdir || Some(syscall) == s.fchdir
+}
+
+/// Argument indices of any real `dirfd`s this syscall accepts, derived
+/// from the existing request-parsing tables, for use by fd upgrade logic
+/// in ManagedBindMountSandbox.
+fn dfd_arg_indices(syscall: ScmpSyscall) -> SmallVec<[u8; 2]> {
+	for &(sys, _h, dfd, _path, _flags) in fs_syscalls_dfd_path_table() {
+		if sys == syscall {
+			return smallvec![dfd];
+		}
+	}
+	for &(sys, _h, dfd1, _p1, dfd2, _p2, _flags) in fs_syscall_dfd_path_dfd_path_table() {
+		if sys == syscall {
+			return smallvec![dfd1, dfd2];
+		}
+	}
+	smallvec![]
+}
+
 impl ManagedBindMountSandbox {
 	/// Wrap a request yielded by the tracer into a [`RequestHandle`]
 	/// bound to this sandbox.  The handle's [`RequestHandle::allow`]
-	/// performs the §11 fd-upgrade dispatch against this sandbox's live
+	/// performs the fd-upgrade dispatch against this sandbox's live
 	/// mount layout.
 	pub fn new_request_handle<'s, 't>(
 		&'s self,
@@ -91,7 +204,7 @@ impl ManagedBindMountSandbox {
 
 	/// Open `path` (absolute, in m1's view) with `how`, retrying once on
 	/// failure or inode-identity mismatch.  When `expected` is `Some`,
-	/// the freshly-opened fd's `(dev, ino)` must equal it (§11.3);
+	/// the freshly-opened fd's `(dev, ino)` must equal it;
 	/// otherwise the open is retried, and after two failures `None` is
 	/// returned (the caller fails closed).
 	fn m1_open_checked(
@@ -155,25 +268,31 @@ impl ManagedBindMountSandbox {
 
 		// openat-family: always substitute a fresh fd resolved through
 		// the current layout.
-		if let Some(params) = syscalls_fs::open_reopen_params(ctx)? {
+		if let Some(params) = open_reopen_params(ctx)? {
 			return self.allow_open(fsop, params, ctx);
 		}
 
-		// chdir/fchdir: preemptively ensure a covering mount (§11.5).
-		if syscalls_fs::is_chdir(syscall) {
+		// chdir/fchdir: preemptively ensure a covering mount before the
+		// kernel resolves cwd (cwd can't be upgraded after the fact).
+		if is_chdir(syscall) {
 			return self.allow_chdir(fsop, ctx);
 		}
 
-		// File-fd metadata/content ops on a bare fd: proxy in m1 if the
-		// fd is stale.  Path-based variants resolve afresh when the
-		// syscall continues, so they fall through to the dirfd-upgrade /
-		// CONTINUE paths below.
-		if let Some(target) = modify_op_bare_fd_target(fsop) {
+		// A metadata/content op whose target *is* an already-open
+		// descriptor (an `f*` call, or an `*at` with `AT_EMPTY_PATH`):
+		// the access is governed by that held fd, so whether we swap it
+		// or proxy the op depends on the fd's upgradability, not on the
+		// fact that it is a bare fd.  Path-based variants instead carry
+		// no target fd; they resolve afresh when the syscall continues
+		// (any `dirfd` they do carry is handled by the dirfd-upgrade path
+		// below).
+		if let Some(target) = modify_op_held_fd_target(fsop) {
 			return self.allow_modify_fd(fsop, target, ctx);
 		}
 
-		// Any other *at with a real dirfd: upgrade it in place if stale.
-		let dfds = syscalls_fs::dfd_arg_indices(syscall);
+		// Any other `*at` with a real dirfd: the dirfd governs the
+		// resolution, so upgrade it in place if its mount is stale.
+		let dfds = dfd_arg_indices(syscall);
 		if !dfds.is_empty() {
 			return self.allow_at_dirfds(&dfds, ctx);
 		}
@@ -186,7 +305,7 @@ impl ManagedBindMountSandbox {
 	fn allow_open(
 		&self,
 		fsop: &FsOperation,
-		params: syscalls_fs::ReopenParams,
+		params: ReopenParams,
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
 		let FsOperation::FsOpen(op) = fsop else {
@@ -262,8 +381,9 @@ impl ManagedBindMountSandbox {
 	}
 
 	/// `chdir` / `fchdir`: ensure a covering mount exists before letting
-	/// the syscall through (§11.5).  cwd cannot be upgraded after the
-	/// fact, so the mount must be in place when the kernel sets `pwd`.
+	/// the syscall through.  cwd cannot be upgraded after the fact (there
+	/// is no fd to swap), so the mount must be in place when the kernel
+	/// sets `pwd`.
 	fn allow_chdir(
 		&self,
 		fsop: &FsOperation,
@@ -308,12 +428,16 @@ impl ManagedBindMountSandbox {
 
 	/// Generic `*at` syscalls with a real `dirfd`: replace any stale
 	/// dirfd in place so the kernel resolves the relative path through
-	/// the current layout.
+	/// the current layout.  A dirfd that resolves a relative path is by
+	/// definition a directory (or `O_PATH`) fd, i.e. always upgradable;
+	/// the upgradability check is kept for robustness (a non-directory fd
+	/// passed here would fail `ENOTDIR` natively if left untouched).
 	fn allow_at_dirfds(
 		&self,
 		dfd_indices: &[u8],
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
+		let pid = ctx.pid();
 		for &idx in dfd_indices {
 			let raw = ctx.arg(idx as usize) as libc::c_int;
 			if raw == libc::AT_FDCWD || raw < 0 {
@@ -327,6 +451,11 @@ impl ManagedBindMountSandbox {
 					continue;
 				}
 			};
+			// Only swap an upgradable fd; anything else would lose state
+			// on a swap (and a regular-file dirfd is a native `ENOTDIR`).
+			if !fd_upgrade_kind(pid, raw, &app_fd).is_upgradable() {
+				continue;
+			}
 			let cur_mnt = match app_fd.mnt_id() {
 				Ok(m) => m,
 				Err(e) => {
@@ -358,8 +487,9 @@ impl ManagedBindMountSandbox {
 			let how = build_path_open_how();
 			let m1fd = match self.m1_open_checked(&path_c, &how, expected) {
 				Some(fd) => fd,
-				// Per §11.3: on failure, skip the upgrade (plain CONTINUE
-				// without replacement) rather than breaking the syscall.
+				// On a failed identity check, skip the upgrade (plain
+				// CONTINUE without replacement) rather than breaking the
+				// syscall.
 				None => continue,
 			};
 			warn!(
@@ -376,17 +506,45 @@ impl ManagedBindMountSandbox {
 		ctx.send_continue()
 	}
 
-	/// `fchmod` / `fchown` / `ftruncate` / `fsetxattr` / `fremovexattr`
-	/// (and any `*at` modify call with `AT_EMPTY_PATH`): if the file fd
-	/// is stale, perform the op in m1 against the current layout and
-	/// return the result directly.
+	/// A metadata/content op whose target *is* an already-open
+	/// descriptor (`fchmod` / `fchown` / `fsetxattr` / `fremovexattr`, or
+	/// any `*at` modify call with `AT_EMPTY_PATH`): make the op act
+	/// against the live layout.  How depends on the held fd:
+	///
+	/// * an **upgradable** fd (directory or `O_PATH`) is swapped in place
+	///   for a fresh one resolved on the live layout, then CONTINUE - so
+	///   the op acts through the current mount (the swapped `O_PATH` fd
+	///   reproduces the syscall's native `O_PATH` semantics, be that
+	///   `EBADF` for `fchmod` or a valid `AT_EMPTY_PATH` `fchownat`);
+	/// * an **unupgradable** fd (a regular file, …) would lose its
+	///   `f_pos`/open state on a swap, so the op is performed in m1 and
+	///   the result returned directly.
+	///
+	/// `ftruncate` is exempt: it needs a writable fd, which can only have
+	/// been opened on a still-writable mount, so CONTINUE acts correctly.
 	fn allow_modify_fd(
 		&self,
 		fsop: &FsOperation,
 		target: &FsTarget,
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
+		// `ftruncate` needs a writable fd; a writable fd implies a
+		// still-writable mount, so it is never stale in a way we must
+		// fix - always CONTINUE.
+		if matches!(fsop, FsOperation::FsTruncate(_)) {
+			return ctx.send_continue();
+		}
+
 		let app_fd = target.dfd();
+		// The app's raw fd number, needed to swap an upgradable fd in
+		// place.  Without a real fd number (e.g. `AT_FDCWD`, whose cwd is
+		// kept current by the chdir path) there is nothing to address, so
+		// CONTINUE.
+		let raw = match target.held_fd_num() {
+			Some(raw) if raw >= 0 => raw,
+			_ => return ctx.send_continue(),
+		};
+
 		let cur_mnt = match app_fd.mnt_id() {
 			Ok(m) => m,
 			Err(_) => return ctx.send_continue(),
@@ -404,6 +562,39 @@ impl ManagedBindMountSandbox {
 			return ctx.send_continue();
 		};
 		let expected = app_fd.inode_id().ok();
+
+		let kind = fd_upgrade_kind(ctx.pid(), raw, app_fd);
+		if kind.is_upgradable() {
+			// Swap a fresh fd in at the same number and CONTINUE.  Open
+			// it `O_PATH` for an `O_PATH` fd (preserving its native
+			// semantics for the syscall — e.g. `EBADF` for `fchmod`, or
+			// a valid `AT_EMPTY_PATH` `fchownat`) and as a real directory
+			// otherwise, so either way the op acts against the live
+			// mount.
+			let how = match kind {
+				FdUpgradeKind::OPath => build_path_open_how(),
+				_ => build_dir_open_how(),
+			};
+			let m1fd = match self.m1_open_checked(&path_c, &how, expected) {
+				Some(fd) => fd,
+				// On a failed identity check, skip the upgrade rather
+				// than breaking the syscall.
+				None => return ctx.send_continue(),
+			};
+			warn!(
+				"upgrading stale held fd {} ({:?}): mnt_id {} no longer current",
+				raw, sandbox_path, cur_mnt
+			);
+			if let Err(e) = ctx.replace_fd(m1fd.as_raw_fd(), raw, false) {
+				if ctx.still_valid()? {
+					return Err(e);
+				}
+				return Ok(());
+			}
+			return ctx.send_continue();
+		}
+
+		// Unupgradable (regular file): proxy the op in m1.
 		let how = build_path_open_how();
 		let m1fd = match self.m1_open_checked(&path_c, &how, expected) {
 			Some(fd) => fd,
@@ -419,7 +610,7 @@ impl ManagedBindMountSandbox {
 /// Build an `open_how` for faithfully re-opening an `openat`-family
 /// target in m1.  Resolution is confined to m1's root, preserving any
 /// `RESOLVE_NO_SYMLINKS` the app requested via `openat2`.
-fn build_open_how(params: &syscalls_fs::ReopenParams) -> open_how {
+fn build_open_how(params: &ReopenParams) -> open_how {
 	let mut how: open_how = unsafe { std::mem::zeroed() };
 	how.flags = params.flags;
 	how.mode = params.mode;
@@ -428,7 +619,7 @@ fn build_open_how(params: &syscalls_fs::ReopenParams) -> open_how {
 }
 
 /// Build an `open_how` for an `O_PATH` handle used purely to re-resolve a
-/// path in m1 (for dirfd / file-fd upgrades).
+/// path in m1 (for dirfd / `O_PATH` fd swaps and for the proxy path).
 fn build_path_open_how() -> open_how {
 	let mut how: open_how = unsafe { std::mem::zeroed() };
 	how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
@@ -436,12 +627,84 @@ fn build_path_open_how() -> open_how {
 	how
 }
 
+/// Build an `open_how` for a real (non-`O_PATH`) directory handle opened
+/// in m1, used to swap a stale directory fd so an `f*` metadata op runs
+/// against the live mount.
+fn build_dir_open_how() -> open_how {
+	let mut how: open_how = unsafe { std::mem::zeroed() };
+	how.flags = (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+	how.resolve = libc::RESOLVE_IN_ROOT;
+	how
+}
+
+/// How a stale app-held fd that governs an access can be made to reflect
+/// the live mount layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FdUpgradeKind {
+	/// An `O_PATH` fd.  It carries no read/write position, so it can be
+	/// swapped for a fresh `O_PATH` fd resolved on the live layout; the
+	/// swapped fd then reproduces the syscall's native `O_PATH` semantics
+	/// (e.g. `EBADF` for `fchmod`, a valid `AT_EMPTY_PATH` `fchownat`)
+	/// against the current mount.
+	OPath,
+	/// A directory fd.  Swappable for a fresh directory fd resolved on
+	/// the live layout (only an in-progress `getdents` cursor is lost).
+	Directory,
+	/// A regular-file (or other) fd.  Swapping would clobber its
+	/// `f_pos`/open state, so a stale one must be proxied in m1 instead.
+	Unupgradable,
+}
+
+impl FdUpgradeKind {
+	/// Whether a stale fd of this kind can be swapped in place (rather
+	/// than needing a proxy).
+	fn is_upgradable(self) -> bool {
+		matches!(self, FdUpgradeKind::OPath | FdUpgradeKind::Directory)
+	}
+}
+
+/// Classify the app-held fd `raw` (belonging to process `pid`) for the
+/// upgrade path.  `O_PATH`-ness is read from `/proc/<pid>/fdinfo/<raw>`
+/// (the `flags:` field preserves `O_PATH`); directory-ness from `statx`
+/// on `app_fd` (a `/proc`-opened handle to the same fd).  Any read
+/// failure conservatively classifies the fd as unupgradable so it is
+/// proxied / left untouched rather than swapped.
+fn fd_upgrade_kind(pid: libc::pid_t, raw: libc::c_int, app_fd: &ForeignFd) -> FdUpgradeKind {
+	if app_fd_is_o_path(pid, raw) {
+		return FdUpgradeKind::OPath;
+	}
+	match app_fd.is_dir() {
+		Ok(true) => FdUpgradeKind::Directory,
+		_ => FdUpgradeKind::Unupgradable,
+	}
+}
+
+/// Whether the app fd `raw` of process `pid` was opened with `O_PATH`,
+/// read from the `flags:` field (octal `file->f_flags`) of
+/// `/proc/<pid>/fdinfo/<raw>`.  Returns `false` if the file cannot be
+/// read or parsed.
+fn app_fd_is_o_path(pid: libc::pid_t, raw: libc::c_int) -> bool {
+	let path = format!("/proc/{}/fdinfo/{}", pid, raw);
+	let Ok(content) = std::fs::read_to_string(&path) else {
+		return false;
+	};
+	for line in content.lines() {
+		if let Some(rest) = line.strip_prefix("flags:")
+			&& let Ok(flags) = i32::from_str_radix(rest.trim(), 8)
+		{
+			return flags & libc::O_PATH != 0;
+		}
+	}
+	false
+}
+
 /// If `fsop` is one of the metadata/content-modifying operations and its
 /// target refers directly to an already-open descriptor (an `f*` call or
-/// an `*at` call with `AT_EMPTY_PATH`), return that target so the op can
-/// be proxied through m1.  Path-based variants return `None` (they
-/// resolve afresh when the syscall continues).
-fn modify_op_bare_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
+/// an `*at` call with `AT_EMPTY_PATH`), return that target.  The held fd
+/// governs the access, so the upgrade path decides per its upgradability
+/// whether to swap it or proxy the op.  Path-based variants return `None`
+/// (they resolve afresh when the syscall continues).
+fn modify_op_held_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
 	let target = match fsop {
 		FsOperation::FsChmod(ChmodOperation { target, .. })
 		| FsOperation::FsChown(ChownOperation { target, .. })
@@ -456,8 +719,8 @@ fn modify_op_bare_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
 /// Re-issue a metadata/content-modifying op against the m1-opened handle
 /// `fd` (an `O_PATH` fd, addressed via its `/proc/self/fd` magic symlink
 /// so the op resolves through m1's mount).  Returns the `errno` on
-/// failure.  Only the bare-fd (`f*`) variants are proxied; other
-/// `FsOperation`s are never passed here.
+/// failure.  Only the unupgradable (regular-file) `f*` variants are
+/// proxied; other `FsOperation`s are never passed here.
 fn perform_modify(fsop: &FsOperation, fd: libc::c_int) -> Result<(), libc::c_int> {
 	// `fd` is a freshly m1-opened O_PATH handle returned by
 	// `m1_open_checked`, so it is always a valid non-negative descriptor;
@@ -540,7 +803,7 @@ impl<'s, 't> RequestHandle<'s, 't> {
 	}
 
 	/// Allow the request, transparently upgrading or proxying fds so the
-	/// traced process's view matches the live mount layout (§11.2).
+	/// traced process's view matches the live mount layout.
 	///
 	/// If the request requires any additional mounts, the caller must have
 	/// already added them.
