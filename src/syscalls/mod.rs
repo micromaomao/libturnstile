@@ -263,6 +263,21 @@ impl<'a> RequestContext<'a> {
 		Ok(unsafe { val.assume_init() })
 	}
 
+	/// Reads a `Vec<u8>` of length `len` from the traced process's memory at
+	/// `src`.
+	pub fn bytes_from_target_memory(
+		&mut self,
+		src: *const u8,
+		len: usize,
+	) -> Result<Vec<u8>, AccessRequestError> {
+		let mut buf = Vec::with_capacity(len);
+		let uninit_buf =
+			unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, len) };
+		self.read_target_memory(src, uninit_buf)?;
+		unsafe { buf.set_len(len) };
+		Ok(buf)
+	}
+
 	pub fn pid(&self) -> libc::pid_t {
 		libc::pid_t::try_from(self.sreq.pid).expect("PID overflowed i32")
 	}
