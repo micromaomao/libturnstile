@@ -154,7 +154,7 @@ pub struct BindMountSandbox {
 	/// is therefore acceptable to `open_tree()` once the helper process
 	/// enters m0.
 	host_root_fd: ForeignFd,
-	/// O_PATH fd to the *scratch* tmpfs root inside m1.  The scratch is
+	/// O_PATH fd to the scratch tmpfs root inside m1.  The scratch is
 	/// a brand-new tmpfs (distinct from `root_tmpfs`) that is made m1's
 	/// root and then shadowed beneath the `root_tmpfs` bind mount, so
 	/// the sandboxed app never sees it.  It serves as a hidden,
