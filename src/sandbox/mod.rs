@@ -626,11 +626,6 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
-				// setns changes the process's root, so this chdir "/" is correct.
-				let res = libc::chdir(c"/".as_ptr());
-				if res != 0 {
-					return perror!("chdir");
-				}
 				match source_tree.mount(libc::AT_FDCWD, ns_path, follow_ns_symlinks) {
 					Ok(()) => (),
 					Err(e) => {
@@ -759,9 +754,6 @@ impl BindMountSandbox {
 				// (m1) the rest of the choreography.
 				if let Err(e) = nsenter_fn_m1() {
 					return e.raw_os_error().unwrap_or(libc::EIO);
-				}
-				if libc::chdir(c"/".as_ptr()) != 0 {
-					return perror!("chdir");
 				}
 				let child_ptrs_ptr = child_ptrs_ptr as *const *const libc::c_char;
 				let child_fds_ptr = child_fds_ptr as *mut libc::c_int;
@@ -922,10 +914,6 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
-				let res = libc::chdir(c"/".as_ptr());
-				if res != 0 {
-					return perror!("chdir");
-				}
 				let mut openhow: libc::open_how = mem::zeroed();
 				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY) as u64;
 				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
@@ -991,10 +979,6 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
-				let res = libc::chdir(c"/".as_ptr());
-				if res != 0 {
-					return perror!("chdir");
-				}
 				let mut openhow: libc::open_how = mem::zeroed();
 				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
 				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
@@ -1049,9 +1033,6 @@ impl BindMountSandbox {
 			send_fd_from_ns(
 				nsenter_fn,
 				|| {
-					if libc::chdir(c"/".as_ptr()) != 0 {
-						return Err(io::Error::last_os_error());
-					}
 					let fd = libc::syscall(
 						libc::SYS_openat2,
 						libc::AT_FDCWD,
@@ -1224,9 +1205,6 @@ impl BindMountSandbox {
 					Ok(()) => (),
 					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
 				}
-				if libc::chdir(c"/".as_ptr()) != 0 {
-					return perror!("chdir");
-				}
 				// Create scratch/<name> to receive the parked mount.
 				if libc::mkdirat(scratch_fd, name.as_ptr(), 0o700) != 0 {
 					let err = libc::__errno_location().read();
@@ -1286,9 +1264,6 @@ impl BindMountSandbox {
 				match nsenter_fn() {
 					Ok(()) => (),
 					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
-				}
-				if libc::chdir(c"/".as_ptr()) != 0 {
-					return perror!("chdir");
 				}
 				let mut openhow: libc::open_how = mem::zeroed();
 				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
