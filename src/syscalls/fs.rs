@@ -4,8 +4,8 @@ use crate::{
 	AccessRequestError, TurnstileTracerError,
 	access::fs::{
 		ChmodOperation, ChownOperation, CreateKind, CreateOperation, ExecOperation, FsTarget,
-		LinkOperation, OpenOperation, RemoveXattrOperation, RenameOperation, SetXattrOperation,
-		TruncateOperation, UnlinkOperation,
+		GetXattrOperation, LinkOperation, OpenOperation, RemoveXattrOperation, RenameOperation,
+		SetXattrOperation, TruncateOperation, UnlinkOperation,
 	},
 	access::{
 		AccessRequest, Operation,
@@ -293,6 +293,20 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 			let mut target = target;
 			target.no_follow = true;
 			handle_removexattr_like(req, target, 1)
+		},
+		0,
+	),
+	(
+		"getxattr",
+		|req, target| handle_getxattr_like(req, target, 1),
+		0,
+	),
+	(
+		"lgetxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_getxattr_like(req, target, 1)
 		},
 		0,
 	),
@@ -609,6 +623,11 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 		|req, target| handle_removexattr_like(req, target, 1),
 		0,
 	),
+	(
+		"fgetxattr",
+		|req, target| handle_getxattr_like(req, target, 1),
+		0,
+	),
 ];
 
 fn handle_setxattr_like(
@@ -647,6 +666,16 @@ fn handle_removexattr_like(
 	let name_ptr = req.arg(name_arg) as *const libc::c_char;
 	let name = req.cstr_from_target_memory(name_ptr)?;
 	Ok(fsop(FsRemoveXattr(RemoveXattrOperation { target, name })))
+}
+
+fn handle_getxattr_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	Ok(fsop(FsGetXattr(GetXattrOperation { target, name })))
 }
 
 pub(crate) fn add_filter_rules(

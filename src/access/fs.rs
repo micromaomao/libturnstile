@@ -766,6 +766,16 @@ pub struct RemoveXattrOperation {
 	pub name: CString,
 }
 
+/// Reading an extended attribute (`getxattr`, `lgetxattr`, `fgetxattr`).
+/// This is a read-only op: like `stat`/`fstat`, it is mediated only to
+/// require read access on the target, and resolves afresh when the
+/// syscall continues against the live layout.
+#[derive(Debug)]
+pub struct GetXattrOperation {
+	pub target: FsTarget,
+	pub name: CString,
+}
+
 #[derive(Debug)]
 pub enum FsOperation {
 	FsOpen(OpenOperation),
@@ -783,6 +793,7 @@ pub enum FsOperation {
 	FsTruncate(TruncateOperation),
 	FsSetXattr(SetXattrOperation),
 	FsRemoveXattr(RemoveXattrOperation),
+	FsGetXattr(GetXattrOperation),
 	UnixConnect(FsTarget),
 	UnixBind(UnixBindOperation),
 	UnixSendto(FsTarget),
@@ -933,6 +944,9 @@ impl std::fmt::Display for FsOperation {
 			Self::FsRemoveXattr(RemoveXattrOperation { target, name }) => {
 				write!(f, "removexattr {} {}", name.to_string_lossy(), target)?;
 			}
+			Self::FsGetXattr(GetXattrOperation { target, name }) => {
+				write!(f, "getxattr {} {}", name.to_string_lossy(), target)?;
+			}
 			Self::UnixConnect(target) => {
 				write!(f, "connect unix:{}", target)?;
 			}
@@ -1017,6 +1031,9 @@ impl FsOperation {
 			}
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
+			}
+			Self::FsGetXattr(GetXattrOperation { target, .. }) => {
+				smallvec![make_rwx!(target.clone(), read)]
 			}
 			Self::FsChmod(ChmodOperation { target, .. })
 			| Self::FsChown(ChownOperation { target, .. })
