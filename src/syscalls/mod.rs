@@ -221,7 +221,7 @@ impl<'a> RequestContext<'a> {
 	/// for this syscall.
 	///
 	/// If the notification is no longer valid (already answered, or
-	/// invalidated by a signal), this is a no-op.
+	/// invalidated by a signal), this returns an error.
 	pub fn replace_fd(
 		&mut self,
 		srcfd: libc::c_int,
