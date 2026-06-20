@@ -647,29 +647,23 @@ impl BindMountSandbox {
 		Ok(stat)
 	}
 
-	/// Bind-mount `host_path` at `ns_path` while preserving the identity
-	/// of any existing direct sub-mounts that the new bind would
-	/// otherwise shadow (§3 / §7 "open child → shadow parent → move
-	/// child back").
+	/// Bind-mount `host_path` at `ns_path` while "carrying over" any
+	/// existing direct sub-mounts that the new bind would otherwise
+	/// shadow.
 	///
-	/// `child_ns_paths` lists the immediate sub-mounts of `ns_path` (the
-	/// topmost mounts strictly beneath it, discovered from the live mount
-	/// tree by the caller).  Ordering is load-bearing: each child's
-	/// `O_PATH` handle must be grabbed *before* the parent bind shadows
-	/// the old layout, so the whole choreography runs in a single m1
-	/// fork:
+	/// `child_ns_paths` lists the immediate sub-mounts of `ns_path`.
 	///
-	/// 1. (m0) `open_tree` the host source.
-	/// 2. (m1) open an `O_PATH` fd to every child (still reachable).
-	/// 3. (m1) `move_mount` the source over `ns_path` (shadows children).
-	/// 4. (m1) `move_mount` each child back onto its own path - now
-	///    resolved *inside* the new bind mount, reattaching the **same**
-	///    `struct mount` so held fds / cwd / `..` keep working.
+	/// Roughly, this function does:
+	///
+	/// - (in m0) `open_tree` the host source.
+	/// - (in m1) open an `O_PATH` fd to every child.
+	/// - (in m1) `move_mount` the source onto `ns_path` (the children are
+	///   now shadowed).
+	/// - (in m1) `move_mount` each child back onto its own path resolved
+	///   inside the new bind mount.
 	///
 	/// A child whose mountpoint dentry is absent from the new parent's
-	/// host fs cannot be moved back; it is left detached (its mount stays
-	/// alive via any app reference and the kernel reclaims it once the
-	/// last reference drops), matching §7.
+	/// host fs cannot be moved back, and so will be unmounted.
 	///
 	/// With no children this is exactly a plain bind mount.
 	pub(self) fn mount_covering(
@@ -685,8 +679,7 @@ impl BindMountSandbox {
 		}
 		validate_sandbox_path(ns_path)?;
 
-		// Resolve + open the host source relative to m0's root fd, exactly
-		// as mount_host_into_sandbox_impl does.
+		// Resolve host_path to an O_PATH fd from the m0 root.
 		let mut open_how: libc::open_how = unsafe { std::mem::zeroed() };
 		open_how.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
 		open_how.resolve |= libc::RESOLVE_NO_SYMLINKS;
