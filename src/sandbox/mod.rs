@@ -540,10 +540,7 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// Resolve `host_path` (interpreted relative to the m0 host root) to
-	/// an `O_PATH` fd.  Leading slashes are stripped because `openat2`
-	/// ignores the dirfd for absolute paths.  Symlinks in the final
-	/// component are followed only when `follow_host_symlinks` is set.
+	/// Resolve `host_path` to an `O_PATH` fd in m0.
 	fn resolve_host_path(
 		&self,
 		host_path: &CStr,
