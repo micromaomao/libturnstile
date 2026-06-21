@@ -707,6 +707,7 @@ impl BindMountSandbox {
 		// Pre-allocate the fd buffer before we fork so the forked child
 		// does not allocate.
 		let mut child_fds: Vec<libc::c_int> = vec![-1; child_ns_paths.len()];
+		let child_fds_slice = child_fds.as_mut_slice();
 		let n_children = child_ns_paths.len();
 
 		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
@@ -738,11 +739,11 @@ impl BindMountSandbox {
 					) as libc::c_int;
 					// A child that can't be opened (already gone) is just
 					// skipped; -1 stays in the slot.
-					child_fds[i] = fd;
+					child_fds_slice[i] = fd;
 				}
 				// Bind the parent over ns_path (shadows the children).
 				if let Err(e) = source_tree.mount(libc::AT_FDCWD, ns_path, false) {
-					for &fd in &child_fds {
+					for &fd in &*child_fds_slice {
 						if fd >= 0 {
 							libc::close(fd);
 						}
@@ -755,7 +756,7 @@ impl BindMountSandbox {
 				// it (MNT_DETACH) rather than leaving it shadowed; we
 				// don't fail the whole op.
 				for i in 0..n_children {
-					let fd = child_fds[i];
+					let fd = child_fds_slice[i];
 					if fd < 0 {
 						continue;
 					}
