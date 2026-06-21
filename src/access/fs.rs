@@ -410,6 +410,18 @@ impl FsTarget {
 		let mut attempts = 0;
 		loop {
 			let mut dfd_path = self.dfd.readlink()?.into_encoded_bytes();
+			if dfd_path == b"/" {
+				// Don't check inode identity if the dfd is the root.
+				unsafe {
+					let cloned_fd = libc::dup(root);
+					if cloned_fd < 0 {
+						return Err(io::Error::last_os_error());
+					}
+					return Ok(ForeignFd {
+						local_fd: cloned_fd,
+					});
+				}
+			}
 			dfd_path.push(b'\0');
 			if dfd_path.first().copied() != Some(b'/') {
 				error!(
@@ -477,8 +489,9 @@ impl FsTarget {
 	///
 	/// This function attempts to re-open the target but under the
 	/// provided root fd.  The target must exist on the same path within
-	/// this new root.  A check with statx() will ensure that the file is
-	/// the same, and if not, ENOENT is returned.
+	/// this new root.  If dfd is not already the root, a check with
+	/// statx() will ensure that the file is the same, and if not, ENOENT
+	/// is returned.
 	pub fn in_root(&self, root: libc::c_int) -> Result<Self, io::Error> {
 		Ok(Self {
 			dfd: self.open_target_dfd_in_root(root)?,
