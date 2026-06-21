@@ -555,6 +555,8 @@ impl BindMountSandbox {
 			open_how.flags |= libc::O_NOFOLLOW as u64;
 			open_how.resolve |= libc::RESOLVE_NO_SYMLINKS;
 		}
+		// openat2 ignores the dirfd when given an absolute path, so we
+		// need to remove any leading '/'.
 		let with_nul = host_path.to_bytes_with_nul();
 		let relative_host_path: &CStr = if with_nul.starts_with(b"/") {
 			let mut i = 0;
