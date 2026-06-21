@@ -22,7 +22,7 @@ use libturnstile::{
 	PlaceholderFileData, PlaceholderSymlinkData, TurnstileTracer,
 	access::{
 		Operation,
-		fs::{FsOperation, RwxPermission},
+		fs::{ForeignFd, FsOperation, RwxPermission},
 	},
 	fstree::FsTree,
 };
@@ -122,55 +122,55 @@ fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io:
 	})
 }
 
-/// Compute the path the traced process intended (before kernel symlink
-/// resolution) by combining the readlinked dfd with the original path.
-fn intent_host_path(target: &libturnstile::access::fs::FsTarget) -> Result<CString, io::Error> {
-	let mut bytes = target.dfd().readlink()?.into_encoded_bytes();
-	let path_bytes = target.path().to_bytes();
-	if !path_bytes.is_empty() {
-		if !bytes.ends_with(b"/") {
-			bytes.push(b'/');
-		}
-		bytes.extend_from_slice(path_bytes);
-	}
-	if bytes.is_empty() {
-		bytes.push(b'/');
-	}
-	if bytes.contains(&0) {
-		return Err(io::Error::other("intent path contains NUL byte"));
-	}
-	bytes.push(0);
-	Ok(CString::from_vec_with_nul(bytes).expect("appended NUL"))
-}
-
-/// Walk the *ancestor* components of `intent_path` on the host.  For
-/// every symlink encountered we record a symlink placeholder in the
-/// sandbox that mirrors the host (same target), and continue
-/// resolution through the symlink.  The leaf component is never
-/// touched.
+/// Walk the *ancestor* components of a user-supplied path (the raw
+/// `path` as passed by the app, resolved against `dfd`) on the host.
+/// For every symlink encountered we record a symlink placeholder in the
+/// sandbox that mirrors the host (same target), and continue resolution
+/// through the symlink.  The leaf component is never touched.
+///
+/// `dfd` is the base the path resolves against (the target's dfd,
+/// already reopened in the host-mapped root); its `readlink()` gives the
+/// starting resolved path, on top of which `path` is walked one
+/// component at a time.
 ///
 /// This makes sure that an app accessing e.g. `/home/user1/file` (where
 /// `/home/user1` is a host symlink to `/home/user2`) sees the same
 /// symlink inside the sandbox, with the underlying placeholder / mount
 /// living at `/home/user2/file`.
-fn mirror_intent_path_symlinks(
+fn create_symlinks_for_user_path(
 	sandbox: &ManagedBindMountSandbox,
-	intent_path: &CStr,
+	dfd: &ForeignFd,
+	path: &CStr,
 ) -> Result<(), io::Error> {
-	let bytes = intent_path.to_bytes();
-	if !bytes.starts_with(b"/") {
+	// Seed the resolved prefix with the dfd's canonical (symlink-free)
+	// path.  Root becomes empty so candidates below are built as
+	// "/comp"; a non-root path keeps no trailing slash.
+	let dfd_path = dfd.readlink()?.into_encoded_bytes();
+	if !dfd_path.starts_with(b"/") {
 		return Ok(());
 	}
-	let comps: Vec<&[u8]> = bytes
+	debug!(
+		"create_symlinks_for_user_path: dfd={:?} path={:?}",
+		OsStr::from_bytes(&dfd_path),
+		path
+	);
+	let mut resolved: Vec<u8> = if dfd_path == b"/" {
+		Vec::new()
+	} else {
+		dfd_path
+	};
+	// Walk every component of `path` except the final (leaf) one, which
+	// is never touched.
+	let path_comps: Vec<&[u8]> = path
+		.to_bytes()
 		.split(|&b| b == b'/')
 		.filter(|c| !c.is_empty())
 		.collect();
-	if comps.len() < 2 {
-		// Only a leaf (or empty) - no ancestor components to walk.
+	if path_comps.is_empty() {
+		// Empty path (AT_EMPTY_PATH): the dfd itself is the target.
 		return Ok(());
 	}
-	let mut resolved: Vec<u8> = Vec::new();
-	let mut remaining: VecDeque<Vec<u8>> = comps[..comps.len() - 1]
+	let mut remaining: VecDeque<Vec<u8>> = path_comps[..path_comps.len() - 1]
 		.iter()
 		.map(|c| c.to_vec())
 		.collect();
@@ -184,6 +184,9 @@ fn mirror_intent_path_symlinks(
 			continue;
 		}
 		if comp == b".." {
+			// Pop the last component off `resolved`. This way of handling
+			// .. is safe because none of the components of `resolved` are
+			// symlinks.
 			if let Some(p) = resolved.iter().rposition(|&b| b == b'/') {
 				resolved.truncate(p);
 			}
@@ -212,6 +215,11 @@ fn mirror_intent_path_symlinks(
 			let target_bytes = target.into_os_string().into_encoded_bytes();
 			let target_cstr = CString::new(target_bytes.clone())
 				.map_err(|_| io::Error::other("symlink target contains NUL byte"))?;
+			debug!(
+				"{:?} symlinks to {:?}",
+				OsStr::from_bytes(&candidate),
+				target_cstr
+			);
 			let placeholder = ManagedPlaceholder::PlaceholderSymlink(PlaceholderSymlinkData {
 				common: CommonPlaceholderData::from_stat(&stat),
 				target: target_cstr,
@@ -231,6 +239,7 @@ fn mirror_intent_path_symlinks(
 				remaining.push_front(c);
 			}
 		} else {
+			debug!("walked to {:?}", OsStr::from_bytes(&candidate));
 			resolved = candidate;
 		}
 	}
@@ -331,20 +340,12 @@ fn tracing_thread(context: &'static Context) {
 							// ancestors so the original (pre-resolution)
 							// path the app used keeps working inside the
 							// sandbox.
-							match intent_host_path(&rwxp.target) {
-								Ok(intent) => {
-									if let Err(e) =
-										mirror_intent_path_symlinks(&context.sandbox, &intent)
-									{
-										debug!(
-											"could not mirror symlinks for intent path {:?}: {}",
-											intent, e
-										);
-									}
-								}
-								Err(e) => {
-									debug!("could not compute intent path for {}: {}", rwxp, e);
-								}
+							if let Err(e) = create_symlinks_for_user_path(
+								&context.sandbox,
+								t_local.dfd(),
+								t_local.path(),
+							) {
+								debug!("could not mirror symlinks for {}: {}", rwxp, e);
 							}
 							if !rwxp.read && !rwxp.write && !rwxp.exec {
 								// Resolve-only access (e.g. realpath /
