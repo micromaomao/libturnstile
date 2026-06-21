@@ -63,6 +63,32 @@ fn to_cstring(bytes: &[u8]) -> Option<CString> {
 	CString::new(bytes.to_vec()).ok()
 }
 
+/// Whether an `io::Error` from resolving or opening a proxied target is a
+/// benign, app-caused condition — the traced process is simply touching a
+/// path that does not exist or that it is not allowed to open — rather
+/// than a sandbox-side fault.  These are logged at `debug` instead of
+/// `warn` / `error` so an app probing missing / forbidden paths cannot
+/// spam the logs.
+fn is_benign_target_errno(e: &std::io::Error) -> bool {
+	matches!(
+		e.raw_os_error(),
+		Some(libc::ENOENT) | Some(libc::EPERM) | Some(libc::EACCES)
+	)
+}
+
+/// `warn!` a proxied-target failure, but downgrade to `debug!` when the
+/// underlying error is a benign app-caused errno (see
+/// [`is_benign_target_errno`]).
+macro_rules! warn_unless_benign {
+	($e:expr, $($arg:tt)+) => {
+		if is_benign_target_errno($e) {
+			debug!($($arg)+);
+		} else {
+			warn!($($arg)+);
+		}
+	};
+}
+
 /// Cache of the syscall numbers the fd-upgrade dispatch needs to
 /// special-case, resolved once for the native architecture.
 struct UpgradeSyscalls {
@@ -360,9 +386,11 @@ impl ManagedBindMountSandbox {
 		let abspath = match op.target.realpath() {
 			Ok(p) => p,
 			Err(e) => {
-				warn!(
+				warn_unless_benign!(
+					&e,
 					"openat upgrade: cannot resolve abspath for {}: {} — continuing natively",
-					op.target, e
+					op.target,
+					e
 				);
 				return ctx.send_continue();
 			}
@@ -439,7 +467,7 @@ impl ManagedBindMountSandbox {
 		let abspath = match target.realpath() {
 			Ok(p) => p,
 			Err(e) => {
-				warn!("chdir: cannot resolve abspath for {}: {}", target, e);
+				warn_unless_benign!(&e, "chdir: cannot resolve abspath for {}: {}", target, e);
 				return ctx.send_continue();
 			}
 		};

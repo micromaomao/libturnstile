@@ -424,7 +424,11 @@ impl FsTarget {
 			}
 			dfd_path.push(b'\0');
 			if dfd_path.first().copied() != Some(b'/') {
-				error!(
+				// The base fd does not name a path (e.g. it is a pipe or
+				// socket: "pipe:[…]" / "socket:[…]").  This is a benign,
+				// app-caused case — the syscall would fail natively — so log
+				// at debug to avoid spam and report ENOENT to the caller.
+				debug!(
 					"readlink of dfd did not return an absolute path: {:?} returned",
 					OsStr::from_bytes(&dfd_path)
 				);

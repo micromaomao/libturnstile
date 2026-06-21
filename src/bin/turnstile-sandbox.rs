@@ -313,10 +313,21 @@ fn tracing_thread(context: &'static Context) {
 									Ok(t) => t,
 									Err(e) => {
 										check_req_valid!();
-										error!(
-											"error reopening target dfd in real root for {}: {}",
-											rwxp, e
-										);
+										match e.kind() {
+											io::ErrorKind::NotFound
+											| io::ErrorKind::PermissionDenied => {
+												debug!(
+													"error reopening target dfd in real root for {}: {}",
+													rwxp, e
+												);
+											}
+											_ => {
+												error!(
+													"error reopening target dfd in real root for {}: {}",
+													rwxp, e
+												);
+											}
+										}
 										break;
 									}
 								};
