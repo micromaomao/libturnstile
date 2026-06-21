@@ -2348,7 +2348,7 @@ impl ManagedBindMountSandbox {
 				}
 			},
 			|_, old, new| old.user.host_path != new.host_path,
-			true,
+			false,
 		);
 
 		// Phase 3: remove placeholders no longer desired (bottom-up).
