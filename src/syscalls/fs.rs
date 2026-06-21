@@ -499,56 +499,28 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	),
 	(
 		"setxattrat",
-		|req, target| {
-			let mut target = target;
-			let flags = req.arg(2);
-			if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 {
-				target.no_follow = true;
-			}
-			handle_setxattr_like(req, target, 3, 4, 5, 2)
-		},
+		|req, target| handle_setxattr_like(req, target, 3, 4, 5, 2),
 		0,
 		1,
 		Some(2),
 	),
 	(
 		"getxattrat",
-		|req, target| {
-			let mut target = target;
-			let flags = req.arg(2);
-			if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 {
-				target.no_follow = true;
-			}
-			handle_getxattr_like(req, target, 3)
-		},
+		|req, target| handle_getxattr_like(req, target, 3),
 		0,
 		1,
 		Some(2),
 	),
 	(
 		"listxattrat",
-		|req, target| {
-			let mut target = target;
-			let flags = req.arg(2);
-			if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 {
-				target.no_follow = true;
-			}
-			handle_listxattr_like(req, target)
-		},
+		|req, target| handle_listxattr_like(req, target),
 		0,
 		1,
 		Some(2),
 	),
 	(
 		"removexattrat",
-		|req, target| {
-			let mut target = target;
-			let flags = req.arg(2);
-			if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 {
-				target.no_follow = true;
-			}
-			handle_removexattr_like(req, target, 3)
-		},
+		|req, target| handle_removexattr_like(req, target, 3),
 		0,
 		1,
 		Some(2),
