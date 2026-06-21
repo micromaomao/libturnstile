@@ -634,8 +634,18 @@ fn join_under_mount(host: &[u8], suffix: &[u8]) -> Vec<u8> {
 }
 
 /// Build an `open_how` for faithfully re-opening an `openat`-family
-/// target in m1.  Resolution is confined to m1's root, preserving any
-/// `RESOLVE_NO_SYMLINKS` the app requested via `openat2`.
+/// target in m1.  Resolution is confined to m1's root.
+///
+/// TODO: RESOLVE_NO_SYMLINKS is not faithfully honored yet.  We pass the
+/// flag through to the m1 `openat2` below, but the `abspath` we open was
+/// itself produced by `FsTarget::realpath()`, which resolves the path by
+/// *following* symlinks.  So a path the app submitted with
+/// RESOLVE_NO_SYMLINKS that contained a symlink component (which should
+/// have failed with ELOOP in the original call) gets resolved here, and
+/// re-opening the already-resolved abspath finds no symlinks left and
+/// succeeds.  Reproducing the original semantics requires resolving the
+/// abspath without following symlinks (and failing the same way) — left
+/// as future work.
 fn build_open_how(params: &ReopenParams) -> open_how {
 	let mut how: open_how = unsafe { std::mem::zeroed() };
 	how.flags = params.flags;

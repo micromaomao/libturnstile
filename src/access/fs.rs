@@ -621,6 +621,14 @@ impl FsTarget {
 	pub fn path(&self) -> &CStr {
 		&self.path
 	}
+
+	/// Whether the final path component is *not* followed when it is a
+	/// symlink, i.e. the syscall was invoked with `AT_SYMLINK_NOFOLLOW`
+	/// (or `O_NOFOLLOW`).  Intermediate components are always followed
+	/// regardless.
+	pub fn no_follow(&self) -> bool {
+		self.no_follow
+	}
 }
 
 impl std::fmt::Display for FsTarget {

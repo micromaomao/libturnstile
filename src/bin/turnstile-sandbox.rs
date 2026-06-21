@@ -133,6 +133,13 @@ fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io:
 /// starting resolved path, on top of which `path` is walked one
 /// component at a time.
 ///
+/// `follow_final` says whether the final (leaf) component is followed by
+/// the kernel when it is a symlink (i.e. the access was *not*
+/// `AT_SYMLINK_NOFOLLOW`).  When true, the leaf is walked just like an
+/// ancestor, so a symlink leaf (e.g. `/etc/localtime`) is mirrored and
+/// resolution continues into its target; when false, the leaf is left
+/// untouched (the mount / placeholder flow handles the symlink itself).
+///
 /// This makes sure that an app accessing e.g. `/home/user1/file` (where
 /// `/home/user1` is a host symlink to `/home/user2`) sees the same
 /// symlink inside the sandbox, with the underlying placeholder / mount
@@ -141,6 +148,7 @@ fn create_symlinks_for_user_path(
 	sandbox: &ManagedBindMountSandbox,
 	dfd: &ForeignFd,
 	path: &CStr,
+	follow_final: bool,
 ) -> Result<(), io::Error> {
 	// Seed the resolved prefix with the dfd's canonical (symlink-free)
 	// path.  Root becomes empty so candidates below are built as
@@ -159,8 +167,10 @@ fn create_symlinks_for_user_path(
 	} else {
 		dfd_path
 	};
-	// Walk every component of `path` except the final (leaf) one, which
-	// is never touched.
+	// Walk the components of `path`.  Ancestor components are always
+	// followed; the final (leaf) component is only walked when
+	// `follow_final` is set, otherwise it is left untouched (handled by
+	// the mount / placeholder flow).
 	let path_comps: Vec<&[u8]> = path
 		.to_bytes()
 		.split(|&b| b == b'/')
@@ -170,10 +180,13 @@ fn create_symlinks_for_user_path(
 		// Empty path (AT_EMPTY_PATH): the dfd itself is the target.
 		return Ok(());
 	}
-	let mut remaining: VecDeque<Vec<u8>> = path_comps[..path_comps.len() - 1]
-		.iter()
-		.map(|c| c.to_vec())
-		.collect();
+	let walk_upto = if follow_final {
+		path_comps.len()
+	} else {
+		path_comps.len() - 1
+	};
+	let mut remaining: VecDeque<Vec<u8>> =
+		path_comps[..walk_upto].iter().map(|c| c.to_vec()).collect();
 	let mut iters = 0;
 	while let Some(comp) = remaining.pop_front() {
 		iters += 1;
@@ -207,7 +220,16 @@ fn create_symlinks_for_user_path(
 			)
 		};
 		if res != 0 {
-			return Err(io::Error::last_os_error());
+			let err = io::Error::last_os_error();
+			// A missing trailing component (nothing left to resolve) is
+			// fine: e.g. the leaf of an `O_CREAT` open doesn't exist yet,
+			// and there are no further symlinks to mirror.  A missing
+			// component with more still to walk is a genuinely unresolvable
+			// path.
+			if err.kind() == io::ErrorKind::NotFound && remaining.is_empty() {
+				return Ok(());
+			}
+			return Err(err);
 		}
 		let kind = stat.st_mode & libc::S_IFMT;
 		if kind == libc::S_IFLNK {
@@ -344,6 +366,7 @@ fn tracing_thread(context: &'static Context) {
 								&context.sandbox,
 								t_local.dfd(),
 								t_local.path(),
+								!t_local.no_follow(),
 							) {
 								debug!("could not mirror symlinks for {}: {}", rwxp, e);
 							}
