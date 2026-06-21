@@ -40,7 +40,7 @@ fn next_scratch_name() -> CString {
 
 /// Call umount("/proc/self/fd/<fd>", MNT_DETACH) in a async-signal-safe
 /// manner.
-unsafe fn umount_detach_fd(fd: libc::c_int) {
+unsafe fn umount_detach_fd(fd: libc::c_int) -> Result<(), io::Error> {
 	const PREFIX: &[u8] = b"/proc/self/fd/";
 	let mut buf = [0u8; PREFIX.len() + 11];
 	buf[..PREFIX.len()].copy_from_slice(PREFIX);
@@ -48,18 +48,21 @@ unsafe fn umount_detach_fd(fd: libc::c_int) {
 		if ENABLE_LOG_IN_FORK {
 			error!("Failed to format fd path for umount: {}", e);
 		}
-		unsafe { libc::_exit(1) };
+		return Err(io::Error::from_raw_os_error(libc::EINVAL));
 	}
 	unsafe {
-		if libc::umount2(buf.as_ptr() as *const libc::c_char, libc::MNT_DETACH) != 0
-			&& ENABLE_LOG_IN_FORK
-		{
-			error!(
-				"umount2(MNT_DETACH) of unmovable child failed: errno {}",
-				libc::__errno_location().read()
-			);
+		if libc::umount2(buf.as_ptr() as *const libc::c_char, libc::MNT_DETACH) != 0 {
+			let errno = libc::__errno_location().read();
+			if ENABLE_LOG_IN_FORK {
+				error!(
+					"umount2(MNT_DETACH) of unmovable child failed: errno {}",
+					errno
+				);
+			}
+			return Err(io::Error::from_raw_os_error(errno));
 		}
 	}
+	Ok(())
 }
 macro_rules! perror {
 	($s:literal) => {{
