@@ -776,7 +776,11 @@ impl BindMountSandbox {
 						if ENABLE_LOG_IN_FORK {
 							error!("move_mount(child back) failed: errno {}", err);
 						}
-						umount_detach_fd(fd);
+						if let Err(e) = umount_detach_fd(fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!("umount_detach_fd failed: {}", e);
+							}
+						}
 					}
 					libc::close(fd);
 				}
