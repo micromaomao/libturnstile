@@ -34,14 +34,14 @@
 //!   sit on a still-writable mount.
 //! * anything else - CONTINUE.
 
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::OnceLock;
 
 use libc::open_how;
 use libseccomp::ScmpSyscall;
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 
 use crate::{
 	AccessRequestError, RequestContext,
@@ -175,13 +175,15 @@ impl ManagedBindMountSandbox {
 		mt.find(sandbox_path, |_, _| true).map(|(_, mi)| mi.mnt_id)
 	}
 
-	/// Whether any tracked mount covers `sandbox_path`.
-	fn is_covered(&self, sandbox_path: &OsStr) -> bool {
+	/// The deepest tracked mount covering `sandbox_path` (the path itself
+	/// or an ancestor), returned as its sandbox mount path, host path, and
+	/// attributes.  `None` if no tracked mount covers it.
+	fn covering_mount(&self, sandbox_path: &OsStr) -> Option<(OsString, CString, MountAttributes)> {
 		self.current_mount_tree
 			.lock()
 			.expect("current_mount_tree lock poisoned")
 			.find(sandbox_path, |_, _| true)
-			.is_some()
+			.map(|(p, mi)| (p.to_owned(), mi.user.host_path.clone(), mi.user.attrs))
 	}
 
 	/// Open `path` (absolute, in m1's view) with `how`, retrying once on
@@ -423,8 +425,9 @@ impl ManagedBindMountSandbox {
 
 	/// `chdir` / `fchdir`: ensure a covering mount exists before letting
 	/// the syscall through.  cwd cannot be upgraded after the fact (there
-	/// is no fd to swap), so the mount must be in place when the kernel
-	/// sets `pwd`.
+	/// is no fd to swap), so a mount must sit *exactly at* the target -
+	/// then a later attribute change reaches the existing cwd handle, and
+	/// reconcile preserves that mount's identity rather than detaching it.
 	fn allow_chdir(
 		&self,
 		fsop: &FsOperation,
@@ -441,27 +444,52 @@ impl ManagedBindMountSandbox {
 			}
 		};
 		let abspath_bytes = abspath.as_bytes();
-		if abspath_bytes == b"/" || self.is_covered(OsStr::from_bytes(abspath_bytes)) {
+		if abspath_bytes == b"/" {
 			return ctx.send_continue();
 		}
-		// No covering mount: add one with chdir's effective attrs
-		// (ro,noexec).  The host dentry is guaranteed to exist (the app
-		// already established the chdir target), so host_path == abspath.
-		if let Some(abspath_c) = to_cstring(abspath_bytes) {
+		let target_os = OsStr::from_bytes(abspath_bytes);
+		// The deepest tracked mount covering the target (the target itself
+		// or an ancestor).  No covering mount means the policy does not
+		// grant this chdir at all, so there is nothing to preempt — CONTINUE
+		// and let the syscall fail / be handled by the caller.
+		let Some((cov_path, cov_host, cov_attrs)) = self.covering_mount(target_os) else {
+			return ctx.send_continue();
+		};
+		// A mount already exists *exactly* at the target: cwd is pinned to
+		// a tracked mount whose identity reconcile preserves, so there is
+		// nothing to do.
+		if cov_path.as_os_str() == target_os {
+			return ctx.send_continue();
+		}
+		// Covered only by an ancestor: add a dummy mount *exactly* at the
+		// target so a later attribute change can affect the existing cwd
+		// handle (cwd can't be upgraded after the fact).  Inherit the
+		// covering mount's attrs and host subtree so the cwd keeps seeing
+		// the same files and is not over-restricted.  `cov_path` is a strict
+		// ancestor here, so the relative suffix is a component-boundary slice
+		// that already starts with `/` (non-root ancestor) or is the whole
+		// abspath (root mount).
+		let suffix: &[u8] = if cov_path.as_os_str() == OsStr::new("/") {
+			abspath_bytes
+		} else {
+			&abspath_bytes[cov_path.as_os_str().as_bytes().len()..]
+		};
+		let host_path_bytes = join_under_mount(cov_host.as_bytes(), suffix);
+		if let Some(host_path) = to_cstring(&host_path_bytes) {
 			let mp = ManagedMountPoint {
-				host_path: abspath_c,
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: true,
-				},
+				host_path,
+				attrs: cov_attrs,
 			};
-			if let Err(e) = self.add_or_update_mount(OsStr::from_bytes(abspath_bytes), mp) {
+			if let Err(e) = self.add_or_update_mount(target_os, mp) {
 				warn!(
 					"chdir: failed to add preemptive mount on {:?}: {}",
 					abspath, e
 				);
 			} else {
-				debug!("chdir: added preemptive ro,noexec mount on {:?}", abspath);
+				debug!(
+					"chdir: added preemptive {} mount on {:?}",
+					cov_attrs, abspath
+				);
 			}
 		}
 		ctx.send_continue()
@@ -588,6 +616,21 @@ impl ManagedBindMountSandbox {
 			Err(errno) => ctx.send_error(-errno),
 		}
 	}
+}
+
+/// Join a covering mount's `host` path with a `suffix` — the part of the
+/// sandbox abspath below the covering mount, always starting with `/` —
+/// yielding the host path the covered sandbox location actually maps to.
+/// One trailing slash is dropped from `host` first so a root host (`/`)
+/// joins cleanly.
+fn join_under_mount(host: &[u8], suffix: &[u8]) -> Vec<u8> {
+	let host = host.strip_suffix(b"/").unwrap_or(host);
+	let mut out = host.to_vec();
+	out.extend_from_slice(suffix);
+	if out.is_empty() {
+		out.push(b'/');
+	}
+	out
 }
 
 /// Build an `open_how` for faithfully re-opening an `openat`-family

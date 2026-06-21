@@ -450,10 +450,18 @@ resolves it from the task's `fs_struct.pwd`, which is not addressable
 from the supervisor.  So cwd is handled preemptively:
 
 - `chdir(path)` / `fchdir(fd)` is intercepted in `allow()`.  Before
-  CONTINUE, ensure a bind mount exists at the resolved target:
-  - Already exists a mount → no action.
-  - No mount → add a bind mount at the path with the request's
-    effective attrs (chdir ⇒ `ro,noexec`), reconcile, then CONTINUE.
+  CONTINUE, ensure a bind mount exists *exactly at* the resolved target
+  (a mount only at an ancestor is not enough: a later attribute change
+  must reach the existing cwd handle, and reconcile must be able to
+  preserve the cwd mount's identity rather than detach it):
+  - A mount already exists exactly at the target → no action.
+  - Covered only by an ancestor mount → add a bind mount at the target,
+    reconcile, then CONTINUE: inherit that mount's attrs and bind its
+    `host_path` joined with the relative suffix, so the cwd keeps seeing
+    the same host subtree and is not over-restricted.
+  - No covering mount → the policy does not grant this chdir, so do
+    nothing and CONTINUE (the syscall then fails / is handled by the
+    caller's deny).
 - This implicitly means that every `chdir` requires read access on the target.
   The caller needs to add the correct policy rules (which may be granting a parent),
   otherwise we should fail with `EPERM`.
