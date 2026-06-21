@@ -705,6 +705,26 @@ impl BindMountSandbox {
 		}
 		validate_sandbox_path(ns_path)?;
 
+		let mut o_path_openhow: libc::open_how = unsafe { mem::zeroed() };
+		o_path_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+		o_path_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+		if log::log_enabled!(log::Level::Debug) {
+			let ns_path_open = self.open_in_m1(ns_path, &o_path_openhow).unwrap();
+			let mnt_id = ns_path_open.mnt_id().unwrap();
+			debug!(
+				"Mounting {:?} over {:?} (current mnt_id = {}) with {} children",
+				host_path,
+				ns_path,
+				mnt_id,
+				child_ns_paths.len()
+			);
+			for c in child_ns_paths {
+				let c_open = self.open_in_m1(c, &o_path_openhow).unwrap();
+				let c_mnt_id = c_open.mnt_id().unwrap();
+				debug!("  will move child {:?} with mnt_id = {}", c, c_mnt_id)
+			}
+		}
+
 		let host_fd = self.host_to_m0(host_path, false)?;
 
 		// Pre-allocate the fd buffer before we fork so the forked child
@@ -740,12 +760,27 @@ impl BindMountSandbox {
 						&child_openhow as *const _,
 						std::mem::size_of::<libc::open_how>(),
 					) as libc::c_int;
+					if fd < 0 {
+						let err = libc::__errno_location().read();
+						if ENABLE_LOG_IN_FORK {
+							error!(
+								"Failed to open child {:?} for move_mount: errno {}",
+								child_ns_paths[i], err
+							);
+						}
+					}
 					// A child that can't be opened (already gone) is just
 					// skipped; -1 stays in the slot.
 					child_fds_slice[i] = fd;
 				}
 				// Bind the parent over ns_path (shadows the children).
 				if let Err(e) = source_tree.mount(libc::AT_FDCWD, ns_path, false) {
+					if ENABLE_LOG_IN_FORK {
+						error!(
+							"Failed to mount covering {:?} to {:?} with {}: {}",
+							host_path, ns_path, attrs, e
+						);
+					}
 					for &mut fd in child_fds_slice {
 						if fd >= 0 {
 							libc::close(fd);
@@ -799,6 +834,13 @@ impl BindMountSandbox {
 			"Mount bind (covering {} children) {:?} {:?} {}",
 			n_children, host_path, ns_path, attrs
 		);
+		if log::log_enabled!(log::Level::Debug) {
+			for c in child_ns_paths {
+				let c_open = self.open_in_m1(c, &o_path_openhow).unwrap();
+				let c_mnt_id = c_open.mnt_id().unwrap();
+				debug!("  moved child {:?} now with mnt_id = {}", c, c_mnt_id)
+			}
+		}
 		Ok(())
 	}
 
@@ -878,6 +920,11 @@ impl BindMountSandbox {
 			));
 		}
 		let (parent_path, leaf) = split_parent_leaf(ns_path);
+
+		debug!(
+			"Umounting {:?} from sandbox (forcibly = {})",
+			ns_path, forcibly
+		);
 
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
 		let fork_res = unsafe {
