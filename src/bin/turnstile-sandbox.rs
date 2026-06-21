@@ -27,8 +27,10 @@ use libturnstile::{
 use log::{debug, error, info};
 
 use crate::common::{ProcPidFd, handle_child_result};
+use crate::config::Config;
 
 mod common;
+mod config;
 
 /// A simple interactive sandbox using libturnstile
 #[derive(Parser)]
@@ -317,59 +319,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		permissive: cli.permissive,
 	}));
 
-	// todo: default for now
-	context.sandbox.update_mounts_from_list([
-		(
-			OsStr::new("/usr"),
-			ManagedMountPoint {
-				host_path: CString::new("/usr").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: false,
-				},
-			},
-		),
-		(
-			OsStr::new("/bin"),
-			ManagedMountPoint {
-				host_path: CString::new("/bin").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: false,
-				},
-			},
-		),
-		(
-			OsStr::new("/lib"),
-			ManagedMountPoint {
-				host_path: CString::new("/lib").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: false,
-				},
-			},
-		),
-		(
-			OsStr::new("/lib64"),
-			ManagedMountPoint {
-				host_path: CString::new("/lib64").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: false,
-				},
-			},
-		),
-		(
-			OsStr::new("/proc"),
-			ManagedMountPoint {
-				host_path: CString::new("/proc").unwrap(),
-				attrs: MountAttributes {
-					readonly: true,
-					noexec: true,
-				},
-			},
-		),
-	])?;
+	// Load mounts from the user-provided config file, replacing the
+	// previously hard-coded default initial mount list.
+	let cfg = Config::load(&cli.config)?;
+	let resolved_mounts = cfg.resolve_mounts()?;
+	if resolved_mounts.is_empty() {
+		info!("config file {:?} has no rules; sandbox will start empty", cli.config);
+	}
+	context.sandbox.update_mounts_from_list(
+		resolved_mounts
+			.iter()
+			.map(|m| (m.sandbox_path.as_os_str(), m.mount.clone())),
+	)?;
 
 	context.path_res_sandbox.update_mounts_from_list([(
 		OsStr::new("/"),
