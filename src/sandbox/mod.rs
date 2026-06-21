@@ -743,7 +743,7 @@ impl BindMountSandbox {
 				}
 				// Bind the parent over ns_path (shadows the children).
 				if let Err(e) = source_tree.mount(libc::AT_FDCWD, ns_path, false) {
-					for &fd in &*child_fds_slice {
+					for &mut fd in child_fds_slice {
 						if fd >= 0 {
 							libc::close(fd);
 						}
