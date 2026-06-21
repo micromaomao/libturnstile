@@ -544,7 +544,7 @@ impl BindMountSandbox {
 	}
 
 	/// Resolve `host_path` to an `O_PATH` fd in m0.
-	fn resolve_host_path(
+	fn host_to_m0(
 		&self,
 		host_path: &CStr,
 		follow_host_symlinks: bool,
@@ -602,7 +602,7 @@ impl BindMountSandbox {
 		create_placeholders: bool,
 	) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(ns_path)?;
-		let host_fd = self.resolve_host_path(host_path, follow_host_symlinks)?;
+		let host_fd = self.host_to_m0(host_path, follow_host_symlinks)?;
 
 		if create_placeholders {
 			let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -705,7 +705,7 @@ impl BindMountSandbox {
 		}
 		validate_sandbox_path(ns_path)?;
 
-		let host_fd = self.resolve_host_path(host_path, false)?;
+		let host_fd = self.host_to_m0(host_path, false)?;
 
 		// Pre-allocate the fd buffer before we fork so the forked child
 		// does not allocate.
@@ -989,22 +989,13 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// Open `path` (absolute, resolved from "/") inside m1, returning an
-	/// fd that resolves through m1's *current* mount layout.  `openhow`
-	/// gives the open flags / resolve flags; the path is always resolved
-	/// relative to m1's root.  Backs the fd-upgrade / proxy path (§11)
-	/// and the reconcile process (opening child mounts and mount
-	/// targets).
-	///
-	/// We resolve in m1 (not m0) so the sandbox's own mount layout and
-	/// `mount_attr`s are authoritative and we cannot accidentally
-	/// over-grant (§11.4).
+	/// Open the absolute `path` inside m1, resolving through the
+	/// sandbox's mount layout.
 	pub fn open_in_m1(
 		&self,
 		path: &CStr,
 		openhow: &libc::open_how,
 	) -> Result<ForeignFd, BindMountSandboxError> {
-		let openhow_copy = *openhow;
 		let raw_fd = unsafe {
 			let nsenter_fn = self.namespaces.nsenter_fn(true, false, true, true);
 			send_fd_from_ns(
@@ -1014,7 +1005,7 @@ impl BindMountSandbox {
 						libc::SYS_openat2,
 						libc::AT_FDCWD,
 						path.as_ptr(),
-						&openhow_copy as *const _,
+						openhow,
 						std::mem::size_of::<libc::open_how>(),
 					) as libc::c_int;
 					if fd < 0 {
