@@ -36,6 +36,47 @@ fn next_scratch_name() -> CString {
 	let pid = unsafe { libc::getpid() };
 	CString::new(format!("park-{pid}-{n}")).expect("no NUL in generated name")
 }
+
+/// Lazily detach the mount referred to by `fd` (an `O_PATH` handle to a
+/// mount root) via `umount2(MNT_DETACH)` on its `/proc/self/fd` magic
+/// symlink.  Used to discard a sub-mount that could not be moved back
+/// into a freshly-bound parent, rather than leaving it shadowed beneath
+/// the new mount.  Must stay async-signal-safe (called from a forked
+/// child): builds the path in a stack buffer without allocating.
+unsafe fn umount_detach_fd(fd: libc::c_int) {
+	const PREFIX: &[u8] = b"/proc/self/fd/";
+	let mut buf = [0u8; PREFIX.len() + 11];
+	buf[..PREFIX.len()].copy_from_slice(PREFIX);
+	// Render the (non-negative) fd as decimal.
+	let mut digits = [0u8; 10];
+	let mut n = fd as u32;
+	let mut di = digits.len();
+	loop {
+		di -= 1;
+		digits[di] = b'0' + (n % 10) as u8;
+		n /= 10;
+		if n == 0 {
+			break;
+		}
+	}
+	let mut pos = PREFIX.len();
+	while di < digits.len() {
+		buf[pos] = digits[di];
+		pos += 1;
+		di += 1;
+	}
+	buf[pos] = 0;
+	unsafe {
+		if libc::umount2(buf.as_ptr() as *const libc::c_char, libc::MNT_DETACH) != 0
+			&& ENABLE_LOG_IN_FORK
+		{
+			error!(
+				"umount2(MNT_DETACH) of unmovable child failed: errno {}",
+				libc::__errno_location().read()
+			);
+		}
+	}
+}
 macro_rules! perror {
 	($s:literal) => {{
 		let err = libc::__errno_location().read();
@@ -352,21 +393,16 @@ impl BindMountSandbox {
 		// root_tmpfs bind below, so the scratch ends up shadowed beneath
 		// the placeholder tmpfs and is invisible to the app.
 		let m1_scratch_fd = unsafe {
-			// Enter the first users and then m1
+			// Enter the first user namespace (where the outside uid is
+			// mapped to root) and then m1.
 			let nsenter_fn = namespaces.nsenter_fn(true, false, true, false);
 			let raw_fd = send_fd_from_ns(
 				nsenter_fn,
 				|| {
-					// 1. fsmount a brand-new tmpfs (distinct from
-					//    root_tmpfs).  Use mode 0777 so the supervisor's
-					//    credentials (which do not own the scratch
-					//    superblock, whose root uid is unmapped in the
-					//    outer user namespace) can still create parking
-					//    directories inside it.
-					let scratch = MountObj::new_tmpfs_mode(Some(c"0777"))?;
-					// 2. move_mount it onto "/" of m1.
+					// fsmount a brand-new tmpfs (distinct from root_tmpfs),
+					// move_mount it onto "/" of m1, and return its fd.
+					let scratch = MountObj::new_tmpfs()?;
 					scratch.mount(libc::AT_FDCWD, c"/", false)?;
-					// 3. Return the fd of the scratch tmpfs.
 					Ok(scratch.into_raw_fd())
 				},
 				BindMountSandboxError::SetupScratchFailed,
@@ -520,27 +556,21 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	// todo: the semantic of follow_ns_symlinks is ill-defined due to use
-	// of create_hierarchy, which has no visibility into bind-mounted
-	// symlinks
-	pub(self) fn mount_host_into_sandbox_impl(
+	/// Resolve `host_path` (interpreted relative to the m0 host root) to
+	/// an `O_PATH` fd.  Leading slashes are stripped because `openat2`
+	/// ignores the dirfd for absolute paths.  Symlinks in the final
+	/// component are followed only when `follow_host_symlinks` is set.
+	fn resolve_host_path(
 		&self,
 		host_path: &CStr,
-		ns_path: &CStr,
-		attrs: MountAttributes,
 		follow_host_symlinks: bool,
-		follow_ns_symlinks: bool,
-		create_placeholders: bool,
-	) -> Result<libc::stat, BindMountSandboxError> {
-		validate_sandbox_path(ns_path)?;
+	) -> Result<ForeignFd, BindMountSandboxError> {
 		let mut open_how: libc::open_how = unsafe { std::mem::zeroed() };
 		open_how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
 		if !follow_host_symlinks {
 			open_how.flags |= libc::O_NOFOLLOW as u64;
 			open_how.resolve |= libc::RESOLVE_NO_SYMLINKS;
 		}
-		// openat2 ignores the dirfd when given an absolute path, so we
-		// need to remove any leading '/'.
 		let with_nul = host_path.to_bytes_with_nul();
 		let relative_host_path: &CStr = if with_nul.starts_with(b"/") {
 			let mut i = 0;
@@ -565,27 +595,37 @@ impl BindMountSandbox {
 			) as libc::c_int
 		};
 		if host_fd < 0 {
-			let err = io::Error::last_os_error();
 			return Err(BindMountSandboxError::ResolveHostPath(
 				host_path.to_owned(),
-				err,
+				io::Error::last_os_error(),
 			));
 		}
-		let host_fd = ForeignFd { local_fd: host_fd };
+		Ok(ForeignFd { local_fd: host_fd })
+	}
 
-		let mut stat: libc::stat;
-		unsafe {
-			stat = std::mem::zeroed();
-			if libc::fstat(host_fd.as_raw_fd(), &mut stat) != 0 {
-				let err = io::Error::last_os_error();
-				return Err(BindMountSandboxError::StatHostPath(
-					host_path.to_owned(),
-					err,
-				));
-			}
-		}
+	// todo: the semantic of follow_ns_symlinks is ill-defined due to use
+	// of create_hierarchy, which has no visibility into bind-mounted
+	// symlinks
+	pub(self) fn mount_host_into_sandbox_impl(
+		&self,
+		host_path: &CStr,
+		ns_path: &CStr,
+		attrs: MountAttributes,
+		follow_host_symlinks: bool,
+		follow_ns_symlinks: bool,
+		create_placeholders: bool,
+	) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(ns_path)?;
+		let host_fd = self.resolve_host_path(host_path, follow_host_symlinks)?;
 
 		if create_placeholders {
+			let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+			if unsafe { libc::fstat(host_fd.as_raw_fd(), &mut stat) } != 0 {
+				return Err(BindMountSandboxError::StatHostPath(
+					host_path.to_owned(),
+					io::Error::last_os_error(),
+				));
+			}
 			self.create_placeholder_hierarchy(
 				ns_path,
 				stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
@@ -644,7 +684,7 @@ impl BindMountSandbox {
 			return Err(BindMountSandboxError::MountFailed(fork_res));
 		}
 		info!("Mount bind {:?} {:?} {}", host_path, ns_path, attrs,);
-		Ok(stat)
+		Ok(())
 	}
 
 	/// Bind-mount `host_path` at `ns_path` while "carrying over" any
@@ -672,70 +712,25 @@ impl BindMountSandbox {
 		ns_path: &CStr,
 		attrs: MountAttributes,
 		child_ns_paths: &[CString],
-	) -> Result<libc::stat, BindMountSandboxError> {
+	) -> Result<(), BindMountSandboxError> {
 		if child_ns_paths.is_empty() {
 			return self
 				.mount_host_into_sandbox_impl(host_path, ns_path, attrs, false, false, false);
 		}
 		validate_sandbox_path(ns_path)?;
 
-		// Resolve host_path to an O_PATH fd from the m0 root.
-		let mut open_how: libc::open_how = unsafe { std::mem::zeroed() };
-		open_how.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-		open_how.resolve |= libc::RESOLVE_NO_SYMLINKS;
-		let with_nul = host_path.to_bytes_with_nul();
-		let relative_host_path: &CStr = if with_nul.starts_with(b"/") {
-			let mut i = 0;
-			while i < with_nul.len() - 1 && with_nul[i] == b'/' {
-				i += 1;
-			}
-			if i == with_nul.len() - 1 {
-				c"."
-			} else {
-				CStr::from_bytes_with_nul(&with_nul[i..]).unwrap()
-			}
-		} else {
-			host_path
-		};
-		let host_fd = unsafe {
-			libc::syscall(
-				libc::SYS_openat2,
-				self.host_root_fd.as_raw_fd(),
-				relative_host_path.as_ptr(),
-				&open_how,
-				std::mem::size_of_val(&open_how),
-			) as libc::c_int
-		};
-		if host_fd < 0 {
-			return Err(BindMountSandboxError::ResolveHostPath(
-				host_path.to_owned(),
-				io::Error::last_os_error(),
-			));
-		}
-		let host_fd = ForeignFd { local_fd: host_fd };
+		let host_fd = self.resolve_host_path(host_path, false)?;
 
-		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe { libc::fstat(host_fd.as_raw_fd(), &mut stat) } != 0 {
-			return Err(BindMountSandboxError::StatHostPath(
-				host_path.to_owned(),
-				io::Error::last_os_error(),
-			));
-		}
-
-		// Pre-build pointers and an fd scratch buffer before we fork so
-		// the forked child does not allocate.
-		let child_ptrs: Vec<*const libc::c_char> =
-			child_ns_paths.iter().map(|c| c.as_ptr()).collect();
+		// Pre-allocate the fd buffer before we fork so the forked child
+		// does not allocate.
 		let mut child_fds: Vec<libc::c_int> = vec![-1; child_ns_paths.len()];
-		let child_ptrs_ptr = child_ptrs.as_ptr() as usize;
-		let child_fds_ptr = child_fds.as_mut_ptr() as usize;
 		let n_children = child_ns_paths.len();
 
 		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
 		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
 		let host_fd_raw = host_fd.as_raw_fd();
 		let fork_res = unsafe {
-			fork_wait(|| {
+			fork_wait(move || {
 				if let Err(e) = nsenter_fn_m0() {
 					return e.raw_os_error().unwrap_or(libc::EIO);
 				}
@@ -746,55 +741,60 @@ impl BindMountSandbox {
 				if let Err(e) = nsenter_fn_m1() {
 					return e.raw_os_error().unwrap_or(libc::EIO);
 				}
-				let child_ptrs_ptr = child_ptrs_ptr as *const *const libc::c_char;
-				let child_fds_ptr = child_fds_ptr as *mut libc::c_int;
-				// Step 2: open every child while still reachable.
+				if let Err(e) = nsenter_fn_m1() {
+					return e.raw_os_error().unwrap_or(libc::EIO);
+				}
+				// Open every child while still reachable.
 				let mut child_openhow: libc::open_how = mem::zeroed();
 				child_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
 				child_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
 				for i in 0..n_children {
-					let cpath = *child_ptrs_ptr.add(i);
 					let fd = libc::syscall(
 						libc::SYS_openat2,
 						libc::AT_FDCWD,
-						cpath,
+						child_ns_paths[i].as_ptr(),
 						&child_openhow as *const _,
 						std::mem::size_of::<libc::open_how>(),
 					) as libc::c_int;
 					// A child that can't be opened (already gone) is just
 					// skipped; -1 stays in the slot.
-					*child_fds_ptr.add(i) = fd;
+					child_fds[i] = fd;
 				}
-				// Step 3: bind the parent over ns_path (shadows children).
+				// Bind the parent over ns_path (shadows the children).
 				if let Err(e) = source_tree.mount(libc::AT_FDCWD, ns_path, false) {
-					for i in 0..n_children {
-						let fd = *child_fds_ptr.add(i);
+					for &fd in &child_fds {
 						if fd >= 0 {
 							libc::close(fd);
 						}
 					}
 					return e.raw_os_error().unwrap_or(libc::EIO);
 				}
-				// Step 4: move each child back onto its path inside the
-				// new bind mount.  A failure here (mountpoint dentry
-				// missing) leaves the child detached - its fd close below
-				// reclaims it; we don't fail the whole op.
+				// Move each child back onto its path inside the new bind
+				// mount.  If the mountpoint dentry is missing in the new
+				// parent the child can't be moved back, so lazily detach
+				// it (MNT_DETACH) rather than leaving it shadowed; we
+				// don't fail the whole op.
 				for i in 0..n_children {
-					let fd = *child_fds_ptr.add(i);
+					let fd = child_fds[i];
 					if fd < 0 {
 						continue;
 					}
-					let cpath = *child_ptrs_ptr.add(i);
 					let res = libc::syscall(
 						libc::SYS_move_mount,
 						fd,
 						c"".as_ptr(),
 						libc::AT_FDCWD,
-						cpath,
+						child_ns_paths[i].as_ptr(),
 						libc::MOVE_MOUNT_F_EMPTY_PATH,
 					);
-					if res != 0 && ENABLE_LOG_IN_FORK {
-						error!("move_mount(child back) failed: errno {}", res);
+					if res != 0 {
+						if ENABLE_LOG_IN_FORK {
+							error!(
+								"move_mount(child back) failed: errno {}",
+								libc::__errno_location().read()
+							);
+						}
+						umount_detach_fd(fd);
 					}
 					libc::close(fd);
 				}
@@ -813,7 +813,7 @@ impl BindMountSandbox {
 			"Mount bind (covering {} children) {:?} {:?} {}",
 			n_children, host_path, ns_path, attrs
 		);
-		Ok(stat)
+		Ok(())
 	}
 
 	/// Open the parent directory of `sandbox_path` within the backing
@@ -1007,7 +1007,7 @@ impl BindMountSandbox {
 	/// fd that resolves through m1's *current* mount layout.  `openhow`
 	/// gives the open flags / resolve flags; the path is always resolved
 	/// relative to m1's root.  Backs the fd-upgrade / proxy path (§11)
-	/// and the reconcile choreography (opening child mounts and mount
+	/// and the reconcile process (opening child mounts and mount
 	/// targets).
 	///
 	/// We resolve in m1 (not m0) so the sandbox's own mount layout and
@@ -1308,8 +1308,9 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// §6 Unmount choreography: park every direct sub-mount under
-	/// `ns_path` to the hidden scratch tmpfs, attempt a non-detach
+	/// Unmount `ns_path` while preserving its sub-mounts: park every
+	/// direct sub-mount under `ns_path` to the hidden scratch tmpfs,
+	/// attempt a non-detach
 	/// `umount2(ns_path)`, then restore the parked sub-mounts onto their
 	/// original paths.  Returns `Ok(true)` if the parent mount was
 	/// successfully unmounted, or `Ok(false)` if it was kept because the
@@ -2208,9 +2209,9 @@ impl ManagedBindMountSandbox {
 							new_mt.remove(sandbox_path);
 							return;
 						}
-						// §6: discover the direct (topmost) sub-mounts
+						// discover the direct (topmost) sub-mounts
 						// still present under this path in the live tree
-						// and hand them to the Unmount choreography, which
+						// and hand them to the unmount routine, which
 						// parks them out of the way, does a non-detach
 						// umount, then restores them - preserving each
 						// child's `struct mount` identity instead of
@@ -2596,7 +2597,7 @@ mod sandbox_integration_tests {
 	/// unavailable in many CI/build environments (and may be blocked by
 	/// AppArmor); when setup fails we skip the test rather than fail, so
 	/// these privileged integration tests are a no-op where they can't
-	/// run but still exercise the m1 mount choreography where they can.
+	/// run but still exercise the m1 mount logic where they can.
 	fn try_new_sandbox() -> Option<BindMountSandbox> {
 		match BindMountSandbox::new(false) {
 			Ok(sb) => Some(sb),
@@ -2669,7 +2670,7 @@ mod sandbox_integration_tests {
 
 	/// Exercise `unmount_covering` (§6): a parent mount with a child
 	/// sub-mount is unmounted while the child's `struct mount` identity is
-	/// preserved.  After the choreography the parent is gone but the child
+	/// preserved.  Afterwards the parent is gone but the child
 	/// is restored on the revealed placeholder layer.
 	#[test]
 	fn unmount_covering_preserves_child() {
