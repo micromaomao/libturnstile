@@ -344,21 +344,71 @@ fds or proxy a syscall so the app's view matches the live mount layout.
 
 #### 11.2 What `allow()` does, by syscall
 
+The choice between an `ADDFD_SETFD` **swap** (replace the app's fd with a
+fresh one resolved on the current layout) and a **proxy** (perform the op
+supervisor-side in m1 and return its result, leaving the app's fd
+untouched) comes down to one thing — **is the fd upgradable?** — *not*
+whether the call is an `f*` or an `*at`:
+
+- **Upgradable**: a *directory* fd (or an `O_PATH` fd).  It carries no
+  read/write `f_pos` or open state we'd lose by swapping; the only
+  casualty is a `getdents` cursor reset (Limitation #5).
+- **Unupgradable**: a *regular-file* fd (and other types).  Swapping
+  would clobber `f_pos`, open flags, locks, mmap backing — so the design
+  never touches it, and we proxy instead.
+
+So whenever a syscall's access is governed by a held fd whose `mnt_id`
+is stale, we swap it if it's upgradable and proxy it if not.  An
+`*at(dirfd, "nonempty")` is simply the case where the governing fd is
+*guaranteed* a directory → always upgradable → always swapped (never
+proxied); `f*` / `*at(fd, "", AT_EMPTY_PATH)` is the case where the fd
+may be either, so the fd's *type* decides.
+
+Upgradability is read from the app's fd directly: directory-ness from
+`statx` (`S_ISDIR`) and `O_PATH`-ness from the `flags:` field of
+`/proc/<pid>/fdinfo/<fd>` (§11.3).  The two roles an `O_PATH` fd can play
+are handled differently:
+
+- **As an `f*` target** (`fchmod(fd)` / `fchown(fd)` / `fsetxattr(fd)` /
+  an `AT_EMPTY_PATH` op): the kernel rejects it with `EBADF` regardless
+  of the mount layout, so we neither swap nor proxy — just CONTINUE and
+  let it fail natively.
+- **As an `*at` dirfd**: a legitimate use; if the dirfd is stale we
+  swap-upgrade it like any directory fd (an `O_PATH` fd is swap-safe —
+  no `f_pos`/state to lose).
+
+So the only fd that ever *proxies* is a non-`O_PATH` *regular-file* fd,
+and the swap-vs-proxy choice really comes down to `S_ISDIR`.
+
+**`ftruncate` is exempt entirely — always a plain CONTINUE, never proxied
+or swapped.**  Unlike `fchmod`/`fchown`/`fsetxattr`/`fremovexattr` (which
+run fine on a *read-only* fd and only need the *mount* writable, so a
+stale ro-fd whose rw cover is a separate leaf mount still needs the
+proxy), `ftruncate` needs a *writable* fd (`FMODE_WRITE`; a read-only fd
+is `EINVAL`, an `O_PATH` fd `EBADF`).  A writable fd can only have been
+opened on a **rw** mount (`O_WRONLY`/`O_RDWR` on a ro mount is `EROFS` at
+open), and that mount cannot then be downgraded to `ro` while the
+writable fd is open (remount-ro / `mount_setattr` with active writers is
+`EBUSY`).  So an `ftruncate` target fd is *guaranteed* to still sit on a
+writable mount: CONTINUE truncates correctly, and the not-writable cases
+reproduce the very `EINVAL`/`EBADF` the app would get natively.
+
 | Syscall | Action in `allow()` |
 |---|---|
-| `openat` / `openat2` | Re-resolve abspath, open fresh in m1 with the requested flags, identity-check, return the new fd via `ADDFD`. |
-| `chdir` / `fchdir` | Ensure a bind mount exists on the target (§11.5), then CONTINUE. |
-| Any other `*at` with a real `dirfd` (≠ `AT_FDCWD`) | `statx(dirfd).mnt_id` vs the expected mnt_id for the dirfd's path; if stale, m1-open the dirfd's path, identity-check, replace at the same fd number via `ADDFD_SETFD`, CONTINUE. |
-| `fchmod`, `fchown`, `fsetxattr`, `fremovexattr`, `ftruncate` (file fd) | `statx(fd).mnt_id`; if stale, m1-open the path, identity-check, perform the op there, return the result via `notif_resp` (no CONTINUE).  Don't touch the app's fd. |
+| `openat` / `openat2` | Always returns a *fresh* fd: re-resolve abspath, open in m1 with the requested flags, identity-check, hand back via `ADDFD` — so the result is anchored on the current layout regardless of the dirfd's mount. |
+| `chdir` / `fchdir` | Ensure a bind mount exists on the target (§11.5), then CONTINUE.  (cwd itself can't be swapped — §11.5.) |
+| Access governed by a held fd whose `mnt_id` is stale — the dirfd of an `*at(dirfd, relpath)`, or the target fd of an `f*` / `*at(fd, "", AT_EMPTY_PATH)` (`fchmod`/`fchown`/`fsetxattr`/`fremovexattr`/…; **not** `ftruncate` — always CONTINUE, see above) | m1-open the fd's abspath, identity-check, then: **upgradable** (dir / `O_PATH` dirfd) → `ADDFD_SETFD`-swap at the same fd number and CONTINUE (the kernel then resolves / acts through the live layout); **unupgradable** (regular file, …) → perform the op in m1 and return via `notif_resp`, don't touch the app's fd.  (An `f*` whose *target* fd is `O_PATH` is neither swapped nor proxied — CONTINUE; it fails `EBADF` natively.) |
+| Path-based `chmod`/`chown`/`truncate`/`setxattr`/`removexattr` resolved from `/` (absolute) or cwd (`AT_FDCWD`) | The kernel resolves the path afresh on CONTINUE against the live layout, so it lands on the current mount; no proxy.  (cwd is kept current by §11.5, with that section's caveat.  An `*at(dirfd, relpath)` form instead resolves from `dirfd` and rides the held-fd row above.) |
 | Anything else | CONTINUE. |
 
-`openat` needs to always returns a fresh fd via `ADDFD` so the result is
-anchored on the *current* layout regardless of the dirfd's mount.
-
-Dirfd replacement is allowed even for non-`O_PATH` dirfds.  The
-trade-off: an in-progress `getdents`/`getdents64` loop on the same fd
-may see duplicates (the replacement fd is at `f_pos = 0`) — see
-Limitation #5.
+Because `*at(dirfd, "nonempty")` always carries a directory dirfd, it is
+always swap-upgradable; the only ops that ever proxy are `f*` /
+`AT_EMPTY_PATH` ops landing on an unupgradable (regular-file) fd.
+Swapping a dirfd has the usual trade-off — an in-progress
+`getdents`/`getdents64` loop on that fd may see duplicates (the swapped
+fd is at `f_pos = 0`), see Limitation #5 — which is one reason we *could*
+also choose to proxy an upgradable `f*` on a dir fd; the table upgrades
+it for uniformity with the `*at` path.
 
 #### 11.3 fd identity check
 
@@ -373,6 +423,15 @@ if new_fd.inode_id()? != (exp_dev, exp_ino) { /* retry once */ }
 After 2 mismatched retries: log `error!` and fail closed —
 `openat`/`f*`-proxy return `EIO`; a dirfd upgrade is skipped (plain
 CONTINUE without replacement).
+
+The other per-fd properties the upgrade path needs are also read
+supervisor-side from the app's fd: the staleness key (`mnt_id`) and the
+open flags (for the `O_PATH` upgradability test, §11.2) both appear in
+`/proc/<pid>/fdinfo/<fd>` — `mnt_id:`, `ino:`, and `flags:` (octal
+`file->f_flags`, in which `O_PATH` is preserved) — so a single fdinfo
+read covers them.  `fdinfo` carries `ino` but not `st_dev`, so the
+full `(dev, ino)` identity check above still goes through `statx` on
+the `pidfd_getfd`'d fd.
 
 #### 11.4 Why m1, not m0
 
@@ -594,13 +653,15 @@ suffices — no mount privilege needed); or an earlier
     interleaving `getdents` with modifying `*at`s on the same dirfd may
     re-see early entries or miss some.  Rare; the library logs a
     `warn!` on each non-`O_PATH` dirfd replacement.
-6. **f\* modifying ops on a stale file fd are proxied, not
-    transparent.**  `fchmod`/`fchown`/`fsetxattr`/`fremovexattr`/
-    `ftruncate` on a stale fd run against the abspath in m1.  If the
+6. **f\* modifying ops on a stale *regular-file* fd are proxied, not
+    transparent.**  A regular-file fd is unupgradable (§11.2), so
+    `fchmod`/`fchown`/`fsetxattr`/`fremovexattr` on a stale
+    one run against the abspath in m1.  If the
     abspath now resolves to a different inode, the op hits the current
     inode, not the app's pinned one; the identity check (§11.3) catches
     the common case, but a race remains.  m1 errors map 1:1 to the
-    syscall return.
+    syscall return.  (`ftruncate` is exempt — §11.2: a writable fd
+    implies a still-writable mount, so it always CONTINUEs.)
 
 ## Changes needed (relative to current code)
 
