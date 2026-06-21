@@ -3,7 +3,8 @@
 //! Only the few fields the sandbox needs are extracted (see the §13
 //! refresh in `design.fd-upgrade.md`): the kernel mount id, the parent
 //! mount id, the source-root path within the backing superblock (field
-//! 4, used to detect an unlinked / renamed bind source), and the mount
+//! 4, used only to detect an unlinked bind source via its `//deleted`
+//! marker - it is *not* the bound host path in general), and the mount
 //! point within the namespace (field 5).
 //!
 //! mountinfo is documented in `proc(5)`.  Path-like fields are
@@ -23,9 +24,11 @@ pub(crate) struct MountinfoEntry {
 	pub mnt_id: u64,
 	/// Field 2: the mount id of this mount's parent.
 	pub parent_mnt_id: u64,
-	/// Field 4 with any trailing `//deleted` marker removed: the
-	/// location of this mount's root dentry within its superblock (i.e.
-	/// the live host path of a bind source, octal-unescaped).
+	/// Field 4 with any trailing `//deleted` marker removed: the location
+	/// of this mount's root dentry *within its source superblock*
+	/// (octal-unescaped).  Note this is **not** the bound host path in
+	/// general - for a bind of a mount point (e.g. `/proc`) it is just
+	/// `/`.  Used only via [`Self::deleted`] to spot an unlinked source.
 	pub root: OsString,
 	/// True when field 4 ended in `//deleted` - the bind source was
 	/// unlinked on the host while still mounted.

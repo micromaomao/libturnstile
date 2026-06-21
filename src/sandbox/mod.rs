@@ -2495,11 +2495,28 @@ impl ManagedBindMountSandbox {
 	/// §13: refresh `current_mt` from m1's `/proc/self/mountinfo`.
 	///
 	/// Joins each tracked entry to its live mountinfo line by `mnt_id`:
-	/// an entry whose `mnt_id` is absent from mountinfo is dropped (its
-	/// mount is gone); a `//deleted` source flags the entry `expired`;
-	/// a renamed source (different root path, no `//deleted`) updates the
-	/// recorded `host_path` without expiring.  Entries with a 0 `mnt_id`
-	/// (capture previously failed) are kept untouched.
+	///
+	/// - absent from mountinfo → the mount is gone; drop it.
+	/// - at a different mount point than where we track it → the mount
+	///   (or an ancestor it rides on) moved; relocate the entry to its
+	///   live path (field 5, same coordinate space as our tree keys).
+	/// - source dentry shows `//deleted` → flag the entry `expired` so the
+	///   next reconcile rebuilds it.
+	///
+	/// Entries with a 0 `mnt_id` (capture previously failed) have no join
+	/// key and are kept untouched at their current path.
+	///
+	/// Note: `host_path` is deliberately **not** refreshed from mountinfo.
+	/// Field 4 ("root") is the location of the mount's root dentry *within
+	/// its source superblock*, which equals the path we bound only when
+	/// that path is a plain directory of that fs; when the bound path is
+	/// itself a mount point (e.g. binding `/proc`), the root field is just
+	/// `/` of that fs.  No kernel API records the original bind-source path
+	/// (statmount/listmount's `mnt_root` reports the same in-superblock
+	/// path), so detecting a host-side *rename* of a bind source is given
+	/// up on for now - `host_path` stays as recorded at mount time.  (A
+	/// `//deleted` *unlink* is still detected, since that marker is a
+	/// reliable per-mount signal.)
 	///
 	/// Best-effort: on any error reading or parsing mountinfo, the tree
 	/// is left unchanged.
@@ -2521,63 +2538,52 @@ impl ManagedBindMountSandbox {
 			by_id.insert(e.mnt_id, e);
 		}
 
-		// (path, deleted, new_host)
-		let mut updates: Vec<(OsString, bool, Option<CString>)> = Vec::new();
-		let mut drops: Vec<OsString> = Vec::new();
+		// Rebuild the tree so each still-live entry lands at its current
+		// live mount point (a mount - or an ancestor it rides on - may have
+		// moved since we last looked).  An entry whose `mnt_id` is gone from
+		// mountinfo is dropped by simply not re-inserting it.
+		let mut new_tree: FsTree<MountInternal> = FsTree::new();
 		current_mt.walk_top_down(|path, mi| {
 			if mi.mnt_id == 0 {
-				// No usable join key; leave as-is.
+				// No usable join key; keep it where it is, untouched.
+				new_tree.insert(path, mi.clone());
 				return;
 			}
 			match by_id.get(&mi.mnt_id) {
 				None => {
 					debug!(
-						"refresh_mount_tree: {:?} mnt_id={} gone from mountinfo",
+						"refresh_mount_tree: {:?} mnt_id={} gone from mountinfo, dropping",
 						path, mi.mnt_id
 					);
-					drops.push(OsString::from(path));
 				}
-				// Some(info) => {
-				// 	let new_host =
-				// 		if !info.deleted && info.root.as_bytes() != mi.user.host_path.to_bytes() {
-				// 			CString::new(info.root.as_bytes()).ok()
-				// 		} else {
-				// 			None
-				// 		};
-				// 	updates.push((OsString::from(path), info.deleted, new_host));
-				// }
-				Some(info) if info.deleted => {
-					debug!(
-						"refresh_mount_tree: {:?} mnt_id={} source {:?} is //deleted",
-						path, mi.mnt_id, info.root
-					);
-					updates.push((OsString::from(path), true, None));
+				Some(info) => {
+					let mut entry = mi.clone();
+					// A `//deleted` source dentry means the bind source was
+					// unlinked on the host while still mounted; flag it so the
+					// next reconcile rebuilds the mount (§13).  `host_path` is
+					// left as-is (see the note on this method).
+					entry.expired = info.deleted;
+					if info.deleted {
+						debug!(
+							"refresh_mount_tree: {:?} mnt_id={} source is //deleted",
+							path, mi.mnt_id
+						);
+					}
+					// Relocate to the live mount point: mountinfo field 5 is
+					// this mount's current path in m1, the same coordinate
+					// space as our tree keys.
+					let live_mp = info.mount_point.as_os_str();
+					if live_mp != path {
+						debug!(
+							"refresh_mount_tree: mnt_id={} moved {:?} -> {:?}",
+							mi.mnt_id, path, live_mp
+						);
+					}
+					new_tree.insert(live_mp, entry);
 				}
-				Some(info)
-					if !info.deleted && info.root.as_bytes() != mi.user.host_path.to_bytes() =>
-				{
-					debug!(
-						"refresh_mount_tree: {:?} mnt_id={} source renamed {:?} -> {:?}",
-						path, mi.mnt_id, mi.user.host_path, info.root
-					);
-					let new_host = CString::new(info.root.as_bytes()).ok();
-					updates.push((OsString::from(path), false, new_host));
-				}
-				_ => {}
 			}
 		});
-
-		for (path, deleted, new_host) in updates {
-			if let Some(entry) = current_mt.get_mut(&path) {
-				entry.expired = deleted;
-				if let Some(h) = new_host {
-					entry.user.host_path = h;
-				}
-			}
-		}
-		for path in drops {
-			current_mt.remove(&path);
-		}
+		*current_mt = new_tree;
 	}
 
 	/// §4 `SetAttrToCovering`: the attributes a path should fall back to

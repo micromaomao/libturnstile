@@ -547,22 +547,31 @@ mount is still alive:
 - The mount keeps working either way (the kernel pins the inode; the
   source dentry stays valid whether it was renamed or
   unlinked-while-mounted).
-- `/proc/<pid>/mountinfo`'s root field (field 4) tracks the source
-  dentry's live location within its superblock:
+- `/proc/<pid>/mountinfo`'s root field (field 4) is the location of the
+  mount's root dentry *within its source superblock* — **not** the host
+  path we bound.  It coincides with the bound path only when that path
+  is a plain directory of the superblock's fs; binding a mount point
+  (e.g. `/proc`) yields a root field of just `/`.  We use it only for the
+  one reliable per-mount signal it carries:
   - **unlinked** (`rm` / `rmdir` of a still-mounted source) → the field
     gains a trailing `//deleted` (it's now a `d_unlinked()` dentry).
-  - **renamed** (`mv`) → the field shows the *new* source path; the
-    dentry is alive, so there is **no** `//deleted` marker.
+  - **renamed** (`mv`) → the field shows the dentry's *new*
+    within-superblock location, with **no** `//deleted` marker.  Because
+    that location isn't the bound host path in general, we do **not** try
+    to recover a renamed source from it (see below).
 
 Only the **unlinked** case sets `expired`.  Its point is to *recreate* a
 mount whose source no longer exists, so that if the host later puts a
 fresh file/dir at the original `host_path` the sandbox picks it up (an
 unlinked-but-mounted inode would otherwise keep serving stale,
-now-orphaned contents forever).  A rename is **not** expired — the
-source still exists (just elsewhere) and the mount keeps serving it
-correctly — but the refresh does update the entry's recorded `host_path`
-to the new location so it stays accurate for a later re-bind /
-`ReplaceHostPath`.
+now-orphaned contents forever).  A **rename** of the source is *not*
+detected: the root field's within-superblock location can't be mapped
+back to a host path in general, and no kernel API records the original
+bind-source path (statmount/listmount's `mnt_root` is the same
+within-superblock path).  So `host_path` is left as recorded at mount
+time — detecting host-side source renames is given up on for now (a
+documented limitation); the mount keeps serving the renamed source
+correctly regardless.
 
 The app's syscalls don't reveal an unlinked source, so we refresh from
 mountinfo on demand and before each reconcile.
@@ -592,18 +601,17 @@ the staleness key for fd upgrades (§11) and the join key for refresh.
 2. Parse each line into `(mnt_id, parent_mnt_id, root_from_fs,
    mountpoint_in_ns, options, …)`.
 3. Build a fresh `new_current_mt`:
-   - mnt_id present in old `current_mt` → copy its `MountInternal` to
-     `new_current_mt` at the mountinfo `mountpoint_in_ns` (the path may
-     have moved if a parent moved).
+   - mnt_id present in old `current_mt` → copy its `MountInternal` into
+     `new_current_mt` **at the mountinfo `mountpoint_in_ns`** (field 5),
+     relocating it if the mount or an ancestor it rides on has moved.
    - mnt_id in old `current_mt` but absent from mountinfo → the mount
-     is gone (see below); drop it.
+     is gone (see below); drop it (don't re-insert).
    - `root_from_fs` ends in `//deleted` (source unlinked) → copy with
      `expired = true`.
-   - `root_from_fs` shows a *different* path than the recorded
-     `host_path` (source renamed) → copy with its `host_path` updated to
-     the new `root_from_fs`, **not** `expired`; the mount still works,
-     and keeping `host_path` accurate means a later `ReplaceHostPath` /
-     re-bind targets the real source.
+   - `host_path` is **never** refreshed from `root_from_fs` (it isn't the
+     bound path in general — see above); it stays as recorded at mount
+     time.  Entries with a 0 `mnt_id` (capture failed) have no join key
+     and are kept untouched at their current path.
 4. Replace `current_mt` with `new_current_mt`.
 
 **Expired entries** (the bind source was unlinked on the host —
@@ -679,6 +687,14 @@ suffices — no mount privilege needed); or an earlier
     the common case, but a race remains.  m1 errors map 1:1 to the
     syscall return.  (`ftruncate` is exempt — §11.2: a writable fd
     implies a still-writable mount, so it always CONTINUEs.)
+7. **Host-side rename of a bind source is not detected.**  The §13
+   refresh can't recover a renamed source: mountinfo's root field is the
+   mount root's path *within its source superblock*, not the bound host
+   path (binding a mount point yields just `/`), and no kernel API
+   records the original bind-source path.  So `host_path` stays as
+   recorded at mount time; an `mv` of the source on the host goes
+   unnoticed (the mount keeps serving it correctly).  Only an *unlink*
+   (`//deleted`) is detected, via `expired`.
 
 ## Changes needed (relative to current code)
 
