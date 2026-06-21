@@ -1954,6 +1954,38 @@ impl PlaceholderSymlinkData {
 	}
 }
 
+/// Debug-print an [`FsTree`], one node per line, indented by depth and
+/// using [`FsTree::walk_top_down`].  Each line is `<path>: <Debug of
+/// node>`, e.g.
+///
+/// ```text
+/// /: ...
+///   /usr: ...
+///   /home: ...
+///     /home/mao: ...
+///   /proc: ...
+/// ```
+fn print_tree<T: std::fmt::Debug>(label: &str, tree: &FsTree<T>) {
+	if !log::log_enabled!(log::Level::Debug) {
+		return;
+	}
+	let mut out = format!("{}:", label);
+	tree.walk_top_down(|path, node| {
+		let depth = path
+			.as_encoded_bytes()
+			.split(|&b| b == b'/')
+			.filter(|s| !s.is_empty())
+			.count();
+		out.push_str(&format!(
+			"\n{}{}: {:?}",
+			"  ".repeat(depth),
+			path.to_string_lossy(),
+			node
+		));
+	});
+	debug!("{}", out);
+}
+
 /// Implements a bind-mount based sandbox that automatically mount and
 /// unmounts based on a desired state.
 #[derive(Debug)]
@@ -2162,10 +2194,10 @@ impl ManagedBindMountSandbox {
 		desired_entries: &FsTree<ManagedTreeEntry>,
 	) -> Vec<(OsString, BindMountSandboxError)> {
 		let (desired_pt, desired_mt, mut errors) = self.build_desired_trees(desired_entries);
-		debug!("Current placeholder tree: {:?}", current_pt);
-		debug!("Desired placeholder tree: {:?}", desired_pt);
-		debug!("Current mount tree: {:?}", current_mt);
-		debug!("Desired mount tree: {:?}", desired_mt);
+		print_tree("Current placeholder tree", current_pt);
+		print_tree("Desired placeholder tree", &desired_pt);
+		print_tree("Current mount tree", current_mt);
+		print_tree("Desired mount tree", &desired_mt);
 
 		let mut new_pt = current_pt.clone();
 		let mut new_mt = current_mt.clone();
