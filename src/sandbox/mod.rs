@@ -741,9 +741,6 @@ impl BindMountSandbox {
 				if let Err(e) = nsenter_fn_m1() {
 					return e.raw_os_error().unwrap_or(libc::EIO);
 				}
-				if let Err(e) = nsenter_fn_m1() {
-					return e.raw_os_error().unwrap_or(libc::EIO);
-				}
 				// Open every child while still reachable.
 				let mut child_openhow: libc::open_how = mem::zeroed();
 				child_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
@@ -788,11 +785,9 @@ impl BindMountSandbox {
 						libc::MOVE_MOUNT_F_EMPTY_PATH,
 					);
 					if res != 0 {
+						let err = libc::__errno_location().read();
 						if ENABLE_LOG_IN_FORK {
-							error!(
-								"move_mount(child back) failed: errno {}",
-								libc::__errno_location().read()
-							);
+							error!("move_mount(child back) failed: errno {}", err);
 						}
 						umount_detach_fd(fd);
 					}
