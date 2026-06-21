@@ -2,7 +2,8 @@ use std::{
 	borrow::Cow,
 	collections::HashMap,
 	ffi::{CStr, CString, OsStr, OsString},
-	io, mem,
+	io::{self, Write},
+	mem,
 	os::{
 		fd::{AsRawFd, IntoRawFd},
 		unix::{ffi::OsStrExt, process::CommandExt},
@@ -37,35 +38,18 @@ fn next_scratch_name() -> CString {
 	CString::new(format!("park-{pid}-{n}")).expect("no NUL in generated name")
 }
 
-/// Lazily detach the mount referred to by `fd` (an `O_PATH` handle to a
-/// mount root) via `umount2(MNT_DETACH)` on its `/proc/self/fd` magic
-/// symlink.  Used to discard a sub-mount that could not be moved back
-/// into a freshly-bound parent, rather than leaving it shadowed beneath
-/// the new mount.  Must stay async-signal-safe (called from a forked
-/// child): builds the path in a stack buffer without allocating.
+/// Call umount("/proc/self/fd/<fd>", MNT_DETACH) in a async-signal-safe
+/// manner.
 unsafe fn umount_detach_fd(fd: libc::c_int) {
 	const PREFIX: &[u8] = b"/proc/self/fd/";
 	let mut buf = [0u8; PREFIX.len() + 11];
 	buf[..PREFIX.len()].copy_from_slice(PREFIX);
-	// Render the (non-negative) fd as decimal.
-	let mut digits = [0u8; 10];
-	let mut n = fd as u32;
-	let mut di = digits.len();
-	loop {
-		di -= 1;
-		digits[di] = b'0' + (n % 10) as u8;
-		n /= 10;
-		if n == 0 {
-			break;
+	if let Err(e) = write!(&mut buf[PREFIX.len()..], "{}", fd) {
+		if ENABLE_LOG_IN_FORK {
+			error!("Failed to format fd path for umount: {}", e);
 		}
+		unsafe { libc::_exit(1) };
 	}
-	let mut pos = PREFIX.len();
-	while di < digits.len() {
-		buf[pos] = digits[di];
-		pos += 1;
-		di += 1;
-	}
-	buf[pos] = 0;
 	unsafe {
 		if libc::umount2(buf.as_ptr() as *const libc::c_char, libc::MNT_DETACH) != 0
 			&& ENABLE_LOG_IN_FORK
