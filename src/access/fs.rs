@@ -741,6 +741,11 @@ pub struct TruncateOperation {
 }
 
 #[derive(Debug)]
+pub struct ListXattrOperation {
+	pub target: FsTarget,
+}
+
+#[derive(Debug)]
 pub struct GetXattrOperation {
 	pub target: FsTarget,
 	pub name: CString,
@@ -775,6 +780,7 @@ pub enum FsOperation {
 	FsChmod(ChmodOperation),
 	FsChown(ChownOperation),
 	FsTruncate(TruncateOperation),
+	FsListXattr(ListXattrOperation),
 	FsGetXattr(GetXattrOperation),
 	FsSetXattr(SetXattrOperation),
 	FsRemoveXattr(RemoveXattrOperation),
@@ -922,6 +928,9 @@ impl std::fmt::Display for FsOperation {
 			Self::FsTruncate(TruncateOperation { target, length }) => {
 				write!(f, "truncate {} {}", length, target)?;
 			}
+			Self::FsListXattr(ListXattrOperation { target }) => {
+				write!(f, "listxattr {}", target)?;
+			}
 			Self::FsGetXattr(GetXattrOperation { target, name }) => {
 				write!(f, "getxattr {} {}", name.to_string_lossy(), target)?;
 			}
@@ -1016,7 +1025,8 @@ impl FsOperation {
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
 			}
-			Self::FsGetXattr(GetXattrOperation { target, .. }) => {
+			Self::FsListXattr(ListXattrOperation { target })
+			| Self::FsGetXattr(GetXattrOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), read)]
 			}
 			Self::FsChmod(ChmodOperation { target, .. })
