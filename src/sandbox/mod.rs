@@ -2028,6 +2028,7 @@ impl ManagedBindMountSandbox {
 		path: &OsStr,
 		mp: ManagedMountPoint,
 	) -> Result<(), BindMountSandboxError> {
+		debug!("add_or_update_mount: path={:?}, mp={:?}", path, mp);
 		self.add_or_update_entry(path, ManagedTreeEntry::BindMount(mp))
 	}
 
@@ -2217,15 +2218,28 @@ impl ManagedBindMountSandbox {
 					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
 					crate::fstree::DiffTree::Removed(old) => {
-						// A `Removed` whose path still exists in the
-						// desired mount tree is half of a host_path-change
-						// "split" (§5): the diff emits Removed(P) then
-						// Added(P).  Its identity is being discarded and
-						// the following Added re-covers P, so detach the
-						// old bind unconditionally (MNT_DETACH) rather than
+						// A `Removed` whose path still exists in the desired
+						// mount tree *with a different host_path* is the
+						// removed half of a host_path-change "split" (§5):
+						// the diff emits Removed(P) then Added(P).  That
+						// mount's identity is being discarded and the
+						// following Added re-covers P, so detach the old
+						// bind unconditionally (MNT_DETACH) rather than
 						// running the §6 keep-on-EBUSY dance - keeping it
 						// would leave the new bind shadowing the old one.
-						if desired_mt.get(sandbox_path).is_some() {
+						//
+						// A `Removed` whose path is gone from the desired
+						// tree, or still present with the *same* host_path,
+						// is not a split: it is a genuine removal (e.g. a
+						// dummy `chdir` mount being garbage-collected now
+						// that the caller dropped it from the desired tree,
+						// §11.5; or a child swept into a split because an
+						// *ancestor's* host_path changed).  Those go through
+						// the gentle keep-on-EBUSY unmount below so a
+						// still-held cwd / fd isn't broken by a MNT_DETACH.
+						if let Some(new) = desired_mt.get(sandbox_path)
+							&& new.host_path != old.user.host_path
+						{
 							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
 								errors.push((sandbox_path.to_owned(), e));
 								return;
@@ -2507,6 +2521,7 @@ impl ManagedBindMountSandbox {
 			by_id.insert(e.mnt_id, e);
 		}
 
+		// (path, deleted, new_host)
 		let mut updates: Vec<(OsString, bool, Option<CString>)> = Vec::new();
 		let mut drops: Vec<OsString> = Vec::new();
 		current_mt.walk_top_down(|path, mi| {
@@ -2515,16 +2530,40 @@ impl ManagedBindMountSandbox {
 				return;
 			}
 			match by_id.get(&mi.mnt_id) {
-				None => drops.push(OsString::from(path)),
-				Some(info) => {
-					let new_host =
-						if !info.deleted && info.root.as_bytes() != mi.user.host_path.to_bytes() {
-							CString::new(info.root.as_bytes()).ok()
-						} else {
-							None
-						};
-					updates.push((OsString::from(path), info.deleted, new_host));
+				None => {
+					debug!(
+						"refresh_mount_tree: {:?} mnt_id={} gone from mountinfo",
+						path, mi.mnt_id
+					);
+					drops.push(OsString::from(path));
 				}
+				// Some(info) => {
+				// 	let new_host =
+				// 		if !info.deleted && info.root.as_bytes() != mi.user.host_path.to_bytes() {
+				// 			CString::new(info.root.as_bytes()).ok()
+				// 		} else {
+				// 			None
+				// 		};
+				// 	updates.push((OsString::from(path), info.deleted, new_host));
+				// }
+				Some(info) if info.deleted => {
+					debug!(
+						"refresh_mount_tree: {:?} mnt_id={} source {:?} is //deleted",
+						path, mi.mnt_id, info.root
+					);
+					updates.push((OsString::from(path), true, None));
+				}
+				Some(info)
+					if !info.deleted && info.root.as_bytes() != mi.user.host_path.to_bytes() =>
+				{
+					debug!(
+						"refresh_mount_tree: {:?} mnt_id={} source renamed {:?} -> {:?}",
+						path, mi.mnt_id, mi.user.host_path, info.root
+					);
+					let new_host = CString::new(info.root.as_bytes()).ok();
+					updates.push((OsString::from(path), false, new_host));
+				}
+				_ => {}
 			}
 		});
 

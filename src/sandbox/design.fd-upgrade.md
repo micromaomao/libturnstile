@@ -424,6 +424,15 @@ After 2 mismatched retries: log `error!` and fail closed —
 `openat`/`f*`-proxy return `EIO`; a dirfd upgrade is skipped (plain
 CONTINUE without replacement).
 
+**Exception — a dirfd that resolves to `/`.**  When the held dirfd being
+re-resolved is the sandbox root itself (its `/proc/<pid>/fd/<n>` readlink
+is `/`), the reopen skips the identity check and simply `dup`s the target
+root fd.  The app's `/` and the supervisor's target root are *legitimately
+distinct inodes* (the app sees the `root_tmpfs` bind mount; the reopen
+root is a separate handle), so an identity comparison there would
+spuriously fail — yet "the root, re-resolved under the new root" is by
+definition just that new root.
+
 The other per-fd properties the upgrade path needs are also read
 supervisor-side from the app's fd: the staleness key (`mnt_id`) and the
 open flags (for the `O_PATH` upgradability test, §11.2) both appear in
