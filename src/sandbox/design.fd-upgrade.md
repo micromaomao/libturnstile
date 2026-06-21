@@ -540,6 +540,15 @@ scope here.
 
 ## 13. Refreshing the mount tree from `/proc/<pid>/mountinfo`
 
+> **Note: this section describes future work — the mountinfo-based
+> refresh is not currently implemented.**  The code that read m1's
+> mountinfo and reconciled `current_mt` against it (`refresh_mount_tree`
+> and the per-reconcile call into it) has been removed for now; the
+> sections below are retained as a design sketch for when it is
+> revisited.  Until then `current_mt` is trusted as-is, so host-side
+> changes under a live mount (an unlinked / renamed bind source, or a
+> mount relocated out from under us) are not detected.
+
 The host fs can change under an active sandbox.  In particular the
 source dentry backing one of our bind mounts can be unlinked while the
 mount is still alive:

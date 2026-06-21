@@ -1,11 +1,13 @@
 //! A small hand-rolled parser for `/proc/<pid>/mountinfo`.
 //!
-//! Only the few fields the sandbox needs are extracted (see the §13
-//! refresh in `design.fd-upgrade.md`): the kernel mount id, the parent
-//! mount id, the source-root path within the backing superblock (field
-//! 4, used only to detect an unlinked bind source via its `//deleted`
-//! marker - it is *not* the bound host path in general), and the mount
-//! point within the namespace (field 5).
+//! Currently used only by the integration tests to introspect the live
+//! mount layout (a mountinfo-based mount-tree refresh is future work, see
+//! §13 in `design.fd-upgrade.md`).  Only the few fields needed are
+//! extracted: the kernel mount id, the parent mount id, the source-root
+//! path within the backing superblock (field 4, whose only reliable
+//! signal is the `//deleted` marker of an unlinked source - it is *not*
+//! the bound host path in general), and the mount point within the
+//! namespace (field 5).
 //!
 //! mountinfo is documented in `proc(5)`.  Path-like fields are
 //! octal-escaped: space, tab, newline and backslash are written as
