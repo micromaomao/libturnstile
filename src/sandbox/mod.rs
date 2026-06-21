@@ -1,5 +1,6 @@
 use std::{
 	borrow::Cow,
+	collections::HashMap,
 	ffi::{CStr, CString, OsStr, OsString},
 	io::{self, Write},
 	mem,
@@ -79,7 +80,6 @@ macro_rules! perror {
 }
 
 mod mount_obj;
-#[cfg(test)]
 mod mountinfo;
 mod namespace;
 mod upgrade;
@@ -1068,8 +1068,8 @@ impl BindMountSandbox {
 
 	/// Read `/proc/self/mountinfo` as seen from inside m1, returning its
 	/// raw bytes.  A short-lived helper forks, `setns`es into m1, reads
-	/// its own mountinfo (now m1's view) and streams it back.  Used by the
-	/// integration tests to introspect the live mount layout.
+	/// its own mountinfo (now m1's view) and streams it back.  Backs the
+	/// §13 mount-tree refresh.
 	pub fn read_m1_mountinfo(&self) -> Result<Vec<u8>, BindMountSandboxError> {
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, false, true, false) };
 		unsafe {
@@ -1452,8 +1452,10 @@ pub struct ManagedMountPoint {
 
 /// Internal per-mount bookkeeping kept in `current_mount_tree`.  Wraps
 /// the user-facing [`ManagedMountPoint`] with the kernel `mnt_id`
-/// captured at mount-creation time, used as the fd-staleness key for
-/// §11.
+/// captured at mount-creation time (used as the join key for the §13
+/// mountinfo refresh and, in future, the fd-staleness key for §11), and
+/// an `expired` flag set by the refresh when the bind source has been
+/// unlinked on the host (`//deleted`).
 #[derive(Debug, Clone)]
 pub(crate) struct MountInternal {
 	/// host_path + currently-applied attrs (the user-visible part).
@@ -1461,6 +1463,10 @@ pub(crate) struct MountInternal {
 	/// Kernel `mnt_id` captured at creation via `statx(STATX_MNT_ID)`
 	/// from the m1 helper; 0 if the capture failed.
 	pub mnt_id: u64,
+	/// Set by the refresh when mountinfo shows the bind source as
+	/// `//deleted`; forces umount-and-readd on the next reconcile if
+	/// still desired.
+	pub expired: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2161,6 +2167,12 @@ impl ManagedBindMountSandbox {
 		current_mt: &mut FsTree<MountInternal>,
 		desired_entries: &FsTree<ManagedTreeEntry>,
 	) -> Vec<(OsString, BindMountSandboxError)> {
+		// §13: refresh the mount tree from m1's mountinfo so the diff
+		// input is kernel-truthful (drops vanished mounts, tracks renamed
+		// bind sources, flags unlinked sources as expired).  Best-effort:
+		// on any read/parse failure we keep the current tree as-is.
+		self.refresh_mount_tree(current_mt);
+
 		let (desired_pt, desired_mt, mut errors) = self.build_desired_trees(desired_entries);
 		debug!("Current placeholder tree: {:?}", current_pt);
 		debug!("Desired placeholder tree: {:?}", desired_pt);
@@ -2304,12 +2316,38 @@ impl ManagedBindMountSandbox {
 							MountInternal {
 								user: (*new).clone(),
 								mnt_id,
+								expired: false,
 							},
 						);
 					}
 					crate::fstree::DiffTree::Updated(old, new) => {
 						assert_eq!(old.user.host_path, new.host_path);
-						if old.user.attrs != new.attrs {
+						// §13: an expired entry (host source was unlinked
+						// while mounted) is rebuilt so the sandbox picks up
+						// any freshly created host dentry at the same path.
+						if old.expired {
+							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
+								errors.push((sandbox_path.to_owned(), e));
+								return;
+							}
+							if let Err(e) = self.sandbox.mount_host_into_sandbox_impl(
+								&new.host_path,
+								&ns_path,
+								new.attrs,
+								false,
+								false,
+								false,
+							) {
+								errors.push((sandbox_path.to_owned(), e));
+								return;
+							}
+							let mnt_id = self.capture_mnt_id(&ns_path);
+							*new_mt.get_mut(sandbox_path).expect("must exist") = MountInternal {
+								user: (*new).clone(),
+								mnt_id,
+								expired: false,
+							};
+						} else if old.user.attrs != new.attrs {
 							if let Err(e) =
 								self.sandbox
 									.set_mount_attr(&ns_path, new.attrs, old.user.attrs)
@@ -2430,8 +2468,8 @@ impl ManagedBindMountSandbox {
 	/// Capture the kernel `mnt_id` of the mount currently topmost at
 	/// `ns_path`, by opening an `O_PATH` handle to it in m1 and running
 	/// `statx(STATX_MNT_ID)`.  Returns 0 (and logs) if the capture
-	/// fails, since a missing id only degrades the §11 fd-staleness check
-	/// for that one entry rather than breaking the mount.
+	/// fails, since a missing id only degrades the §13 refresh join for
+	/// that one entry rather than breaking the mount.
 	fn capture_mnt_id(&self, ns_path: &CStr) -> u64 {
 		let mut openhow: libc::open_how = unsafe { mem::zeroed() };
 		openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
@@ -2452,6 +2490,100 @@ impl ManagedBindMountSandbox {
 				0
 			}
 		}
+	}
+
+	/// §13: refresh `current_mt` from m1's `/proc/self/mountinfo`.
+	///
+	/// Joins each tracked entry to its live mountinfo line by `mnt_id`:
+	///
+	/// - absent from mountinfo → the mount is gone; drop it.
+	/// - at a different mount point than where we track it → the mount
+	///   (or an ancestor it rides on) moved; relocate the entry to its
+	///   live path (field 5, same coordinate space as our tree keys).
+	/// - source dentry shows `//deleted` → flag the entry `expired` so the
+	///   next reconcile rebuilds it.
+	///
+	/// Entries with a 0 `mnt_id` (capture previously failed) have no join
+	/// key and are kept untouched at their current path.
+	///
+	/// Note: `host_path` is deliberately **not** refreshed from mountinfo.
+	/// Field 4 ("root") is the location of the mount's root dentry *within
+	/// its source superblock*, which equals the path we bound only when
+	/// that path is a plain directory of that fs; when the bound path is
+	/// itself a mount point (e.g. binding `/proc`), the root field is just
+	/// `/` of that fs.  No kernel API records the original bind-source path
+	/// (statmount/listmount's `mnt_root` reports the same in-superblock
+	/// path), so detecting a host-side *rename* of a bind source is given
+	/// up on for now - `host_path` stays as recorded at mount time.  (A
+	/// `//deleted` *unlink* is still detected, since that marker is a
+	/// reliable per-mount signal.)
+	///
+	/// Best-effort: on any error reading or parsing mountinfo, the tree
+	/// is left unchanged.
+	fn refresh_mount_tree(&self, current_mt: &mut FsTree<MountInternal>) {
+		if current_mt.is_empty() {
+			return;
+		}
+		let raw = match self.sandbox.read_m1_mountinfo() {
+			Ok(b) => b,
+			Err(e) => {
+				warn!("mountinfo refresh skipped: {}", e);
+				return;
+			}
+		};
+		let entries = mountinfo::parse_mountinfo(&raw);
+		// Index the parsed lines by mnt_id for the join.
+		let mut by_id: HashMap<u64, &mountinfo::MountinfoEntry> = HashMap::new();
+		for e in &entries {
+			by_id.insert(e.mnt_id, e);
+		}
+
+		// Rebuild the tree so each still-live entry lands at its current
+		// live mount point (a mount - or an ancestor it rides on - may have
+		// moved since we last looked).  An entry whose `mnt_id` is gone from
+		// mountinfo is dropped by simply not re-inserting it.
+		let mut new_tree: FsTree<MountInternal> = FsTree::new();
+		current_mt.walk_top_down(|path, mi| {
+			if mi.mnt_id == 0 {
+				// No usable join key; keep it where it is, untouched.
+				new_tree.insert(path, mi.clone());
+				return;
+			}
+			match by_id.get(&mi.mnt_id) {
+				None => {
+					debug!(
+						"refresh_mount_tree: {:?} mnt_id={} gone from mountinfo, dropping",
+						path, mi.mnt_id
+					);
+				}
+				Some(info) => {
+					let mut entry = mi.clone();
+					// A `//deleted` source dentry means the bind source was
+					// unlinked on the host while still mounted; flag it so the
+					// next reconcile rebuilds the mount (§13).  `host_path` is
+					// left as-is (see the note on this method).
+					entry.expired = info.deleted;
+					if info.deleted {
+						debug!(
+							"refresh_mount_tree: {:?} mnt_id={} source is //deleted",
+							path, mi.mnt_id
+						);
+					}
+					// Relocate to the live mount point: mountinfo field 5 is
+					// this mount's current path in m1, the same coordinate
+					// space as our tree keys.
+					let live_mp = info.mount_point.as_os_str();
+					if live_mp != path {
+						debug!(
+							"refresh_mount_tree: mnt_id={} moved {:?} -> {:?}",
+							mi.mnt_id, path, live_mp
+						);
+					}
+					new_tree.insert(live_mp, entry);
+				}
+			}
+		});
+		*current_mt = new_tree;
 	}
 
 	/// §4 `SetAttrToCovering`: the attributes a path should fall back to
