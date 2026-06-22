@@ -88,22 +88,38 @@ impl ForeignFd {
 		Ok(OsString::from_vec(buf))
 	}
 
-	/// Return the `(st_dev, st_ino)` identity of the inode this fd
-	/// refers to, using `statx(2)` with `AT_EMPTY_PATH`.
-	pub fn inode_id(&self) -> Result<InodeId, io::Error> {
+	/// Call `statx()` on this fd with `AT_EMPTY_PATH | AT_STATX_DONT_SYNC |
+	/// AT_SYMLINK_NOFOLLOW` and the provided `mask`.
+	fn statx(&self, mask: u32) -> Result<libc::statx, io::Error> {
 		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
 		let ret = unsafe {
 			libc::statx(
 				self.local_fd,
 				c"".as_ptr(),
 				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
-				libc::STATX_INO,
+				mask,
 				&mut stx,
 			)
 		};
 		if ret < 0 {
-			return Err(io::Error::last_os_error());
+			let err = io::Error::last_os_error();
+			let try_realpath = self
+				.readlink()
+				.ok()
+				.unwrap_or_else(|| OsString::from("???"));
+			error!(
+				"statx failed on fd {} (-> {:?}): {}",
+				self.local_fd, try_realpath, err
+			);
+			return Err(err);
 		}
+		Ok(stx)
+	}
+
+	/// Return the `(st_dev, st_ino)` identity of the inode this fd
+	/// refers to, using `statx(2)` with `AT_EMPTY_PATH`.
+	pub fn inode_id(&self) -> Result<InodeId, io::Error> {
+		let stx = self.statx(libc::STATX_INO)?;
 		Ok(InodeId {
 			dev_major: stx.stx_dev_major,
 			dev_minor: stx.stx_dev_minor,
@@ -114,24 +130,7 @@ impl ForeignFd {
 	/// Return the (non-unique) kernel mount id of this fd.  This matches with
 	/// the first field of /proc/.../mountinfo.
 	pub fn mnt_id(&self) -> Result<u64, io::Error> {
-		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-		let ret = unsafe {
-			libc::statx(
-				self.local_fd,
-				c"".as_ptr(),
-				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
-				libc::STATX_MNT_ID,
-				&mut stx,
-			)
-		};
-		if ret < 0 {
-			let err = io::Error::last_os_error();
-			error!(
-				"statx(AT_EMPTY_PATH) failed on fd {}: {}",
-				self.local_fd, err
-			);
-			return Err(err);
-		}
+		let stx = self.statx(libc::STATX_MNT_ID)?;
 		if stx.stx_mask & libc::STATX_MNT_ID == 0 {
 			let try_realpath = self
 				.readlink()
@@ -148,19 +147,7 @@ impl ForeignFd {
 
 	/// Whether the inode this fd refers to is a directory.
 	pub fn is_dir(&self) -> Result<bool, io::Error> {
-		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-		let ret = unsafe {
-			libc::statx(
-				self.local_fd,
-				c"".as_ptr(),
-				libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
-				libc::STATX_TYPE,
-				&mut stx,
-			)
-		};
-		if ret < 0 {
-			return Err(io::Error::last_os_error());
-		}
+		let stx = self.statx(libc::STATX_TYPE)?;
 		Ok((u32::from(stx.stx_mode) & libc::S_IFMT) == libc::S_IFDIR)
 	}
 }
