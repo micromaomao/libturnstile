@@ -292,6 +292,9 @@ fn tracing_thread(context: &'static Context) {
 			Ok(Some((request, mut req_ctx))) => {
 				debug!("got request: {:?}", request);
 				let mut send_eperm = false;
+				// Set when we cannot evaluate the request at all (e.g.
+				// request is for an anonymous pipe or socket)
+				let mut force_continue = false;
 				match request.operation() {
 					Operation::FsOperation(fsop) => {
 						let rwxps = fsop.as_rwx_permissions();
@@ -328,6 +331,8 @@ fn tracing_thread(context: &'static Context) {
 												);
 											}
 										}
+										debug!("Will not evaluate request");
+										force_continue = true;
 										break;
 									}
 								};
@@ -496,6 +501,12 @@ fn tracing_thread(context: &'static Context) {
 				}
 				if req_ctx.still_valid().ok() != Some(true) {
 					debug!("request is no longer valid; skipping response");
+					continue;
+				}
+				if force_continue {
+					if let Err(e) = req_ctx.send_continue() {
+						debug!("error continuing request: {}", e);
+					}
 					continue;
 				}
 				// Finalize via the sandbox, which transparently upgrades
