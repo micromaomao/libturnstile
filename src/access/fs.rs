@@ -90,7 +90,7 @@ impl ForeignFd {
 
 	/// Call `statx()` on this fd with `AT_EMPTY_PATH | AT_STATX_DONT_SYNC |
 	/// AT_SYMLINK_NOFOLLOW` and the provided `mask`.
-	fn statx(&self, mask: u32) -> Result<libc::statx, io::Error> {
+	pub fn statx(&self, mask: u32) -> Result<libc::statx, io::Error> {
 		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
 		let ret = unsafe {
 			libc::statx(

@@ -796,7 +796,7 @@ lazy_syscall_table_name_to_number!(
 );
 lazy_syscall_table_name_to_number!(FS_SYSCALLS_FD, fs_syscalls_fd_table, SyscallHandler1, u8);
 
-/// Argument indices of any real `dirfd`s this syscall accepts, derived from the
+/// Argument indices of any dir fds this syscall accepts, derived from the
 /// existing request-parsing tables, for use by fd upgrade logic in
 /// ManagedBindMountSandbox.
 pub(crate) fn dfd_arg_indices(syscall: libseccomp::ScmpSyscall) -> smallvec::SmallVec<[u8; 2]> {
@@ -805,7 +805,7 @@ pub(crate) fn dfd_arg_indices(syscall: libseccomp::ScmpSyscall) -> smallvec::Sma
 			return smallvec::smallvec![dfd];
 		}
 	}
-	for &(sys, _h, dfd1, _p1, dfd2, _p2, _flags) in fs_syscall_dfd_path_dfd_path_table() {
+	for &(sys, _h, dfd1, _p1, dfd2, _p2, _flags) in fs_syscalls_dfd_path_dfd_path_table() {
 		if sys == syscall {
 			return smallvec::smallvec![dfd1, dfd2];
 		}

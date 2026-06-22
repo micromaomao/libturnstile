@@ -35,6 +35,7 @@
 //! * anything else - CONTINUE.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::OnceLock;
@@ -43,6 +44,7 @@ use libc::open_how;
 use libseccomp::ScmpSyscall;
 use log::{debug, error, warn};
 
+use crate::access::fs::OpenOperation;
 use crate::{
 	AccessRequestError, RequestContext,
 	access::{
@@ -165,12 +167,6 @@ fn open_reopen_params(
 	}
 }
 
-/// Whether `syscall` is `chdir` or `fchdir`.
-fn is_chdir(syscall: ScmpSyscall) -> bool {
-	let s = upgraded_syscalls();
-	Some(syscall) == s.chdir || Some(syscall) == s.fchdir
-}
-
 impl ManagedBindMountSandbox {
 	/// Wrap a request yielded by the tracer into a [`RequestHandle`]
 	/// bound to this sandbox.  The handle's [`RequestHandle::allow`]
@@ -267,62 +263,67 @@ impl ManagedBindMountSandbox {
 		}
 	}
 
-	/// If the held fd `app_fd` is *stale* — its current `mnt_id` differs
-	/// from the tracked mount covering its path — return that sandbox path
-	/// (as a `CString`) and the fd's inode identity, ready for an m1
-	/// reopen.  Returns `None` when there is nothing to fix: the path is
-	/// not covered by a tracked mount, the fd's mount is already current,
-	/// or the fd cannot be inspected.
-	fn stale_held_fd_target(&self, app_fd: &ForeignFd) -> Option<(CString, Option<InodeId>)> {
-		let cur_mnt = app_fd.mnt_id().ok()?;
-		let sandbox_path = app_fd.readlink().ok()?;
+	/// If the target is based on a shadowed (aka. stale) dfd, i.e. its
+	/// current `mnt_id` differs from the tracked mount covering its path,
+	/// return that sandbox path (as a `CString`) and the fd's inode
+	/// identity.  Returns `None` when it's not shadowed, the path is not
+	/// covered by a tracked mount, or the fd cannot be inspected.
+	fn is_fstarget_shadowed(&self, target: &FsTarget) -> Option<(CString, InodeId)> {
+		if let OriginalHandle::Root = target.get_original_handle() {
+			// root is never shadowed
+			return None;
+		}
+		let dfd = target.dfd();
+		self.is_dfd_shadowed(dfd)
+	}
+
+	// is_fstarget_shadowed but takes a ForeignFd directly
+	fn is_dfd_shadowed(&self, dfd: &ForeignFd) -> Option<(CString, InodeId)> {
+		let stx = dfd.statx(libc::STATX_MNT_ID | libc::STATX_INO).ok()?;
+		if stx.stx_mask & libc::STATX_MNT_ID == 0 {
+			let try_realpath = dfd.readlink().ok().unwrap_or_else(|| OsString::from("???"));
+			debug!(
+				"statx(AT_EMPTY_PATH) on fd {} (-> {:?}) did not return mount id",
+				dfd.as_raw_fd(),
+				try_realpath
+			);
+			// We can't determine if it's shadowed without mount id.
+			return None;
+		}
+		let cur_mnt = stx.stx_mnt_id;
+		let sandbox_path = dfd.readlink().ok()?;
 		match self.expected_mnt_id(&sandbox_path) {
-			// Already current, or no tracked covering mount to compare
-			// against: nothing to fix.
-			Some(exp) if exp != 0 && exp == cur_mnt => return None,
-			Some(_) => {}
-			None => return None,
-		}
-		let path_c = to_cstring(sandbox_path.as_bytes())?;
-		let expected = app_fd.inode_id().ok();
-		Some((path_c, expected))
-	}
-
-	/// Swap a fresh handle, opened on the live mount layout, in at the app
-	/// fd number `raw`.  `how` selects the handle's character so the
-	/// swapped fd behaves like the original (`build_dir_open_how` for a
-	/// real directory fd so it stays usable for `getdents`, or
-	/// `build_path_open_how` for an `O_PATH` fd so it keeps its `O_PATH`
-	/// semantics).  Shared by the stale-`*at`-dirfd path and the
-	/// upgradable target fd of an `f*` / `AT_EMPTY_PATH` op.
-	fn swap_stale_fd(
-		&self,
-		ctx: &mut RequestContext,
-		raw: libc::c_int,
-		path_c: &CStr,
-		expected: Option<InodeId>,
-		how: &open_how,
-	) -> Result<FdSwapOutcome, AccessRequestError> {
-		let m1fd = match self.m1_open_checked(path_c, how, expected) {
-			Some(fd) => fd,
-			// Failed identity check: skip the swap (leave the fd in place)
-			// rather than breaking the syscall.
-			None => return Ok(FdSwapOutcome::NoChange),
-		};
-		warn!(
-			"upgrading stale held fd {} ({:?}): mount no longer current",
-			raw, path_c
-		);
-		if let Err(e) = ctx.replace_fd(m1fd.as_raw_fd(), raw, false) {
-			if ctx.still_valid()? {
-				return Err(e);
+			Some(0) => {
+				// We can't determine if it's shadowed without knowing the
+				// covering mount's mount id.
+				return None;
 			}
-			return Ok(FdSwapOutcome::RequestGone);
+			Some(exp) if exp == cur_mnt => return None,
+			None => return None,
+			Some(exp) => {
+				debug!(
+					"fd {} (-> {:?}) is shadowed: mnt_id {} != expected {}",
+					dfd.as_raw_fd(),
+					sandbox_path,
+					cur_mnt,
+					exp
+				);
+				let mut vec = sandbox_path.into_encoded_bytes();
+				vec.push(0);
+				let path_c = CString::from_vec_with_nul(vec).unwrap();
+				Some((
+					path_c,
+					InodeId {
+						dev_major: stx.stx_dev_major,
+						dev_minor: stx.stx_dev_minor,
+						ino: stx.stx_ino,
+					},
+				))
+			}
 		}
-		Ok(FdSwapOutcome::Swapped)
 	}
 
-	/// The dispatch entry point used by [`RequestHandle::allow`].
+	/// Called by [`RequestHandle::allow`].
 	fn allow_request(
 		&self,
 		request: &AccessRequest,
@@ -331,58 +332,117 @@ impl ManagedBindMountSandbox {
 		let Operation::FsOperation(fsop) = request.operation();
 		let syscall = ctx.syscall();
 
-		// openat-family: always substitute a fresh fd resolved through
-		// the current layout.
-		if let Some(params) = open_reopen_params(ctx)? {
+		// Open may need to be proxied if it's based on a CWD and that CWD
+		// is shadowed.  We proxy or upgrade the fd it even if the open
+		// request is read-only, to ensure the child always gets a
+		// non-shadowed fd.
+		if let FsOperation::FsOpen(op) = fsop {
 			debug!("Handling open request {:?}", request.operation());
-			return self.allow_open(fsop, params, ctx);
+			let Some((path_c, inode_id)) = self.is_fstarget_shadowed(&op.target) else {
+				// Openat with a non-shadowed base will always give us a
+				// non-shadowed fd, since each walk inwards will step into
+				// mounts, and .. will step out then move to the topmost
+				// parent mount.
+				return ctx.send_continue();
+			};
+			let dfd = op.target.dfd();
+			match op.target.get_original_handle() {
+				OriginalHandle::Cwd => {
+					// Need proxy (can't upgrade cwd)
+					return self.proxy_open(op, ctx);
+				}
+				OriginalHandle::Fd(orig_fd) => {
+					// Upgrade the base fd
+					let can_upgrade =
+						self.try_upgrade_fd(ctx, dfd, orig_fd, &path_c, Some(inode_id))?;
+					if !can_upgrade {
+						warn!("non-dir fd {} (-> {:?}) given to openat", orig_fd, path_c);
+					}
+					return ctx.send_continue();
+				}
+				OriginalHandle::Root => unreachable!("root is never shadowed"),
+			}
 		}
 
 		// chdir/fchdir: preemptively ensure a covering mount before the
 		// kernel resolves cwd (cwd can't be upgraded after the fact).
-		if is_chdir(syscall) {
+		if let FsOperation::FsChdir(target) = fsop {
 			debug!("Handling chdir request {:?}", request.operation());
-			return self.allow_chdir(fsop, ctx);
+			return self.handle_chdir(target, ctx);
 		}
 
-		// A metadata/content op whose target *is* an already-open
-		// descriptor (an `f*` call, or an `*at` with `AT_EMPTY_PATH`):
-		// the access is governed by that held fd, so whether we swap it
-		// or proxy the op depends on the fd's upgradability, not on the
-		// fact that it carries an empty path.  Path-based variants instead
-		// carry no target fd; they resolve afresh when the syscall continues
-		// (any `dirfd` they do carry is handled by the dirfd-upgrade path
-		// below).
-		if let Some(target) = modify_op_held_fd_target(fsop) {
-			debug!("Handling modify-fd request {:?}", request.operation());
-			return self.allow_modify_fd(fsop, target, ctx);
+		// modification f* operations may need to have their fd upgraded,
+		// or if they operate on non-directories, proxied.
+		if let Some(target) = modifying_fsop_fd_target(fsop) {
+			debug!("Handling f* request {:?}", request.operation());
+			return self.handle_modifying_f_ops(fsop, target, ctx);
 		}
 
-		// Any other `*at` with a real dirfd: the dirfd governs the
-		// resolution, so upgrade it in place if its mount is stale.
-		let dfds = syscalls_fs::dfd_arg_indices(syscall);
-		if !dfds.is_empty() {
+		// *at with one or more dirfd: upgrade the fds if they are shadowed.
+		let fd_indices = syscalls_fs::dfd_arg_indices(syscall);
+		if !fd_indices.is_empty() {
 			debug!("Handling *at request {:?}", request.operation());
-			return self.allow_at_dirfds(&dfds, ctx);
+			return self.allow_at_dirfds(&fd_indices, ctx);
 		}
 
 		ctx.send_continue()
 	}
 
+	/// Attempt to upgrade fd_raw in the target process by re-opening the
+	/// proxied absolute `path` on the current sandbox mount layout.  If
+	/// the fd is not upgradable, return Ok(false).
+	fn try_upgrade_fd(
+		&self,
+		ctx: &mut RequestContext,
+		fd_opened: &ForeignFd,
+		fd_raw: libc::c_int,
+		path: &CStr,
+		inode_id: Option<InodeId>,
+	) -> Result<bool, AccessRequestError> {
+		let is_o_path = app_fd_is_o_path(ctx.pid(), fd_raw).map_err(|_| todo!())?;
+		let mut is_dir = false;
+		if !is_o_path {
+			is_dir = fd_opened
+				.is_dir()
+				.map_err(|_| todo!("Add AccessRequestError variant"))?;
+		}
+		let upgradable = is_o_path || is_dir;
+		if !upgradable {
+			return Ok(false);
+		}
+
+		let openhow = if is_o_path {
+			build_path_open_how()
+		} else {
+			build_dir_open_how()
+		};
+		let m1fd = match self.m1_open_checked(path, &openhow, inode_id) {
+			Some(fd) => fd,
+			None => todo!(
+				"m1_open_checked need to return a proper error, then this function need to return BindMountSandboxError::OpenInM1Failed. When caller finds this, it should log the error and send CONTINUE to the app."
+			),
+		};
+		warn!("upgrading shadowed fd {} using {:?}", fd_raw, path);
+		// todo: can you examine O_CLOEXEC via fdinfo?
+		ctx.replace_fd(m1fd.as_raw_fd(), fd_raw, false)?;
+		Ok(true)
+	}
+
 	/// `openat` / `openat2` / `open` / `creat`: re-open the abspath in m1
 	/// with the requested flags and hand the fresh fd to the app.
-	fn allow_open(
+	fn proxy_open(
 		&self,
-		fsop: &FsOperation,
-		params: ReopenParams,
+		op: &OpenOperation,
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
-		let FsOperation::FsOpen(op) = fsop else {
-			// Shouldn't happen (open_reopen_params only matches
-			// open-family syscalls, which always parse to FsOpen).
+		let Some(params) = open_reopen_params(ctx)? else {
+			debug_assert!(
+				false,
+				"open_reopen_params returned None for open syscall {:?}",
+				ctx.syscall()
+			);
 			return ctx.send_continue();
 		};
-
 		let abspath = match op.target.realpath() {
 			Ok(p) => p,
 			Err(e) => {
@@ -422,12 +482,7 @@ impl ManagedBindMountSandbox {
 		let fd = match self.m1_open_checked(&abspath_c, &how, expected) {
 			Some(fd) => fd,
 			None => {
-				// Identity check failed after retries → fail closed.
-				if !creating && expected.is_some() {
-					return ctx.send_error(-libc::EIO);
-				}
-				// Open itself failed; let the kernel report the real
-				// error by re-executing the syscall.
+				// TODO: m1_open_checked need to return a proper error, then print here.
 				return ctx.send_continue();
 			}
 		};
@@ -456,18 +511,20 @@ impl ManagedBindMountSandbox {
 	/// is no fd to swap), so a mount must sit *exactly at* the target -
 	/// then a later attribute change reaches the existing cwd handle, and
 	/// reconcile preserves that mount's identity rather than detaching it.
-	fn allow_chdir(
+	fn handle_chdir(
 		&self,
-		fsop: &FsOperation,
+		chdir_target: &FsTarget,
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
-		let FsOperation::FsChdir(target) = fsop else {
-			return ctx.send_continue();
-		};
-		let abspath = match target.realpath() {
+		let abspath = match chdir_target.realpath() {
 			Ok(p) => p,
 			Err(e) => {
-				warn_unless_benign!(&e, "chdir: cannot resolve abspath for {}: {}", target, e);
+				warn_unless_benign!(
+					&e,
+					"chdir: cannot resolve abspath for {}: {}",
+					chdir_target,
+					e
+				);
 				return ctx.send_continue();
 			}
 		};
@@ -523,123 +580,109 @@ impl ManagedBindMountSandbox {
 		ctx.send_continue()
 	}
 
-	/// Generic `*at` syscalls with a real `dirfd`: replace any stale
-	/// dirfd in place so the kernel resolves the relative path through
-	/// the current layout.  A dirfd that resolves a relative path is by
-	/// definition a directory (or `O_PATH`) fd, i.e. always upgradable;
-	/// the upgradability check is kept for robustness (a non-directory fd
-	/// passed here would fail `ENOTDIR` natively if left untouched).  The
-	/// swapped-in fd preserves the original's character (real directory vs
-	/// `O_PATH`), so e.g. a later `getdents` on a real-directory dirfd
-	/// keeps working.
+	/// For an *at request with a proper dfd, we have a chance to inspect
+	/// if it is shadowed and upgrade it, regardless of whether the
+	/// request is modifying or not.
 	fn allow_at_dirfds(
 		&self,
 		dfd_indices: &[u8],
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
-		let pid = ctx.pid();
+		// The two fds can be treated independently, if one fails to
+		// upgrade, the other may still succeed.
 		for &idx in dfd_indices {
 			let raw = ctx.arg(idx as usize) as libc::c_int;
 			if raw == libc::AT_FDCWD || raw < 0 {
 				continue;
 			}
-			// Open the app's dirfd from /proc to inspect it.
-			let app_fd = match ctx.arg_to_fd(idx as usize) {
+			let dfd = match ctx.arg_to_fd(idx as usize) {
 				Ok(f) => f,
 				Err(e) => {
-					debug!("dirfd upgrade: cannot open app fd {}: {}", raw, e);
+					warn!("allow_at_dirfds: cannot open app fd {}: {}", raw, e);
 					continue;
 				}
 			};
-			// Only swap an upgradable fd; a regular-file dirfd is a native
-			// `ENOTDIR`, so leave it untouched.
-			let kind = fd_upgrade_kind(pid, raw, &app_fd);
-			if !kind.is_upgradable() {
-				continue;
-			}
-			let Some((path_c, expected)) = self.stale_held_fd_target(&app_fd) else {
+			let Some((path_c, expected)) = self.is_dfd_shadowed(&dfd) else {
 				continue;
 			};
-			// Preserve the dirfd's character: a real directory fd must stay
-			// a real directory (else a later `getdents` on it would
-			// `EBADF`), an `O_PATH` dirfd stays `O_PATH`.
-			let how = swap_open_how(kind);
-			match self.swap_stale_fd(ctx, raw, &path_c, expected, &how)? {
-				FdSwapOutcome::RequestGone => return Ok(()),
-				FdSwapOutcome::NoChange | FdSwapOutcome::Swapped => {}
-			}
+			match self.try_upgrade_fd(ctx, &dfd, raw, &path_c, Some(expected)) {
+				Ok(true) => {}
+				Ok(false) => {
+					warn!(
+						"allow_at_dirfds: expected *at request dfd {} (-> {:?}) to be a directory or O_PATH, but it is not",
+						raw, path_c
+					);
+				}
+				Err(e) => {
+					error!(
+						"allow_at_dirfds: try_upgrade_fd failed for fd {} (-> {:?}): {}",
+						raw, path_c, e
+					);
+				}
+			};
 		}
 		ctx.send_continue()
 	}
 
-	/// A metadata/content op whose target *is* an already-open
-	/// descriptor (`fchmod` / `fchown` / `fsetxattr` / `fremovexattr`, or
-	/// any `*at` modify call with `AT_EMPTY_PATH`): make the op act
-	/// against the live layout.  How depends on the held fd:
+	/// Handle a metadata modification operation whose target is an
+	/// already-open, possibly O_PATH descriptor (`fchmod` / `fchown` /
+	/// `fsetxattr` / `fremovexattr`).
 	///
-	/// * an **upgradable** fd (directory or `O_PATH`) is swapped in place
-	///   for a fresh one resolved on the live layout, then CONTINUE - so
-	///   the op acts through the current mount (the swapped `O_PATH` fd
-	///   reproduces the syscall's native `O_PATH` semantics, be that
-	///   `EBADF` for `fchmod` or a valid `AT_EMPTY_PATH` `fchownat`);
-	/// * an **unupgradable** fd (a regular file, …) would lose its
-	///   `f_pos`/open state on a swap, so the op is performed in m1 and
-	///   the result returned directly.
+	/// If the fd is shadowed but it is upgradable, it is upgraded,
+	/// otherwise the operation is proxied.
 	///
-	/// `ftruncate` is exempt: it needs a writable fd, which can only have
-	/// been opened on a still-writable mount, so CONTINUE acts correctly.
-	fn allow_modify_fd(
+	/// Unlike other metadata modifying operations, `ftruncate` needs an
+	/// actually writable fd when the process calls it, and so if we got
+	/// here, the fd already has the required permission, so there is no
+	/// need to upgrade or proxy anything.
+	fn handle_modifying_f_ops(
 		&self,
 		fsop: &FsOperation,
 		target: &FsTarget,
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
-		// `ftruncate` needs a writable fd; a writable fd implies a
-		// still-writable mount, so it is never stale in a way we must
-		// fix - always CONTINUE.
 		if matches!(fsop, FsOperation::FsTruncate(_)) {
 			return ctx.send_continue();
 		}
 
-		let app_fd = target.dfd();
-		// The app's raw fd number, needed to swap an upgradable fd in
-		// place.  Without a real fd number (e.g. `AT_FDCWD`, whose cwd is
-		// kept current by the chdir path) there is nothing to address, so
-		// CONTINUE.
-		let OriginalHandle::Fd(target_fd) = target.get_original_handle() else {
+		let dfd = target.dfd();
+		if let OriginalHandle::Root = target.get_original_handle() {
+			// root is never shadowed
 			return ctx.send_continue();
-		};
-
-		// Nothing to fix unless the held fd's mount is stale.
-		let Some((path_c, expected)) = self.stale_held_fd_target(app_fd) else {
-			return ctx.send_continue();
-		};
-
-		let kind = fd_upgrade_kind(ctx.pid(), target_fd, app_fd);
-		if kind.is_upgradable() {
-			// A directory / `O_PATH` target carries no `f_pos`/open state to
-			// lose, so swap a fresh kind-preserving fd in at the same number
-			// and CONTINUE — identical to the stale-`*at`-dirfd path (an
-			// `fchmod(dirfd)` is just `fchmodat(dirfd, "", AT_EMPTY_PATH)`).
-			// A swapped `O_PATH` fd reproduces the syscall's native `O_PATH`
-			// semantics against the live mount (e.g. `EBADF` for `fchmod`,
-			// a valid `AT_EMPTY_PATH` `fchownat`).
-			let how = swap_open_how(kind);
-			return match self.swap_stale_fd(ctx, target_fd, &path_c, expected, &how)? {
-				FdSwapOutcome::RequestGone => Ok(()),
-				FdSwapOutcome::NoChange | FdSwapOutcome::Swapped => ctx.send_continue(),
-			};
 		}
 
-		// Unupgradable (a regular file): a swap would clobber its
-		// `f_pos`/open state, so proxy the op in m1 against the live
-		// layout instead.
-		let how = build_path_open_how();
-		let m1fd = match self.m1_open_checked(&path_c, &how, expected) {
-			Some(fd) => fd,
-			None => return ctx.send_error(-libc::EIO),
+		// Nothing to fix unless the held fd's mount is stale.
+		let Some((path_c, inode_id)) = self.is_fstarget_shadowed(target) else {
+			return ctx.send_continue();
 		};
-		match perform_modify(fsop, m1fd.as_raw_fd()) {
+
+		if let OriginalHandle::Fd(dfd_raw) = target.get_original_handle() {
+			match self.try_upgrade_fd(ctx, dfd, dfd_raw, &path_c, Some(inode_id)) {
+				Ok(true) => {
+					// Upgraded in place; CONTINUE so the op resolves through
+					// the live layout.
+					return ctx.send_continue();
+				}
+				Ok(false) => {
+					// can't upgrade, proxy.
+				}
+				Err(e) => {
+					error!("try_upgrade_fd failed for fd {}: {}", dfd_raw, e);
+					// proxy.
+				}
+			}
+		}
+		// else if OriginalHandle::Cwd (but shadowed), also proxy
+
+		let how = build_path_open_how();
+		let m1fd = match self.m1_open_checked(&path_c, &how, Some(inode_id)) {
+			Some(fd) => fd,
+			None => {
+				// todo: ...
+				return ctx.send_continue();
+			}
+		};
+		match proxy_modify(fsop, m1fd.as_raw_fd()) {
 			Ok(()) => ctx.send_value(0),
 			Err(errno) => ctx.send_error(-errno),
 		}
@@ -703,105 +746,25 @@ fn build_dir_open_how() -> open_how {
 	how
 }
 
-/// How a stale app-held fd that governs an access can be made to reflect
-/// the live mount layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FdUpgradeKind {
-	/// An `O_PATH` fd.  It carries no read/write position, so it can be
-	/// swapped for a fresh `O_PATH` fd resolved on the live layout; the
-	/// swapped fd then reproduces the syscall's native `O_PATH` semantics
-	/// (e.g. `EBADF` for `fchmod`, a valid `AT_EMPTY_PATH` `fchownat`)
-	/// against the current mount.
-	OPath,
-	/// A directory fd.  Swappable for a fresh directory fd resolved on
-	/// the live layout (only an in-progress `getdents` cursor is lost).
-	Directory,
-	/// A regular-file (or other) fd.  Swapping would clobber its
-	/// `f_pos`/open state, so a stale one must be proxied in m1 instead.
-	Unupgradable,
-}
-
-impl FdUpgradeKind {
-	/// Whether a stale fd of this kind can be swapped in place (rather
-	/// than needing a proxy).
-	fn is_upgradable(self) -> bool {
-		matches!(self, FdUpgradeKind::OPath | FdUpgradeKind::Directory)
-	}
-}
-
-/// The `open_how` to swap in for an upgradable fd of `kind`, chosen to
-/// preserve the original fd's character.  Must only be called for an
-/// upgradable kind.
-fn swap_open_how(kind: FdUpgradeKind) -> open_how {
-	match kind {
-		// Keep `O_PATH` semantics (e.g. `EBADF` for `fchmod`, a valid
-		// `AT_EMPTY_PATH` `fchownat`) against the live mount.
-		FdUpgradeKind::OPath => build_path_open_how(),
-		// A real directory handle so the swapped fd stays usable for
-		// `getdents` and as an `*at` base.
-		FdUpgradeKind::Directory => build_dir_open_how(),
-		FdUpgradeKind::Unupgradable => {
-			debug_assert!(false, "swap_open_how called on an unupgradable fd");
-			build_path_open_how()
-		}
-	}
-}
-
-/// Outcome of an in-place swap of a stale held fd (see
-/// [`ManagedBindMountSandbox::swap_stale_fd`]).
-enum FdSwapOutcome {
-	/// Nothing changed — the identity check failed, so the original fd is
-	/// left in place; continue the syscall.
-	NoChange,
-	/// A fresh, kind-preserving fd was swapped in at the same number.
-	Swapped,
-	/// The request is no longer valid (the traced process is gone or its
-	/// response was already consumed); the caller should return `Ok(())`.
-	RequestGone,
-}
-
-/// Classify the app-held fd `raw` (belonging to process `pid`) for the
-/// upgrade path.  `O_PATH`-ness is read from `/proc/<pid>/fdinfo/<raw>`
-/// (the `flags:` field preserves `O_PATH`); directory-ness from `statx`
-/// on `app_fd` (a `/proc`-opened handle to the same fd).  Any read
-/// failure conservatively classifies the fd as unupgradable so it is
-/// proxied / left untouched rather than swapped.
-fn fd_upgrade_kind(pid: libc::pid_t, raw: libc::c_int, app_fd: &ForeignFd) -> FdUpgradeKind {
-	if app_fd_is_o_path(pid, raw) {
-		return FdUpgradeKind::OPath;
-	}
-	match app_fd.is_dir() {
-		Ok(true) => FdUpgradeKind::Directory,
-		_ => FdUpgradeKind::Unupgradable,
-	}
-}
-
-/// Whether the app fd `raw` of process `pid` was opened with `O_PATH`,
-/// read from the `flags:` field (octal `file->f_flags`) of
-/// `/proc/<pid>/fdinfo/<raw>`.  Returns `false` if the file cannot be
-/// read or parsed.
-fn app_fd_is_o_path(pid: libc::pid_t, raw: libc::c_int) -> bool {
+/// Determine whether the app fd `raw` of process `pid` was opened with
+/// `O_PATH` via fdinfo
+fn app_fd_is_o_path(pid: libc::pid_t, raw: libc::c_int) -> Result<bool, io::Error> {
 	let path = format!("/proc/{}/fdinfo/{}", pid, raw);
-	let Ok(content) = std::fs::read_to_string(&path) else {
-		return false;
-	};
+	let content = std::fs::read_to_string(&path)?;
 	for line in content.lines() {
 		if let Some(rest) = line.strip_prefix("flags:")
 			&& let Ok(flags) = i32::from_str_radix(rest.trim(), 8)
 		{
-			return flags & libc::O_PATH != 0;
+			return Ok(flags & libc::O_PATH != 0);
 		}
 	}
-	false
+	Ok(false)
 }
 
-/// If `fsop` is one of the metadata/content-modifying operations and its
-/// target refers directly to an already-open descriptor (an `f*` call or
-/// an `*at` call with `AT_EMPTY_PATH`), return that target.  The held fd
-/// governs the access, so the upgrade path decides per its upgradability
-/// whether to swap it or proxy the op.  Path-based variants return `None`
-/// (they resolve afresh when the syscall continues).
-fn modify_op_held_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
+/// If `fsop` is a single-operand modification operation whose target
+/// refers directly to an already-open descriptor (an `f*` call or an
+/// `*at` call with `AT_EMPTY_PATH`), return that target.
+fn modifying_fsop_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
 	let target = match fsop {
 		FsOperation::FsChmod(ChmodOperation { target, .. })
 		| FsOperation::FsChown(ChownOperation { target, .. })
@@ -818,7 +781,7 @@ fn modify_op_held_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
 /// so the op resolves through m1's mount).  Returns the `errno` on
 /// failure.  Only the unupgradable (regular-file) `f*` variants are
 /// proxied; other `FsOperation`s are never passed here.
-fn perform_modify(fsop: &FsOperation, fd: libc::c_int) -> Result<(), libc::c_int> {
+fn proxy_modify(fsop: &FsOperation, fd: libc::c_int) -> Result<(), libc::c_int> {
 	// `fd` is a freshly m1-opened O_PATH handle returned by
 	// `m1_open_checked`, so it is always a valid non-negative descriptor;
 	// its /proc/self/fd magic symlink redirects the path-based ops below
@@ -899,13 +862,13 @@ impl<'s, 't> RequestHandle<'s, 't> {
 		&mut self.req_ctx
 	}
 
-	/// Allow the request, transparently upgrading or proxying fds so the
-	/// traced process's view matches the live mount layout.
+	/// Allow the request, transparently upgrading fds or proxying the
+	/// operation if the traced process is operating on a fd or cwd
+	/// shadowed by newer mounts.
 	///
 	/// If the request requires any additional mounts, the caller must have
 	/// already added them.
 	pub fn allow(mut self) -> Result<(), AccessRequestError> {
-		// Disjoint field borrows: `request` immutably, `req_ctx` mutably.
 		self.sandbox.allow_request(&self.request, &mut self.req_ctx)
 	}
 
