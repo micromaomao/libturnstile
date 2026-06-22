@@ -750,7 +750,7 @@ pub(crate) fn add_filter_rules(
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
-	for &(sys, ..) in fs_syscall_dfd_path_dfd_path_table() {
+	for &(sys, ..) in fs_syscalls_dfd_path_dfd_path_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
@@ -786,7 +786,7 @@ lazy_syscall_table_name_to_number!(
 );
 lazy_syscall_table_name_to_number!(
 	FS_SYSCALLS_DFD_PATH_DFD_PATH,
-	fs_syscall_dfd_path_dfd_path_table,
+	fs_syscalls_dfd_path_dfd_path_table,
 	SyscallHandler2,
 	u8,
 	u8,
@@ -855,7 +855,7 @@ pub(crate) fn handle_notification<'a>(
 		dfd2_arg_index,
 		path2_arg_index,
 		flags_arg_index,
-	) in fs_syscall_dfd_path_dfd_path_table()
+	) in fs_syscalls_dfd_path_dfd_path_table()
 	{
 		if syscall == sys {
 			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
