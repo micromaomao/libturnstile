@@ -305,6 +305,9 @@ impl ManagedBindMountSandbox {
 	/// return that sandbox path (as a `CString`) and the fd's inode
 	/// identity.  Returns `None` when it's not shadowed, the path is not
 	/// covered by a tracked mount, or the fd cannot be inspected.
+	///
+	/// TODO: this function is misleading - it returns the InodeId of the
+	/// target's dfd, not the target file!! Probably should just remove / refactor.
 	fn is_fstarget_shadowed(&self, target: &FsTarget) -> Option<(CString, InodeId)> {
 		if let OriginalHandle::Root = target.get_original_handle() {
 			// root is never shadowed

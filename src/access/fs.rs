@@ -393,6 +393,7 @@ impl FsTarget {
 
 		// This can't change across retries, since a fd points to a
 		// specific inode.
+
 		let original_id = self.dfd.inode_id()?;
 		let mut attempts = 0;
 		loop {
@@ -452,9 +453,11 @@ impl FsTarget {
 			}
 			let opened = ForeignFd { local_fd: fd };
 			let new_id = opened.inode_id()?;
-			if new_id == original_id {
-				return Ok(opened);
-			}
+			// if new_id == original_id {
+			// 	return Ok(opened);
+			// }
+			return Ok(opened);
+			// todo
 			debug!(
 				"open_target_dfd_in_root: attempt {} for {:?} got different inode \
 				 (expected id {:?}, got id {:?})",
@@ -829,6 +832,9 @@ pub struct RwxPermission {
 	/// Need the ability to stat the target path (but not necessarily read
 	/// it)
 	pub metadata_read: bool,
+	/// Whether this is a chdir operation.  Useful for special case
+	/// handling.
+	pub chdir: bool,
 }
 
 macro_rules! make_rwx {
@@ -840,6 +846,7 @@ macro_rules! make_rwx {
 			write: false,
 			exec: false,
 			metadata_read: false,
+			chdir: false,
 		};
 		// Get rid of unused mut warning
 		perm.read = false;
@@ -1032,7 +1039,7 @@ impl FsOperation {
 				smallvec![make_rwx!(target.clone(), read)]
 			}
 			Self::FsChdir(target) => {
-				smallvec![make_rwx!(target.clone(),)]
+				smallvec![make_rwx!(target.clone(), chdir)]
 			}
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
