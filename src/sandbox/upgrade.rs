@@ -19,7 +19,8 @@
 //!   dirfd of an `*at(dirfd, relpath)`, or the target fd of an
 //!   `f*` / `*at(fd, "", AT_EMPTY_PATH)` metadata op) - the choice
 //!   between swapping the fd and proxying the op comes down to whether
-//!   the held fd is *upgradable* (see [`fd_upgrade_kind`]).  An
+//!   the held fd is *upgradable* (see
+//!   [`ManagedBindMountSandbox::try_upgrade_fd`]).  An
 //!   **upgradable** fd (a directory, or an `O_PATH` fd) carries no
 //!   read/write position to lose, so we m1-open its abspath,
 //!   identity-check, and swap a fresh fd in at the same number
@@ -45,6 +46,7 @@ use libseccomp::ScmpSyscall;
 use log::{debug, error, warn};
 
 use crate::access::fs::OpenOperation;
+use crate::errors::BindMountSandboxError;
 use crate::{
 	AccessRequestError, RequestContext,
 	access::{
@@ -98,8 +100,6 @@ struct UpgradeSyscalls {
 	openat: Option<ScmpSyscall>,
 	openat2: Option<ScmpSyscall>,
 	creat: Option<ScmpSyscall>,
-	chdir: Option<ScmpSyscall>,
-	fchdir: Option<ScmpSyscall>,
 }
 
 fn upgraded_syscalls() -> &'static UpgradeSyscalls {
@@ -111,8 +111,6 @@ fn upgraded_syscalls() -> &'static UpgradeSyscalls {
 			openat: n("openat"),
 			openat2: n("openat2"),
 			creat: n("creat"),
-			chdir: n("chdir"),
-			fchdir: n("fchdir"),
 		}
 	})
 }
@@ -167,6 +165,39 @@ fn open_reopen_params(
 	}
 }
 
+/// Why an [`ManagedBindMountSandbox::m1_open_checked`] reopen did not
+/// yield a usable handle.
+enum M1OpenError {
+	/// The `openat2` in m1 itself failed; carries the errno so a proxy
+	/// caller can reproduce the error the app would have seen natively.
+	OpenFailed(libc::c_int),
+	/// The open succeeded but the resulting inode did not match the
+	/// expected identity after retries — a TOCTOU race where the path now
+	/// resolves to a different file.
+	IdentityMismatch,
+}
+
+/// Result of attempting to upgrade (swap in place) a stale app-held fd
+/// via [`ManagedBindMountSandbox::try_upgrade_fd`].
+enum UpgradeOutcome {
+	/// A fresh handle resolved on the live layout was swapped in at the
+	/// same fd number.
+	Upgraded,
+	/// The fd is a regular file (or otherwise not swap-safe): the caller
+	/// may proxy the operation instead.
+	NotUpgradable,
+	/// The fd is upgradable, but the swap could not be completed (the fd
+	/// could not be inspected, or the m1 reopen failed / mismatched).
+	/// Nothing was changed; callers should fail open and CONTINUE,
+	/// leaving the stale fd in place.  In particular, callers must *not*
+	/// proxy on this outcome — the fd may be an `O_PATH` fd, which a
+	/// path-based proxy would mis-handle.
+	UpgradeFailed,
+	/// The notification is no longer valid (the traced process is gone or
+	/// it was already answered); the caller should just return `Ok(())`.
+	RequestGone,
+}
+
 impl ManagedBindMountSandbox {
 	/// Wrap a request yielded by the tracer into a [`RequestHandle`]
 	/// bound to this sandbox.  The handle's [`RequestHandle::allow`]
@@ -210,22 +241,24 @@ impl ManagedBindMountSandbox {
 
 	/// Open `path` (absolute, in m1's view) with `how`, retrying once on
 	/// failure or inode-identity mismatch.  When `expected` is `Some`,
-	/// the freshly-opened fd's `(dev, ino)` must equal it;
-	/// otherwise the open is retried, and after two failures `None` is
-	/// returned (the caller fails closed).
+	/// the freshly-opened fd's `(dev, ino)` must equal it; otherwise the
+	/// open is retried, and after two failures an [`M1OpenError`] is
+	/// returned that distinguishes a genuine open failure (with its errno)
+	/// from an identity mismatch, so the caller can pick an appropriate
+	/// response.
 	fn m1_open_checked(
 		&self,
 		path: &CStr,
 		how: &open_how,
 		expected: Option<InodeId>,
-	) -> Option<ForeignFd> {
+	) -> Result<ForeignFd, M1OpenError> {
 		let mut attempts = 0u32;
 		loop {
 			match self.sandbox.open_in_m1(path, how) {
 				Ok(fd) => match expected {
-					None => return Some(fd),
+					None => return Ok(fd),
 					Some(exp) => match fd.inode_id() {
-						Ok(id) if id == exp => return Some(fd),
+						Ok(id) if id == exp => return Ok(fd),
 						Ok(id) => {
 							attempts += 1;
 							debug!(
@@ -237,26 +270,30 @@ impl ManagedBindMountSandbox {
 									"m1 reopen of {:?}: identity check failed after retries; failing closed",
 									path
 								);
-								return None;
+								return Err(M1OpenError::IdentityMismatch);
 							}
 						}
 						Err(e) => {
 							attempts += 1;
 							debug!("m1 reopen of {:?}: statx failed: {}", path, e);
 							if attempts >= 2 {
-								return None;
+								return Err(M1OpenError::IdentityMismatch);
 							}
 						}
 					},
 				},
 				Err(e) => {
+					let errno = match &e {
+						BindMountSandboxError::OpenInM1Failed(errno) => *errno,
+						_ => libc::EIO,
+					};
 					attempts += 1;
 					debug!(
 						"m1 reopen of {:?} failed: {}, attempt {}",
 						path, e, attempts
 					);
 					if attempts >= 2 {
-						return None;
+						return Err(M1OpenError::OpenFailed(errno));
 					}
 				}
 			}
@@ -277,7 +314,10 @@ impl ManagedBindMountSandbox {
 		self.is_dfd_shadowed(dfd)
 	}
 
-	// is_fstarget_shadowed but takes a ForeignFd directly
+	/// Like [`is_fstarget_shadowed`](Self::is_fstarget_shadowed) but takes
+	/// the dfd directly.  Does a single `statx(STATX_MNT_ID | STATX_INO)`
+	/// and compares the fd's current `mnt_id` against the tracked covering
+	/// mount's.
 	fn is_dfd_shadowed(&self, dfd: &ForeignFd) -> Option<(CString, InodeId)> {
 		let stx = dfd.statx(libc::STATX_MNT_ID | libc::STATX_INO).ok()?;
 		if stx.stx_mask & libc::STATX_MNT_ID == 0 {
@@ -352,11 +392,19 @@ impl ManagedBindMountSandbox {
 					return self.proxy_open(op, ctx);
 				}
 				OriginalHandle::Fd(orig_fd) => {
-					// Upgrade the base fd
-					let can_upgrade =
-						self.try_upgrade_fd(ctx, dfd, orig_fd, &path_c, Some(inode_id))?;
-					if !can_upgrade {
-						warn!("non-dir fd {} (-> {:?}) given to openat", orig_fd, path_c);
+					// Upgrade the base dirfd in place, then CONTINUE so the
+					// kernel re-resolves the path through the now-current
+					// dirfd.
+					match self.try_upgrade_fd(ctx, dfd, orig_fd, &path_c, Some(inode_id))? {
+						UpgradeOutcome::RequestGone => return Ok(()),
+						// Upgraded, or couldn't upgrade (fail open): in both
+						// cases let the kernel resolve the open.
+						UpgradeOutcome::Upgraded | UpgradeOutcome::UpgradeFailed => {}
+						UpgradeOutcome::NotUpgradable => {
+							// A non-directory base fd; the kernel will report
+							// ENOTDIR natively on CONTINUE.
+							warn!("non-dir fd {} (-> {:?}) given to openat", orig_fd, path_c);
+						}
 					}
 					return ctx.send_continue();
 				}
@@ -390,7 +438,16 @@ impl ManagedBindMountSandbox {
 
 	/// Attempt to upgrade fd_raw in the target process by re-opening the
 	/// proxied absolute `path` on the current sandbox mount layout.  If
-	/// the fd is not upgradable, return Ok(false).
+	/// Attempt to upgrade `fd_raw` in the traced process by swapping in a
+	/// fresh handle that re-resolves `path` (an absolute m1 path) on the
+	/// current sandbox mount layout.
+	///
+	/// An `O_PATH` fd is treated as upgradable: the swap is safe (no
+	/// `f_pos` / open state) and the swapped fd reproduces the syscall's
+	/// native `O_PATH` semantics against the live mount, so callers must
+	/// *not* proxy it.  Only a confirmed regular file yields
+	/// [`UpgradeOutcome::NotUpgradable`]; any failure to inspect or reopen
+	/// yields [`UpgradeOutcome::UpgradeFailed`] (fail open, never proxy).
 	fn try_upgrade_fd(
 		&self,
 		ctx: &mut RequestContext,
@@ -398,17 +455,34 @@ impl ManagedBindMountSandbox {
 		fd_raw: libc::c_int,
 		path: &CStr,
 		inode_id: Option<InodeId>,
-	) -> Result<bool, AccessRequestError> {
-		let is_o_path = app_fd_is_o_path(ctx.pid(), fd_raw).map_err(|_| todo!())?;
+	) -> Result<UpgradeOutcome, AccessRequestError> {
+		let is_o_path = match app_fd_is_o_path(ctx.pid(), fd_raw) {
+			Ok(v) => v,
+			Err(e) => {
+				debug!(
+					"try_upgrade_fd: cannot read fdinfo for fd {} (-> {:?}): {}",
+					fd_raw, path, e
+				);
+				return Ok(UpgradeOutcome::UpgradeFailed);
+			}
+		};
 		let mut is_dir = false;
 		if !is_o_path {
-			is_dir = fd_opened
-				.is_dir()
-				.map_err(|_| todo!("Add AccessRequestError variant"))?;
+			is_dir = match fd_opened.is_dir() {
+				Ok(v) => v,
+				Err(e) => {
+					debug!(
+						"try_upgrade_fd: cannot statx fd {} (-> {:?}): {}",
+						fd_raw, path, e
+					);
+					return Ok(UpgradeOutcome::UpgradeFailed);
+				}
+			};
 		}
-		let upgradable = is_o_path || is_dir;
-		if !upgradable {
-			return Ok(false);
+		if !is_o_path && !is_dir {
+			// A regular file (or other non-swap-safe fd): swapping would
+			// clobber its f_pos / open state, so leave it to the caller.
+			return Ok(UpgradeOutcome::NotUpgradable);
 		}
 
 		let openhow = if is_o_path {
@@ -417,15 +491,33 @@ impl ManagedBindMountSandbox {
 			build_dir_open_how()
 		};
 		let m1fd = match self.m1_open_checked(path, &openhow, inode_id) {
-			Some(fd) => fd,
-			None => todo!(
-				"m1_open_checked need to return a proper error, then this function need to return BindMountSandboxError::OpenInM1Failed. When caller finds this, it should log the error and send CONTINUE to the app."
-			),
+			Ok(fd) => fd,
+			Err(e) => {
+				// Couldn't get a fresh handle on the live layout — leave
+				// the stale fd in place and let the caller fail open.
+				match e {
+					M1OpenError::OpenFailed(errno) => debug!(
+						"try_upgrade_fd: m1 reopen of {:?} for fd {} failed: errno {}",
+						path, fd_raw, errno
+					),
+					M1OpenError::IdentityMismatch => debug!(
+						"try_upgrade_fd: m1 reopen of {:?} for fd {} failed identity check",
+						path, fd_raw
+					),
+				}
+				return Ok(UpgradeOutcome::UpgradeFailed);
+			}
 		};
 		warn!("upgrading shadowed fd {} using {:?}", fd_raw, path);
-		// todo: can you examine O_CLOEXEC via fdinfo?
-		ctx.replace_fd(m1fd.as_raw_fd(), fd_raw, false)?;
-		Ok(true)
+		// TODO: preserve the app fd's original O_CLOEXEC (readable from
+		// /proc/<pid>/fdinfo `flags:`); for now the swapped fd is not cloexec.
+		if let Err(e) = ctx.replace_fd(m1fd.as_raw_fd(), fd_raw, false) {
+			if ctx.still_valid()? {
+				return Err(e);
+			}
+			return Ok(UpgradeOutcome::RequestGone);
+		}
+		Ok(UpgradeOutcome::Upgraded)
 	}
 
 	/// `openat` / `openat2` / `open` / `creat`: re-open the abspath in m1
@@ -480,10 +572,18 @@ impl ManagedBindMountSandbox {
 
 		let how = build_open_how(&params);
 		let fd = match self.m1_open_checked(&abspath_c, &how, expected) {
-			Some(fd) => fd,
-			None => {
-				// TODO: m1_open_checked need to return a proper error, then print here.
-				return ctx.send_continue();
+			Ok(fd) => fd,
+			Err(M1OpenError::OpenFailed(errno)) => {
+				// The open failed in m1 too.  We can't safely CONTINUE
+				// (the app's cwd is shadowed, so a native re-resolution
+				// could land elsewhere), so reproduce the errno the app
+				// would have seen.
+				return ctx.send_error(-errno);
+			}
+			Err(M1OpenError::IdentityMismatch) => {
+				// The abspath now resolves to a different inode than the
+				// app's own resolution (a TOCTOU race); fail closed.
+				return ctx.send_error(-libc::ESTALE);
 			}
 		};
 
@@ -605,21 +705,16 @@ impl ManagedBindMountSandbox {
 			let Some((path_c, expected)) = self.is_dfd_shadowed(&dfd) else {
 				continue;
 			};
-			match self.try_upgrade_fd(ctx, &dfd, raw, &path_c, Some(expected)) {
-				Ok(true) => {}
-				Ok(false) => {
+			match self.try_upgrade_fd(ctx, &dfd, raw, &path_c, Some(expected))? {
+				UpgradeOutcome::Upgraded | UpgradeOutcome::UpgradeFailed => {}
+				UpgradeOutcome::RequestGone => return Ok(()),
+				UpgradeOutcome::NotUpgradable => {
 					warn!(
 						"allow_at_dirfds: expected *at request dfd {} (-> {:?}) to be a directory or O_PATH, but it is not",
 						raw, path_c
 					);
 				}
-				Err(e) => {
-					error!(
-						"allow_at_dirfds: try_upgrade_fd failed for fd {} (-> {:?}): {}",
-						raw, path_c, e
-					);
-				}
-			};
+			}
 		}
 		ctx.send_continue()
 	}
@@ -645,42 +740,44 @@ impl ManagedBindMountSandbox {
 			return ctx.send_continue();
 		}
 
-		let dfd = target.dfd();
-		if let OriginalHandle::Root = target.get_original_handle() {
-			// root is never shadowed
-			return ctx.send_continue();
-		}
-
-		// Nothing to fix unless the held fd's mount is stale.
+		// Nothing to fix unless the held fd's mount is stale.  (An f*
+		// target always comes from an explicit fd, so it is never
+		// Root/Cwd; the shadow check returns None for those anyway.)
 		let Some((path_c, inode_id)) = self.is_fstarget_shadowed(target) else {
 			return ctx.send_continue();
 		};
 
+		let dfd = target.dfd();
 		if let OriginalHandle::Fd(dfd_raw) = target.get_original_handle() {
-			match self.try_upgrade_fd(ctx, dfd, dfd_raw, &path_c, Some(inode_id)) {
-				Ok(true) => {
-					// Upgraded in place; CONTINUE so the op resolves through
-					// the live layout.
-					return ctx.send_continue();
-				}
-				Ok(false) => {
-					// can't upgrade, proxy.
-				}
-				Err(e) => {
-					error!("try_upgrade_fd failed for fd {}: {}", dfd_raw, e);
-					// proxy.
-				}
+			match self.try_upgrade_fd(ctx, dfd, dfd_raw, &path_c, Some(inode_id))? {
+				// Upgraded in place (including an O_PATH fd, which keeps
+				// its native O_PATH semantics on the live mount): CONTINUE
+				// so the op resolves through the live layout.
+				UpgradeOutcome::Upgraded => return ctx.send_continue(),
+				// Couldn't upgrade an upgradable fd: fail open rather than
+				// proxy.  We must never proxy here without knowing the fd
+				// is a regular file — a path-based proxy of an O_PATH fd
+				// would turn a native EBADF into a spurious success.
+				UpgradeOutcome::UpgradeFailed => return ctx.send_continue(),
+				UpgradeOutcome::RequestGone => return Ok(()),
+				// A confirmed regular file: fall through to the m1 proxy.
+				UpgradeOutcome::NotUpgradable => {}
 			}
+		} else {
+			// No explicit fd to swap (shouldn't happen for an f* target).
+			return ctx.send_continue();
 		}
-		// else if OriginalHandle::Cwd (but shadowed), also proxy
 
+		// Unupgradable (a regular file): a swap would clobber its
+		// `f_pos`/open state, so perform the op in m1 against the live
+		// layout and return its result directly.
 		let how = build_path_open_how();
 		let m1fd = match self.m1_open_checked(&path_c, &how, Some(inode_id)) {
-			Some(fd) => fd,
-			None => {
-				// todo: ...
-				return ctx.send_continue();
-			}
+			Ok(fd) => fd,
+			// Reproduce the error the app would have seen; on an identity
+			// race report ESTALE rather than acting on the wrong inode.
+			Err(M1OpenError::OpenFailed(errno)) => return ctx.send_error(-errno),
+			Err(M1OpenError::IdentityMismatch) => return ctx.send_error(-libc::ESTALE),
 		};
 		match proxy_modify(fsop, m1fd.as_raw_fd()) {
 			Ok(()) => ctx.send_value(0),
