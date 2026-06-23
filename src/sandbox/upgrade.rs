@@ -165,6 +165,22 @@ fn open_reopen_params(
 	}
 }
 
+fn fdinfo_flags(pid: libc::pid_t, raw: libc::c_int) -> Result<i32, io::Error> {
+	let path = format!("/proc/{}/fdinfo/{}", pid, raw);
+	let content = std::fs::read_to_string(&path)?;
+	for line in content.lines() {
+		if let Some(rest) = line.strip_prefix("flags:")
+			&& let Ok(flags) = i32::from_str_radix(rest.trim(), 8)
+		{
+			return Ok(flags);
+		}
+	}
+	Err(io::Error::new(
+		io::ErrorKind::InvalidData,
+		"no parseable `flags:` line in fdinfo",
+	))
+}
+
 /// Why an [`ManagedBindMountSandbox::m1_open_checked`] reopen did not
 /// yield a usable handle.
 enum M1OpenError {
@@ -459,7 +475,7 @@ impl ManagedBindMountSandbox {
 		path: &CStr,
 		inode_id: Option<InodeId>,
 	) -> Result<UpgradeOutcome, AccessRequestError> {
-		let is_o_path = match app_fd_is_o_path(ctx.pid(), fd_raw) {
+		let flags = match fdinfo_flags(ctx.pid(), fd_raw) {
 			Ok(v) => v,
 			Err(e) => {
 				debug!(
@@ -469,6 +485,9 @@ impl ManagedBindMountSandbox {
 				return Ok(UpgradeOutcome::UpgradeFailed);
 			}
 		};
+		let is_o_path = flags & libc::O_PATH != 0;
+		// Preserve the app fd's close-on-exec setting on the swapped fd.
+		let cloexec = flags & libc::O_CLOEXEC != 0;
 		let mut is_dir = false;
 		if !is_o_path {
 			is_dir = match fd_opened.is_dir() {
@@ -512,9 +531,7 @@ impl ManagedBindMountSandbox {
 			}
 		};
 		warn!("upgrading shadowed fd {} using {:?}", fd_raw, path);
-		// TODO: preserve the app fd's original O_CLOEXEC (readable from
-		// /proc/<pid>/fdinfo `flags:`); for now the swapped fd is not cloexec.
-		if let Err(e) = ctx.replace_fd(m1fd.as_raw_fd(), fd_raw, false) {
+		if let Err(e) = ctx.replace_fd(m1fd.as_raw_fd(), fd_raw, cloexec) {
 			if ctx.still_valid()? {
 				return Err(e);
 			}
@@ -844,21 +861,6 @@ fn build_dir_open_how() -> open_how {
 	how.flags = (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
 	how.resolve = libc::RESOLVE_IN_ROOT;
 	how
-}
-
-/// Determine whether the app fd `raw` of process `pid` was opened with
-/// `O_PATH` via fdinfo
-fn app_fd_is_o_path(pid: libc::pid_t, raw: libc::c_int) -> Result<bool, io::Error> {
-	let path = format!("/proc/{}/fdinfo/{}", pid, raw);
-	let content = std::fs::read_to_string(&path)?;
-	for line in content.lines() {
-		if let Some(rest) = line.strip_prefix("flags:")
-			&& let Ok(flags) = i32::from_str_radix(rest.trim(), 8)
-		{
-			return Ok(flags & libc::O_PATH != 0);
-		}
-	}
-	Ok(false)
 }
 
 /// If `fsop` is a single-operand modification operation whose target
