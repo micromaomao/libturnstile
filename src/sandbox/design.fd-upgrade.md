@@ -353,9 +353,16 @@ whether the call is an `f*` or an `*at`:
 - **Upgradable**: a *directory* fd (or an `O_PATH` fd).  It carries no
   read/write `f_pos` or open state we'd lose by swapping; the only
   casualty is a `getdents` cursor reset (Limitation #5).
-- **Unupgradable**: a *regular-file* fd (and other types).  Swapping
-  would clobber `f_pos`, open flags, locks, mmap backing — so the design
-  never touches it, and we proxy instead.
+- **Unupgradable**: a *regular-file* fd (and other types).  A swap
+  replaces the *entire* open file description with a fresh `struct file`,
+  which silently drops OFD locks (`F_OFD_SETLK`) and desyncs any
+  dup-shared offset — even though the file offset and open flags
+  themselves *are* recoverable (`f_pos` transfers with the ADDFD'd
+  `struct file`, and flags come from fdinfo).  So for the metadata ops we
+  proxy instead, leaving the app's fd untouched.  The one case that
+  *can't* be proxied is `mmap(PROT_EXEC)` (it maps into the app's address
+  space), so there we do swap the regular-file fd, accepting the
+  lock/dup-offset caveat — see §11.6.
 
 So whenever a syscall's access is governed by a held fd whose `mnt_id`
 is stale, we swap it if it's upgradable and proxy it if not.  An
@@ -489,13 +496,26 @@ it (which still succeeds only once the app's cwd / fds let go).
 
 #### 11.6  `execve` and `mmap(PROT_EXEC)`
 
-- **`fexecve` / `execveat(fd, "", AT_EMPTY_PATH)`** and **`mmap(
-  PROT_EXEC, fd, ...)`** with `fd` opened on a `noexec` mount: the
-  kernel checks `path_noexec(&file->f_path)` against the fd's mount and
-  fails.  We could SETFD-replace the fd (exec has no `f_pos` concern),
-  but it carries the app's open flags/state, so we leave it for now.
-  Workaround: grant exec before the open, or re-open by abspath.  See
-  Limitation #4 and the TODO.
+- **`mmap(PROT_EXEC, fd, ...)`** with `fd` opened on a `noexec` mount:
+  the kernel checks `path_noexec(&file->f_path)` against the fd's mount
+  and fails.  An mmap can't be proxied (it maps into the app's address
+  space), and exec-ability isn't an open flag (so we can't pre-empt it at
+  open time).  When the fd is on a *stale* mount (a new exec-capable
+  mount was layered on after the open, so `mnt_id` differs), `allow()`
+  swaps the regular-file fd for a fresh one resolved on the live mount,
+  preserving the app fd's flags and `pos:` offset, then CONTINUE.  This
+  accepts the regular-file-swap caveat (OFD locks / dup-shared offset are
+  lost — §11.2, Limitation #4).  If the fd's *own* mount merely had its
+  attrs changed in place (same `mnt_id`), it isn't stale and a plain
+  CONTINUE already maps it executable.
+- **`fexecve` / `execveat(fd, "", AT_EMPTY_PATH)`** with `fd` opened on a
+  `noexec` mount hit the same `path_noexec` check, and are handled the
+  same way as the mmap case: when the held fd is on a stale mount,
+  `allow()` swaps it for a fresh one resolved on the live exec-capable
+  mount (preserving flags / offset, and reopening an `O_PATH` exec fd as
+  `O_PATH`), then CONTINUE.  Same regular-file-swap caveat applies (OFD
+  locks / dup-shared offset lost — usually irrelevant for an exec'd
+  file).
 - **`execve("/abs", ...)`** and **`execveat(AT_FDCWD, "/abs", ...)`**
   re-resolve from `/` and see the latest layout — no upgrade needed
   (after an exec grant + reconcile, CONTINUE replays successfully).
@@ -675,18 +695,28 @@ suffices — no mount privilege needed); or an earlier
    mount is freed only when the caller drops it from the desired tree
    and a reconcile emits an `Unmount` for it; until then (e.g. churned
    `chdir` targets) it stays in `current_mt`.
-4. **Exec via pre-grant held fds fails.**  `fexecve(fd)` /
-   `execveat(fd, "", AT_EMPTY_PATH)` / `mmap(PROT_EXEC, fd, …)` check
-   `path_noexec` against the fd's mount; if it was `noexec` at open
-   time and exec was granted later, the held fd doesn't see it.
-   Workarounds: re-open by abspath after the grant (the `openat` proxy
-   returns a fresh fd), or grant exec before the open.  TODO: consider
-   SETFD-replacing the fd for `fexecve` (no `f_pos` concern).
+4. **Exec via pre-grant held fds.**  `fexecve(fd)` / `execveat(fd, "",
+   AT_EMPTY_PATH)` / `mmap(PROT_EXEC, fd, …)` check `path_noexec` against
+   the fd's mount; if it was `noexec` at open time and exec was granted
+   later (via a *new* covering mount), the held fd doesn't see it.  All
+   three are now handled (§11.6): the held fd is swapped for a fresh one
+   on the live exec-capable mount, preserving its flags and `pos:`
+   offset.  The swap replaces the whole open file description, so OFD
+   locks (`F_OFD_SETLK`) and any dup-shared offset on that fd are lost —
+   a regular file is mapped/exec'd, not generally locked, so this is
+   usually fine.  (Only the `*at(dirfd, relpath)` / path-based exec
+   forms need no swap — they re-resolve on CONTINUE.)
 5. **Mid-`getdents` dirfd replacement causes duplicates / misses.**  A
     replaced non-`O_PATH` dirfd starts at `f_pos = 0`; an app
     interleaving `getdents` with modifying `*at`s on the same dirfd may
-    re-see early entries or miss some.  Rare; the library logs a
-    `warn!` on each non-`O_PATH` dirfd replacement.
+    re-see early entries or miss some.  The reset is *not* an ADDFD
+    artifact — `f_pos` does transfer with the handed-over `struct file`
+    (verified) — it's because we hand over a *freshly* m1-opened fd that
+    happens to start at 0.  It could be avoided by seeking the fresh fd
+    to the app fd's `pos:` before the swap (as the `mmap(PROT_EXEC)`
+    regular-file swap already does, §11.6); for dirfds this is left as
+    future work.  Rare; the library logs a `warn!` on each non-`O_PATH`
+    dirfd replacement.
 6. **f\* modifying ops on a stale *regular-file* fd are proxied, not
     transparent.**  A regular-file fd is unupgradable (§11.2), so
     `fchmod`/`fchown`/`fsetxattr`/`fremovexattr` on a stale

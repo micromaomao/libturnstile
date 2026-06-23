@@ -455,6 +455,47 @@ impl ManagedBindMountSandbox {
 			return self.handle_chdir(target, ctx);
 		}
 
+		// A file opened on a noexec mount can't be mmapped executable.
+		// If exec is granted later, before any mmap we need to upgrade
+		// any fds in shadowed noexec mounts.
+		if let FsOperation::FsMmap(op) = fsop {
+			if op.need_exec
+				&& let Some((path_c, inode_id)) = self.is_fstarget_shadowed(&op.target)
+				&& let OriginalHandle::Fd(fd_raw) = op.target.get_original_handle()
+			{
+				debug!("Handling mmap(PROT_EXEC) request {:?}", request.operation());
+				if let Err(e) = self.upgrade_regular_file_fd(ctx, fd_raw, &path_c, Some(inode_id)) {
+					error!(
+						"mmap(PROT_EXEC): failed to upgrade fd {} (-> {:?}): {} — continuing natively",
+						fd_raw, path_c, e
+					);
+				}
+			}
+			return ctx.send_continue();
+		}
+
+		// execveat(fd, "", AT_EMPTY_PATH) also needs to be handled
+		// specially because it may require newly gained exec permission
+		// but it's not something we can proxy like for other *at with
+		// empty path or f* ops.
+		if let FsOperation::FsExec(op) = fsop
+			&& op.target.is_empty_path()
+			&& let Some((path_c, inode_id)) = self.is_fstarget_shadowed(&op.target)
+			&& let OriginalHandle::Fd(fd_raw) = op.target.get_original_handle()
+		{
+			debug!(
+				"Handling execveat(AT_EMPTY_PATH) request {:?}",
+				request.operation()
+			);
+			if let Err(e) = self.upgrade_regular_file_fd(ctx, fd_raw, &path_c, Some(inode_id)) {
+				error!(
+					"execveat(AT_EMPTY_PATH): failed to upgrade fd {} (-> {:?}): {} — continuing natively",
+					fd_raw, path_c, e
+				);
+			}
+			return ctx.send_continue();
+		}
+
 		// modification f* operations may need to have their fd upgraded,
 		// or if they operate on non-directories, proxied.
 		if let Some(target) = modifying_fsop_fd_target(fsop) {
@@ -474,16 +515,8 @@ impl ManagedBindMountSandbox {
 
 	/// Attempt to upgrade fd_raw in the target process by re-opening the
 	/// proxied absolute `path` on the current sandbox mount layout.  If
-	/// Attempt to upgrade `fd_raw` in the traced process by swapping in a
-	/// fresh handle that re-resolves `path` (an absolute m1 path) on the
-	/// current sandbox mount layout.
-	///
-	/// An `O_PATH` fd is treated as upgradable: the swap is safe (no
-	/// `f_pos` / open state) and the swapped fd reproduces the syscall's
-	/// native `O_PATH` semantics against the live mount, so callers must
-	/// *not* proxy it.  Only a confirmed regular file yields
-	/// [`UpgradeOutcome::NotUpgradable`]; any failure to inspect or reopen
-	/// yields [`UpgradeOutcome::UpgradeFailed`] (fail open, never proxy).
+	/// the fd is a regular file, this returns
+	/// [`UpgradeOutcome::NotUpgradable`] without doing anything.
 	fn try_upgrade_fd(
 		&self,
 		ctx: &mut RequestContext,
@@ -492,8 +525,8 @@ impl ManagedBindMountSandbox {
 		path: &CStr,
 		inode_id: Option<InodeId>,
 	) -> Result<UpgradeOutcome, AccessRequestError> {
-		let flags = match fdinfo_flags(ctx.pid(), fd_raw) {
-			Ok(v) => v,
+		let flags = match read_fdinfo(ctx.pid(), fd_raw) {
+			Ok(v) => v.flags,
 			Err(e) => {
 				debug!(
 					"try_upgrade_fd: cannot read fdinfo for fd {} (-> {:?}): {}",
@@ -532,8 +565,6 @@ impl ManagedBindMountSandbox {
 		let m1fd = match self.m1_open_checked(path, &openhow, inode_id) {
 			Ok(fd) => fd,
 			Err(e) => {
-				// Couldn't get a fresh handle on the live layout — leave
-				// the stale fd in place and let the caller fail open.
 				match e {
 					M1OpenError::OpenFailed(errno) => debug!(
 						"try_upgrade_fd: m1 reopen of {:?} for fd {} failed: errno {}",
@@ -555,6 +586,53 @@ impl ManagedBindMountSandbox {
 			return Ok(UpgradeOutcome::RequestGone);
 		}
 		Ok(UpgradeOutcome::Upgraded)
+	}
+
+	/// Upgrades a fd, with support even for regular files, preserving the
+	/// seek offset.  Some state on the fd are still lost, like flock().
+	/// A fd sharing a file description (struct file) with another fd will
+	/// also have this link broken.
+	fn upgrade_regular_file_fd(
+		&self,
+		ctx: &mut RequestContext,
+		fd_raw: libc::c_int,
+		path: &CStr,
+		inode_id: Option<InodeId>,
+	) -> Result<(), io::Error> {
+		let info = read_fdinfo(ctx.pid(), fd_raw)?;
+		// Re-open the same file on the live layout with the app fd's
+		// original access mode / status flags (O_PATH included, so an
+		// exec-only O_PATH fd stays openable).  Whether the transient m1 fd
+		// is O_CLOEXEC is irrelevant - the target fd's close-on-exec is set
+		// on replace_fd below.
+		let how = build_open_how(&ReopenParams {
+			flags: (info.flags as u32) as u64,
+			mode: 0,
+			resolve: 0,
+		});
+		let m1fd = self
+			.m1_open_checked(path, &how, inode_id)
+			.map_err(|e| match e {
+				M1OpenError::OpenFailed(errno) => io::Error::from_raw_os_error(errno),
+				M1OpenError::IdentityMismatch => io::Error::from_raw_os_error(libc::ESTALE),
+			})?;
+		// ADDFD shares the struct file, but we opened a fresh one, so seek
+		// it to the app fd's current offset to keep reads/writes consistent.
+		if info.pos > 0 {
+			let r =
+				unsafe { libc::lseek(m1fd.as_raw_fd(), info.pos as libc::off_t, libc::SEEK_SET) };
+			if r < 0 {
+				return Err(io::Error::last_os_error());
+			}
+		}
+		let cloexec = info.flags & libc::O_CLOEXEC != 0;
+		ctx.replace_fd(m1fd.as_raw_fd(), fd_raw, cloexec)
+			.map_err(io::Error::other)?;
+		warn!(
+			"upgraded shadowed regular-file fd {} using {:?}",
+			fd_raw, path
+		);
+		Ok(())
 	}
 
 	/// `openat` / `openat2` / `open` / `creat`: re-open the abspath in m1
