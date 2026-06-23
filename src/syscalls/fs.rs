@@ -4,8 +4,9 @@ use crate::{
 	AccessRequestError, TurnstileTracerError,
 	access::fs::{
 		ChmodOperation, ChownOperation, CreateKind, CreateOperation, ExecOperation, FsTarget,
-		GetXattrOperation, LinkOperation, ListXattrOperation, OpenOperation, RemoveXattrOperation,
-		RenameOperation, SetXattrOperation, TruncateOperation, UnlinkOperation,
+		GetXattrOperation, LinkOperation, ListXattrOperation, MmapOperation, OpenOperation,
+		RemoveXattrOperation, RenameOperation, SetXattrOperation, TruncateOperation,
+		UnlinkOperation,
 	},
 	access::{
 		AccessRequest, Operation,
@@ -18,6 +19,9 @@ use super::lazy_syscall_table_name_to_number;
 
 type SyscallHandler1 =
 	fn(req: &mut RequestContext, target: FsTarget) -> Result<Operation, AccessRequestError>;
+
+type SyscallHandler1Optional =
+	fn(req: &mut RequestContext, fd_arg_index: u8) -> Result<Option<Operation>, AccessRequestError>;
 
 type SyscallHandler2 = fn(
 	req: &mut RequestContext,
@@ -671,6 +675,9 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 	),
 ];
 
+// (name, handler, fd)
+const FS_SYSCALLS_FD_OPTIONAL: &[(&str, SyscallHandler1Optional, u8)] = &[("mmap", handle_mmap, 4)];
+
 fn handle_listxattr_like(
 	_req: &mut RequestContext,
 	target: FsTarget,
@@ -726,6 +733,27 @@ fn handle_removexattr_like(
 	Ok(fsop(FsRemoveXattr(RemoveXattrOperation { target, name })))
 }
 
+// ignores anonymous mmaps
+fn handle_mmap(
+	req: &mut RequestContext,
+	fd_arg_index: u8,
+) -> Result<Option<Operation>, AccessRequestError> {
+	let flags = req.arg(3);
+	let fd = req.arg(fd_arg_index as usize) as libc::c_int;
+	if flags & libc::MAP_ANONYMOUS as u64 != 0 || fd < 0 {
+		return Ok(None);
+	}
+	let target = FsTarget::from_fd(req, fd_arg_index)?;
+	let prot = req.arg(2);
+	let shared = flags & libc::MAP_SHARED as u64 != 0;
+	Ok(Some(fsop(FsMmap(MmapOperation {
+		target,
+		need_read: prot & libc::PROT_READ as u64 != 0,
+		need_write: shared && prot & libc::PROT_WRITE as u64 != 0,
+		need_exec: prot & libc::PROT_EXEC as u64 != 0,
+	}))))
+}
+
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
 ) -> Result<(), TurnstileTracerError> {
@@ -750,6 +778,11 @@ pub(crate) fn add_filter_rules(
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	for &(sys, ..) in fs_syscalls_fd_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_fd_optional_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
@@ -789,6 +822,12 @@ lazy_syscall_table_name_to_number!(
 	Option<u8>
 );
 lazy_syscall_table_name_to_number!(FS_SYSCALLS_FD, fs_syscalls_fd_table, SyscallHandler1, u8);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_FD_OPTIONAL,
+	fs_syscalls_fd_optional_table,
+	SyscallHandler1Optional,
+	u8
+);
 
 /// Argument indices of any dir fds this syscall accepts, derived from the
 /// existing request-parsing tables, for use by fd upgrade logic in
@@ -867,6 +906,17 @@ pub(crate) fn handle_notification<'a>(
 			let target = FsTarget::from_fd(request_ctx, fd_arg_index)?;
 			let op = handler(request_ctx, target)?;
 			return Ok(Some(AccessRequest { operation: op }));
+		}
+	}
+
+	for &(sys, handler, fd_arg_index) in fs_syscalls_fd_optional_table() {
+		if syscall == sys {
+			let op = handler(request_ctx, fd_arg_index)?;
+			if let Some(op) = op {
+				return Ok(Some(AccessRequest { operation: op }));
+			} else {
+				return Ok(None);
+			}
 		}
 	}
 

@@ -756,6 +756,14 @@ pub struct TruncateOperation {
 }
 
 #[derive(Debug)]
+pub struct MmapOperation {
+	pub target: FsTarget,
+	pub need_read: bool,
+	pub need_write: bool,
+	pub need_exec: bool,
+}
+
+#[derive(Debug)]
 pub struct ListXattrOperation {
 	pub target: FsTarget,
 }
@@ -795,6 +803,7 @@ pub enum FsOperation {
 	FsChmod(ChmodOperation),
 	FsChown(ChownOperation),
 	FsTruncate(TruncateOperation),
+	FsMmap(MmapOperation),
 	FsListXattr(ListXattrOperation),
 	FsGetXattr(GetXattrOperation),
 	FsSetXattr(SetXattrOperation),
@@ -947,6 +956,16 @@ impl std::fmt::Display for FsOperation {
 			Self::FsTruncate(TruncateOperation { target, length }) => {
 				write!(f, "truncate {} {}", length, target)?;
 			}
+			Self::FsMmap(MmapOperation {
+				target,
+				need_read,
+				need_write,
+				need_exec,
+			}) => {
+				write!(f, "mmap ")?;
+				write_rwx(f, *need_read, *need_write, *need_exec)?;
+				write!(f, " {}", target)?;
+			}
 			Self::FsListXattr(ListXattrOperation { target }) => {
 				write!(f, "listxattr {}", target)?;
 			}
@@ -1043,6 +1062,24 @@ impl FsOperation {
 			}
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
+			}
+			Self::FsMmap(MmapOperation {
+				target,
+				need_read,
+				need_write,
+				need_exec,
+			}) => {
+				let mut p = make_rwx!(target.clone(),);
+				if *need_read {
+					p.read = true;
+				}
+				if *need_write {
+					p.write = true;
+				}
+				if *need_exec {
+					p.exec = true;
+				}
+				smallvec![p]
 			}
 			Self::FsListXattr(ListXattrOperation { target })
 			| Self::FsGetXattr(GetXattrOperation { target, .. }) => {
