@@ -165,20 +165,37 @@ fn open_reopen_params(
 	}
 }
 
-fn fdinfo_flags(pid: libc::pid_t, raw: libc::c_int) -> Result<i32, io::Error> {
+/// The fields of `/proc/<pid>/fdinfo/<raw>` the upgrade path needs.
+struct FdInfo {
+	/// `file->f_flags` (octal `flags:` line).  Faithfully reflects both
+	/// `O_PATH` and `O_CLOEXEC`.
+	flags: i32,
+	/// Current file offset (`pos:` line).
+	pos: i64,
+}
+
+/// Read the `flags:` and `pos:` fields of the app fd `raw` of process
+/// `pid` from `/proc/<pid>/fdinfo/<raw>`.  Both lines are always present
+/// (the kernel emits them for every fd type, including `O_PATH`).
+fn read_fdinfo(pid: libc::pid_t, raw: libc::c_int) -> Result<FdInfo, io::Error> {
 	let path = format!("/proc/{}/fdinfo/{}", pid, raw);
 	let content = std::fs::read_to_string(&path)?;
+	let mut flags = None;
+	let mut pos = None;
 	for line in content.lines() {
-		if let Some(rest) = line.strip_prefix("flags:")
-			&& let Ok(flags) = i32::from_str_radix(rest.trim(), 8)
-		{
-			return Ok(flags);
+		if let Some(rest) = line.strip_prefix("flags:") {
+			flags = i32::from_str_radix(rest.trim(), 8).ok();
+		} else if let Some(rest) = line.strip_prefix("pos:") {
+			pos = rest.trim().parse::<i64>().ok();
 		}
 	}
-	Err(io::Error::new(
-		io::ErrorKind::InvalidData,
-		"no parseable `flags:` line in fdinfo",
-	))
+	match (flags, pos) {
+		(Some(flags), Some(pos)) => Ok(FdInfo { flags, pos }),
+		_ => Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			"no parseable `flags:` / `pos:` line in fdinfo",
+		)),
+	}
 }
 
 /// Why an [`ManagedBindMountSandbox::m1_open_checked`] reopen did not
@@ -660,6 +677,10 @@ impl ManagedBindMountSandbox {
 		let Some((cov_path, cov_host, cov_attrs)) = self.covering_mount(target_os) else {
 			return ctx.send_continue();
 		};
+		// If we're already full permission, don't bother setting up dummy mounts
+		if !cov_attrs.readonly && !cov_attrs.noexec {
+			return ctx.send_continue();
+		}
 		// A mount already exists *exactly* at the target: cwd is pinned to
 		// a tracked mount whose identity reconcile preserves, so there is
 		// nothing to do.
