@@ -606,12 +606,6 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 ];
 
 // (name, handler, fd)
-//
-// `fchmod`/`fchown`/`ftruncate`/`fsetxattr`/`fremovexattr` only take an
-// already-open descriptor (argument 0); the remaining arguments carry
-// the payload.  When such a call lands on a stale fd, `ManagedBindMountSandbox`
-// upgrades or proxies it so it operates against the live layout (see the
-// held-fd dispatch in `sandbox::upgrade`).
 const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 	("fchdir", handle_chdir_like, 0),
 	(
