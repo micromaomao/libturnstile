@@ -17,9 +17,10 @@ use std::{
 
 use clap::Parser;
 use libturnstile::{
-	AccessRequestError, BindMountSandbox, CommonPlaceholderData, ManagedBindMountSandbox,
-	ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry, MountAttributes, PlaceholderDirData,
-	PlaceholderFileData, PlaceholderSymlinkData, TracerOptions, TurnstileTracer,
+	AccessRequestError, BindMountSandbox, BindMountSandboxError, CommonPlaceholderData,
+	ManagedBindMountSandbox, ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry,
+	MountAttributes, PlaceholderDirData, PlaceholderFileData, PlaceholderSymlinkData,
+	TracerOptions, TurnstileTracer,
 	access::{
 		Operation,
 		fs::{ForeignFd, FsOperation, RwxPermission},
@@ -239,13 +240,20 @@ fn create_symlinks_for_user_path(
 				OsStr::from_bytes(&candidate),
 				target_cstr
 			);
-			let placeholder = ManagedPlaceholder::PlaceholderSymlink(PlaceholderSymlinkData {
-				common: CommonPlaceholderData::from_stat(&stat),
-				target: target_cstr,
-			});
-			sandbox
-				.add_or_update_placeholder(OsStr::from_bytes(&candidate), placeholder)
-				.map_err(io::Error::other)?;
+			// Don't do anything if the symlink is already covered by a
+			// mount or created as a placeholder,
+			let covered = check_covered_or_placeholder(sandbox, &candidate_c, false, false, true)
+				.map(|(covered, _)| covered)
+				.unwrap_or(false);
+			if !covered {
+				let placeholder = ManagedPlaceholder::PlaceholderSymlink(PlaceholderSymlinkData {
+					common: CommonPlaceholderData::from_stat(&stat),
+					target: target_cstr,
+				});
+				sandbox
+					.add_or_update_placeholder(OsStr::from_bytes(&candidate), placeholder)
+					.map_err(io::Error::other)?;
+			}
 			if target_bytes.starts_with(b"/") {
 				resolved.clear();
 			}
@@ -263,6 +271,41 @@ fn create_symlinks_for_user_path(
 		}
 	}
 	Ok(())
+}
+
+/// Determine whether `abspath` is already covered for an access.
+///
+/// A path is covered if it sits under a mount that already grants the
+/// required access (`need_write` / `need_exec`).  Additionally, when
+/// `resolve_only` is true, a path that merely has a placeholder is also
+/// considered covered.
+///
+/// Returns `(covered, existing_mount)`, same as
+/// [`ManagedBindMountSandbox::check_covered`].  When the placeholder
+/// lookup errors it is logged and the mount-only result is returned.
+fn check_covered_or_placeholder(
+	sandbox: &ManagedBindMountSandbox,
+	abspath: &CStr,
+	need_write: bool,
+	need_exec: bool,
+	resolve_only: bool,
+) -> Result<(bool, Option<ManagedMountPoint>), BindMountSandboxError> {
+	assert!(!resolve_only || (!need_write && !need_exec));
+	let cover = sandbox.check_covered(abspath, need_write, need_exec);
+	if matches!(cover, Ok((true, _))) || !resolve_only {
+		return cover;
+	}
+	match sandbox.has_placeholder(abspath) {
+		Ok(true) => Ok((true, None)),
+		Ok(false) => cover,
+		Err(e) => {
+			debug!(
+				"error checking if {:?} is covered by placeholder: {}",
+				abspath, e
+			);
+			cover
+		}
+	}
 }
 
 fn tracing_thread(context: &'static Context) {
@@ -380,25 +423,13 @@ fn tracing_thread(context: &'static Context) {
 							// mount with sufficient permissions, or if it is a
 							// resolve-only request and the path is covered by a
 							// placeholder.
-							let mut cover = context
-								.sandbox
-								.check_covered(&abspath, rwxp.write, rwxp.exec);
-							if !matches!(cover, Ok((true, _))) && resolve_only {
-								let has_placeholder = context.sandbox.has_placeholder(&abspath);
-								match has_placeholder {
-									Ok(true) => {
-										cover = Ok((true, None));
-									}
-									Ok(false) => {}
-									Err(e) => {
-										check_req_valid!();
-										error!(
-											"error checking if {} is covered by placeholder: {}",
-											rwxp, e
-										);
-									} // The error! log below will log the error from check_covered.
-								}
-							}
+							let cover = check_covered_or_placeholder(
+								&context.sandbox,
+								&abspath,
+								rwxp.write,
+								rwxp.exec,
+								resolve_only,
+							);
 							match cover.as_ref().map(|x| x.0) {
 								Ok(true) => {
 									debug!(
