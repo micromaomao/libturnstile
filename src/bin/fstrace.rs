@@ -1,6 +1,6 @@
 use clap::Parser;
 use libturnstile::access::fs::{ForeignFd, FsOperation, FsTarget, RwxPermission};
-use libturnstile::{AccessRequestError, TurnstileTracer, access::Operation};
+use libturnstile::{AccessRequestError, TracerOptions, TurnstileTracer, access::Operation};
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -195,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	};
 
 	let context = Arc::new(Context {
-		tracer: TurnstileTracer::new()?,
+		tracer: TurnstileTracer::new(TracerOptions::default())?,
 		pidfd: OnceLock::new(),
 	});
 

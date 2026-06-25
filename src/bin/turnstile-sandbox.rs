@@ -19,7 +19,7 @@ use clap::Parser;
 use libturnstile::{
 	AccessRequestError, BindMountSandbox, CommonPlaceholderData, ManagedBindMountSandbox,
 	ManagedMountPoint, ManagedPlaceholder, MountAttributes, PlaceholderDirData,
-	PlaceholderFileData, PlaceholderSymlinkData, TurnstileTracer,
+	PlaceholderFileData, PlaceholderSymlinkData, TracerOptions, TurnstileTracer,
 	access::{
 		Operation,
 		fs::{ForeignFd, FsOperation, RwxPermission},
@@ -594,7 +594,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let context = Box::leak(Box::new(Context {
 		sandbox,
 		path_res_sandbox,
-		tracer: TurnstileTracer::new()?,
+		tracer: TurnstileTracer::new(TracerOptions::default())?,
 		pidfd: OnceLock::new(),
 		should_exit: AtomicBool::new(false),
 		permissive: cli.permissive,

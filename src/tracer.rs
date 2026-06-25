@@ -176,8 +176,29 @@ pub struct TurnstileTracer {
 unsafe impl Sync for TurnstileTracer {}
 unsafe impl Send for TurnstileTracer {}
 
+/// Options for [`TurnstileTracer::new`].
+#[derive(Debug, Clone)]
+pub struct TracerOptions {
+	/// Make all `io_uring` syscalls (`io_uring_setup`, `io_uring_enter`,
+	/// `io_uring_register`) fail with `ENOSYS`.
+	///
+	/// This tracer does not support tracing io_uring operations.  If an
+	/// application uses io_uring, operations done that way will not be
+	/// traced.  This option prevents the traced application from using
+	/// io_uring.
+	pub block_io_uring: bool,
+}
+
+impl Default for TracerOptions {
+	fn default() -> Self {
+		Self {
+			block_io_uring: true,
+		}
+	}
+}
+
 impl TurnstileTracer {
-	pub fn new() -> Result<Self, TurnstileTracerError> {
+	pub fn new(options: TracerOptions) -> Result<Self, TurnstileTracerError> {
 		let mut filter_ctx = ScmpFilterContext::new(libseccomp::ScmpAction::Allow)
 			.map_err(TurnstileTracerError::Init)?;
 		let native_arch = ScmpArch::native();
@@ -187,6 +208,16 @@ impl TurnstileTracer {
 
 		syscalls::fs::add_filter_rules(&mut filter_ctx)?;
 		syscalls::net::add_filter_rules(&mut filter_ctx)?;
+
+		if options.block_io_uring {
+			for name in ["io_uring_setup", "io_uring_enter", "io_uring_register"] {
+				if let Ok(sys) = libseccomp::ScmpSyscall::from_name(name) {
+					filter_ctx
+						.add_rule(libseccomp::ScmpAction::Errno(libc::ENOSYS), sys)
+						.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+				}
+			}
+		}
 
 		let mut notify_fd_sock_pair = [-1i32; 2];
 		unsafe {
