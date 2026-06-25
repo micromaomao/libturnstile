@@ -376,15 +376,29 @@ fn tracing_thread(context: &'static Context) {
 							let mut add_mount = false;
 							let resolve_only =
 								!rwxp.read && !rwxp.write && !rwxp.exec && !rwxp.chdir;
-							let cover = match resolve_only {
-								false => context
-									.sandbox
-									.check_covered(&abspath, rwxp.write, rwxp.exec),
-								true => context
-									.sandbox
-									.has_placeholder(&abspath)
-									.map(|covered| (covered, None)),
-							};
+							// We consider a request covered if either it is under a
+							// mount with sufficient permissions, or if it is a
+							// resolve-only request and the path is covered by a
+							// placeholder.
+							let mut cover = context
+								.sandbox
+								.check_covered(&abspath, rwxp.write, rwxp.exec);
+							if !matches!(cover, Ok((true, _))) && resolve_only {
+								let has_placeholder = context.sandbox.has_placeholder(&abspath);
+								match has_placeholder {
+									Ok(true) => {
+										cover = Ok((true, None));
+									}
+									Ok(false) => {}
+									Err(e) => {
+										check_req_valid!();
+										error!(
+											"error checking if {} is covered by placeholder: {}",
+											rwxp, e
+										);
+									} // The error! log below will log the error from check_covered.
+								}
+							}
 							match cover.as_ref().map(|x| x.0) {
 								Ok(true) => {
 									debug!(
