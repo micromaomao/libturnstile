@@ -849,9 +849,9 @@ pub struct RwxPermission {
 	/// permission is in fact required on the directory (i.e. parent of
 	/// [`target`](Self::target)).
 	pub is_dir_op: bool,
-	/// Need read access on either a file, device, symlink (for readlink),
-	/// directory, to connect to a Unix socket (for which write is also
-	/// required), or to create a link from this file.
+	/// Need read access on either a file, device, directory, to connect
+	/// to a Unix socket (for which write is also required), or to create
+	/// a link from this file.
 	pub read: bool,
 	/// Need write access for file or devices, ability to create or delete
 	/// the pointed to directory entry, connect to a Unix socket (for
@@ -1093,7 +1093,7 @@ impl FsOperation {
 				smallvec![make_rwx!(target.clone(), exec)]
 			}
 			Self::FsReadlink(target) => {
-				smallvec![make_rwx!(target.clone(), read)]
+				smallvec![make_rwx!(target.clone(), metadata_read)]
 			}
 			Self::FsChdir(target) => {
 				smallvec![make_rwx!(target.clone(), chdir)]

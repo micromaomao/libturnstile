@@ -124,8 +124,9 @@ fn handle_symlink_like(
 
 fn handle_readlink_like(
 	_req: &mut RequestContext,
-	target: FsTarget,
+	mut target: FsTarget,
 ) -> Result<Operation, AccessRequestError> {
+	target.no_follow = true;
 	Ok(fsop(FsReadlink(target)))
 }
 
