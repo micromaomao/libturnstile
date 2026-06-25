@@ -52,8 +52,9 @@ use crate::{
 	access::{
 		AccessRequest, Operation,
 		fs::{
-			ChmodOperation, ChownOperation, ForeignFd, FsOperation, FsTarget, InodeId,
-			OriginalHandle, RemoveXattrOperation, SetXattrOperation, TruncateOperation,
+			ChmodOperation, ChownOperation, FallocateOperation, ForeignFd, FsOperation, FsTarget,
+			InodeId, OriginalHandle, RemoveXattrOperation, SetXattrOperation, TruncateOperation,
+			UtimensOperation,
 		},
 	},
 	syscalls::fs as syscalls_fs,
@@ -845,17 +846,20 @@ impl ManagedBindMountSandbox {
 	/// If the fd is shadowed but it is upgradable, it is upgraded,
 	/// otherwise the operation is proxied.
 	///
-	/// Unlike other metadata modifying operations, `ftruncate` needs an
-	/// actually writable fd when the process calls it, and so if we got
-	/// here, the fd already has the required permission, so there is no
-	/// need to upgrade or proxy anything.
+	/// Unlike other metadata modifying operations, `ftruncate` and
+	/// `fallocate` need an actually writable fd when the process calls
+	/// them, and so if we got here, the fd already has the required
+	/// permission, so there is no need to upgrade or proxy anything.
 	fn handle_modifying_f_ops(
 		&self,
 		fsop: &FsOperation,
 		target: &FsTarget,
 		ctx: &mut RequestContext,
 	) -> Result<(), AccessRequestError> {
-		if matches!(fsop, FsOperation::FsTruncate(_)) {
+		if matches!(
+			fsop,
+			FsOperation::FsTruncate(_) | FsOperation::FsFallocate(_)
+		) {
 			return ctx.send_continue();
 		}
 
@@ -970,6 +974,8 @@ fn modifying_fsop_fd_target(fsop: &FsOperation) -> Option<&FsTarget> {
 		FsOperation::FsChmod(ChmodOperation { target, .. })
 		| FsOperation::FsChown(ChownOperation { target, .. })
 		| FsOperation::FsTruncate(TruncateOperation { target, .. })
+		| FsOperation::FsFallocate(FallocateOperation { target, .. })
+		| FsOperation::FsUtimens(UtimensOperation { target, .. })
 		| FsOperation::FsSetXattr(SetXattrOperation { target, .. })
 		| FsOperation::FsRemoveXattr(RemoveXattrOperation { target, .. }) => target,
 		_ => return None,
@@ -1013,9 +1019,15 @@ fn proxy_modify(fsop: &FsOperation, fd: libc::c_int) -> Result<(), libc::c_int> 
 			FsOperation::FsRemoveXattr(RemoveXattrOperation { name, .. }) => {
 				libc::removexattr(p, name.as_ptr())
 			}
-			// `allow_modify_fd` only calls this for the variants above;
-			// any other op reaching here is a programming error.  Fail
-			// closed rather than panicking inside the supervisor.
+			FsOperation::FsUtimens(UtimensOperation { target, times }) => {
+				// todo: symlink handling here is incorrect
+				let flags = if target.no_follow() {
+					libc::AT_SYMLINK_NOFOLLOW
+				} else {
+					0
+				};
+				libc::utimensat(libc::AT_FDCWD, p, times.as_ptr(), flags)
+			}
 			_ => {
 				debug_assert!(false, "perform_modify called with non-modify op {:?}", fsop);
 				return Err(libc::EIO);

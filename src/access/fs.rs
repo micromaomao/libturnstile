@@ -300,8 +300,9 @@ impl FsTarget {
 		let no_follow = at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
 
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
+		let path_is_null = path_ptr.is_null();
 		let path;
-		if path_ptr.is_null() {
+		if path_is_null {
 			path = CString::default();
 		} else {
 			path = req.cstr_from_target_memory(path_ptr)?;
@@ -319,7 +320,10 @@ impl FsTarget {
 			});
 		}
 
-		if pathb.len() == 0 && !at_empty_path {
+		// For some syscalls (e.g. utimensat), you can pass in a NULL path
+		// to act as an empty path, without requiring AT_EMPTY_PATH.
+		// TODO: only allow this for utime* syscalls
+		if pathb.len() == 0 && !at_empty_path && !path_is_null {
 			return Err(AccessRequestError::InvalidSyscallData(
 				"empty path without AT_EMPTY_PATH",
 			));
@@ -756,6 +760,23 @@ pub struct TruncateOperation {
 }
 
 #[derive(Debug)]
+pub struct FallocateOperation {
+	pub target: FsTarget,
+	pub mode: i32,
+	pub offset: i64,
+	pub length: i64,
+}
+
+/// `utimensat` / `futimesat` / `utimes`.  `times` is normalised to
+/// the `utimensat` representation.
+#[derive(Debug)]
+pub struct UtimensOperation {
+	pub target: FsTarget,
+	/// [last access, last modification]
+	pub times: [libc::timespec; 2],
+}
+
+#[derive(Debug)]
 pub struct MmapOperation {
 	pub target: FsTarget,
 	pub need_read: bool,
@@ -803,6 +824,8 @@ pub enum FsOperation {
 	FsChmod(ChmodOperation),
 	FsChown(ChownOperation),
 	FsTruncate(TruncateOperation),
+	FsFallocate(FallocateOperation),
+	FsUtimens(UtimensOperation),
 	FsMmap(MmapOperation),
 	FsListXattr(ListXattrOperation),
 	FsGetXattr(GetXattrOperation),
@@ -956,6 +979,21 @@ impl std::fmt::Display for FsOperation {
 			Self::FsTruncate(TruncateOperation { target, length }) => {
 				write!(f, "truncate {} {}", length, target)?;
 			}
+			Self::FsFallocate(FallocateOperation {
+				target,
+				mode,
+				offset,
+				length,
+			}) => {
+				write!(
+					f,
+					"fallocate mode={:#x} {}+{} {}",
+					mode, offset, length, target
+				)?;
+			}
+			Self::FsUtimens(UtimensOperation { target, .. }) => {
+				write!(f, "utimens {}", target)?;
+			}
 			Self::FsMmap(MmapOperation {
 				target,
 				need_read,
@@ -1088,6 +1126,8 @@ impl FsOperation {
 			Self::FsChmod(ChmodOperation { target, .. })
 			| Self::FsChown(ChownOperation { target, .. })
 			| Self::FsTruncate(TruncateOperation { target, .. })
+			| Self::FsFallocate(FallocateOperation { target, .. })
+			| Self::FsUtimens(UtimensOperation { target, .. })
 			| Self::FsSetXattr(SetXattrOperation { target, .. })
 			| Self::FsRemoveXattr(RemoveXattrOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), write)]

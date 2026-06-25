@@ -3,10 +3,10 @@ use libseccomp::ScmpFilterContext;
 use crate::{
 	AccessRequestError, TurnstileTracerError,
 	access::fs::{
-		ChmodOperation, ChownOperation, CreateKind, CreateOperation, ExecOperation, FsTarget,
-		GetXattrOperation, LinkOperation, ListXattrOperation, MmapOperation, OpenOperation,
-		RemoveXattrOperation, RenameOperation, SetXattrOperation, TruncateOperation,
-		UnlinkOperation,
+		ChmodOperation, ChownOperation, CreateKind, CreateOperation, ExecOperation,
+		FallocateOperation, FsTarget, GetXattrOperation, LinkOperation, ListXattrOperation,
+		MmapOperation, OpenOperation, RemoveXattrOperation, RenameOperation, SetXattrOperation,
+		TruncateOperation, UnlinkOperation, UtimensOperation,
 	},
 	access::{
 		AccessRequest, Operation,
@@ -144,6 +144,50 @@ fn handle_stat_like(
 	Ok(fsop(FsStat(StatOperation { target, lstat })))
 }
 
+/// A `timespec` whose `tv_nsec` is `UTIME_NOW`, i.e. "set this timestamp
+/// to the current time".  Used when the syscall passes a NULL `times`
+/// pointer.
+fn timespec_now() -> libc::timespec {
+	libc::timespec {
+		tv_sec: 0,
+		tv_nsec: libc::UTIME_NOW,
+	}
+}
+
+/// Read the `times` argument of `utimensat`/`futimens` (an array of two
+/// `timespec`s) from the traced process, returning `[timespec_now(),
+/// timespec_now()]` if the pointer is NULL.
+fn read_timespec_times(
+	req: &mut RequestContext,
+	times_arg: usize,
+) -> Result<[libc::timespec; 2], AccessRequestError> {
+	let ptr = req.arg(times_arg) as *const [libc::timespec; 2];
+	if ptr.is_null() {
+		return Ok([timespec_now(), timespec_now()]);
+	}
+	req.value_from_target_memory(ptr)
+}
+
+/// Read the `times` argument of `utimes`/`futimesat` (an array of two
+/// `timeval`s) and normalise it to the `utimensat` `timespec`
+/// representation, returning `[timespec_now(), timespec_now()]` if the
+/// pointer is NULL.
+fn read_timeval_times(
+	req: &mut RequestContext,
+	times_arg: usize,
+) -> Result<[libc::timespec; 2], AccessRequestError> {
+	let ptr = req.arg(times_arg) as *const [libc::timeval; 2];
+	if ptr.is_null() {
+		return Ok([timespec_now(), timespec_now()]);
+	}
+	let tv = req.value_from_target_memory(ptr)?;
+	let conv = |t: libc::timeval| libc::timespec {
+		tv_sec: t.tv_sec,
+		tv_nsec: (t.tv_usec as i64) * 1000,
+	};
+	Ok([conv(tv[0]), conv(tv[1])])
+}
+
 // (name, handler, arg index of the path)
 const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	(
@@ -268,6 +312,16 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 			Ok(fsop(FsTruncate(TruncateOperation {
 				target,
 				length: req.arg(1) as i64,
+			})))
+		},
+		0,
+	),
+	(
+		"utimes",
+		|req, target| {
+			Ok(fsop(FsUtimens(UtimensOperation {
+				times: read_timeval_times(req, 1)?,
+				target,
 			})))
 		},
 		0,
@@ -446,6 +500,31 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 		0,
 		1,
 		Some(4),
+	),
+	(
+		"utimensat",
+		|req, target| {
+			Ok(fsop(FsUtimens(UtimensOperation {
+				times: read_timespec_times(req, 2)?,
+				target,
+			})))
+		},
+		0,
+		1,
+		Some(3),
+	),
+	(
+		"futimesat",
+		|req, target| {
+			Ok(fsop(FsUtimens(UtimensOperation {
+				times: read_timeval_times(req, 2)?,
+				target,
+			})))
+		},
+		0,
+		1,
+		// futimesat has no flags argument.
+		None,
 	),
 	(
 		"newfstatat",
@@ -649,6 +728,18 @@ const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
 			Ok(fsop(FsTruncate(TruncateOperation {
 				target,
 				length: req.arg(1) as i64,
+			})))
+		},
+		0,
+	),
+	(
+		"fallocate",
+		|req, target| {
+			Ok(fsop(FsFallocate(FallocateOperation {
+				target,
+				mode: req.arg(1) as i32,
+				offset: req.arg(2) as i64,
+				length: req.arg(3) as i64,
 			})))
 		},
 		0,
