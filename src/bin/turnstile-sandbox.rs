@@ -18,7 +18,7 @@ use std::{
 use clap::Parser;
 use libturnstile::{
 	AccessRequestError, BindMountSandbox, CommonPlaceholderData, ManagedBindMountSandbox,
-	ManagedMountPoint, ManagedPlaceholder, MountAttributes, PlaceholderDirData,
+	ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry, MountAttributes, PlaceholderDirData,
 	PlaceholderFileData, PlaceholderSymlinkData, TracerOptions, TurnstileTracer,
 	access::{
 		Operation,
@@ -45,7 +45,7 @@ struct Cli {
 	block_nested_userns: bool,
 
 	/// Configuration for this sandbox.  Changes to this file will be
-	/// live-reloaded.
+	/// live-reloaded. TODO implement live reload
 	#[arg(required = true)]
 	config: PathBuf,
 
@@ -80,11 +80,8 @@ struct Context {
 	permissive: bool,
 }
 
-/// Stat `host_path` (no symlink following) and build a placeholder of
-/// the matching type so that the path becomes resolvable inside the
-/// sandbox without granting any actual read/write/exec permission on
-/// the underlying inode.  Used for "resolve-only" access patterns such
-/// as `realpath` / `readlink` on intermediate path components.
+/// Stat `host_path` (no symlink following) and build a ManagedPlaceholder
+/// that mirrors that path.
 fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io::Error> {
 	let mut stat: libc::stat = unsafe { std::mem::zeroed() };
 	let res = unsafe {
@@ -374,61 +371,37 @@ fn tracing_thread(context: &'static Context) {
 									break;
 								}
 							};
-							// Mirror any host symlinks in the path's
-							// ancestors so the original (pre-resolution)
-							// path the app used keeps working inside the
-							// sandbox.
-							if let Err(e) = create_symlinks_for_user_path(
-								&context.sandbox,
-								t_local.dfd(),
-								t_local.path(),
-								!t_local.no_follow(),
-							) {
-								debug!("could not mirror symlinks for {}: {}", rwxp, e);
-							}
-							if !rwxp.read && !rwxp.write && !rwxp.exec && !rwxp.chdir {
-								// Resolve-only access (e.g. realpath /
-								// readlink on intermediate path
-								// components, stat-only lookup).  No
-								// permission to grant, but we do need to
-								// make the path resolvable inside the
-								// sandbox by mirroring the host entry's
-								// type as a placeholder.
-								if abspath.as_bytes() != b"/" {
-									match build_resolve_placeholder(&abspath) {
-										Ok(ph) => {
-											if let Err(e) =
-												context.sandbox.add_or_update_placeholder(
-													OsStr::from_bytes(abspath.as_bytes()),
-													ph,
-												) {
-												error!(
-													"error adding resolve placeholder for {:?}: {}",
-													abspath, e
-												);
-											} else {
-												debug!(
-													"added resolve placeholder for {:?}",
-													abspath
-												);
-											}
-										}
-										Err(e) => {
-											debug!(
-												"could not build resolve placeholder for {:?}: {}",
-												abspath, e
-											);
-										}
-									}
+							let mut add_symlinks = false;
+							let mut add_placeholder = false;
+							let mut add_mount = false;
+							let resolve_only =
+								!rwxp.read && !rwxp.write && !rwxp.exec && !rwxp.chdir;
+							let cover = match resolve_only {
+								false => context
+									.sandbox
+									.check_covered(&abspath, rwxp.write, rwxp.exec),
+								true => context
+									.sandbox
+									.has_placeholder(&abspath)
+									.map(|covered| (covered, None)),
+							};
+							match cover.as_ref().map(|x| x.0) {
+								Ok(true) => {
+									debug!(
+										"{}[{}] is covered for {}{}{} on {}",
+										req_ctx
+											.comm()
+											.unwrap_or_else(|_| OsString::from("???"))
+											.to_string_lossy(),
+										req_ctx.pid(),
+										if rwxp.read || rwxp.chdir { "r" } else { "-" },
+										if rwxp.write { "w" } else { "-" },
+										if rwxp.exec { "x" } else { "-" },
+										t_local,
+									);
+									add_symlinks = true;
 								}
-								continue;
-							}
-							match context
-								.sandbox
-								.check_covered(&abspath, rwxp.write, rwxp.exec)
-							{
-								Ok((true, _)) => {}
-								Ok((false, mut existing_mnt)) => {
+								Ok(false) => {
 									check_req_valid!();
 									info!(
 										"{}[{}] need fs permission {}{}{} on {}",
@@ -449,50 +422,104 @@ fn tracing_thread(context: &'static Context) {
 									d.need_read |= rwxp.read || rwxp.chdir;
 									d.need_write |= rwxp.write;
 									d.need_exec |= rwxp.exec;
-									send_eperm = true;
 									if context.permissive {
-										send_eperm = false;
 										if abspath.as_bytes() == b"/" {
-											// TODO
+											// TODO: figure out a way to grant root, maybe
+											// we create the / mount anyway, and let the
+											// fd upgrade / proxy mechanism do the work.
 											debug!("skipping mount update on /");
-											break;
+											continue;
 										}
-										if let Some(mp) = &existing_mnt
-											&& mp.host_path != abspath
-										{
-											existing_mnt = None;
+										add_symlinks = true;
+										if !resolve_only {
+											add_mount = true;
+										} else {
+											add_placeholder = true;
 										}
-										let mut mp =
-											existing_mnt.unwrap_or_else(|| ManagedMountPoint {
-												host_path: abspath.clone(),
-												attrs: MountAttributes {
-													readonly: true,
-													noexec: true,
-												},
-											});
-										if rwxp.write {
-											mp.attrs.readonly = false;
-										}
-										if rwxp.exec {
-											mp.attrs.noexec = false;
-										}
-										match context.sandbox.add_or_update_mount(
-											OsStr::from_bytes(abspath.as_bytes()),
-											mp,
-										) {
-											Ok(()) => {}
-											Err(e) => {
-												error!(
-													"error updating mount for {:?}: {}",
-													abspath, e
-												);
-											}
-										}
+									} else {
+										// Not covered and not in permissive mode -
+										// send a eperm so that the process doesn't
+										// get ENOENT or EROFS instead.  (This denial
+										// is not for security).  Also, don't add
+										// symlinks to avoid exposing symlink data
+										// which the user does not intend to expose.
+										send_eperm = true;
 									}
 								}
 								Err(e) => {
 									check_req_valid!();
 									error!("error checking if {} is covered: {}", rwxp, e);
+								}
+							}
+							if add_symlinks {
+								// Mirror any host symlinks in the path's
+								// ancestors so the original (pre-resolution)
+								// path the app used keeps working inside the
+								// sandbox.
+								if let Err(e) = create_symlinks_for_user_path(
+									&context.sandbox,
+									t_local.dfd(),
+									t_local.path(),
+									!t_local.no_follow(),
+								) {
+									debug!("could not mirror symlinks for {}: {}", rwxp, e);
+								}
+							}
+							if add_placeholder {
+								// Resolve-only access (e.g.  realpath / readlink on intermediate path
+								// components, stat-only lookup).  No permission to grant, but we do need to
+								// make the path resolvable inside the sandbox by mirroring the host entry's
+								// type as a placeholder.
+								let ph = match build_resolve_placeholder(&abspath) {
+									Ok(ph) => ph,
+									Err(e) => {
+										debug!(
+											"could not build resolve placeholder for {:?}: {}",
+											abspath, e
+										);
+										continue;
+									}
+								};
+								if let Err(e) = context.sandbox.add_or_update_placeholder(
+									OsStr::from_bytes(abspath.as_bytes()),
+									ph,
+								) {
+									error!(
+										"error adding resolve placeholder for {:?}: {}",
+										abspath, e
+									);
+								} else {
+									debug!("added resolve placeholder for {:?}", abspath);
+								}
+							}
+							if add_mount {
+								let mut existing_mnt = cover.unwrap().1;
+								if let Some(ref mp) = existing_mnt
+									&& mp.host_path != abspath
+								{
+									existing_mnt = None;
+								}
+								let mut mp = existing_mnt.unwrap_or_else(|| ManagedMountPoint {
+									host_path: abspath.clone(),
+									attrs: MountAttributes {
+										readonly: true,
+										noexec: true,
+									},
+								});
+								if rwxp.write {
+									mp.attrs.readonly = false;
+								}
+								if rwxp.exec {
+									mp.attrs.noexec = false;
+								}
+								match context
+									.sandbox
+									.add_or_update_mount(OsStr::from_bytes(abspath.as_bytes()), mp)
+								{
+									Ok(()) => {}
+									Err(e) => {
+										error!("error updating mount for {:?}: {}", abspath, e);
+									}
 								}
 							}
 						}
@@ -603,18 +630,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// Load mounts from the user-provided config file, replacing the
 	// previously hard-coded default initial mount list.
 	let cfg = Config::load(&cli.config)?;
-	let resolved_mounts = cfg.resolve_mounts()?;
-	if resolved_mounts.is_empty() {
+	let resolved_entries = cfg.parse_entries()?;
+	if resolved_entries.is_empty() {
 		info!(
 			"config file {:?} has no rules; sandbox will start empty",
 			cli.config
 		);
 	}
-	context.sandbox.update_mounts_from_list(
-		resolved_mounts
-			.iter()
-			.map(|m| (m.sandbox_path.as_os_str(), m.mount.clone())),
-	)?;
+	context
+		.sandbox
+		.update_from_list(resolved_entries.iter().map(|e| {
+			(
+				e.sandbox_path.as_os_str(),
+				match e.mount {
+					Some(ref m) => ManagedTreeEntry::BindMount(m.clone()),
+					None => {
+						let p = match build_resolve_placeholder(
+							e.placeholder_host_path.as_deref().expect(
+								"placeholder_host_path must be non-empty when mount is None",
+							),
+						) {
+							Ok(p) => p,
+							Err(err) => {
+								error!(
+									"error building placeholder for {:?}: {}",
+									e.placeholder_host_path, err
+								);
+								std::process::exit(1);
+							}
+						};
+
+						ManagedTreeEntry::Placeholder(p)
+					}
+				},
+			)
+		}))?;
 
 	context.path_res_sandbox.update_mounts_from_list([(
 		OsStr::new("/"),

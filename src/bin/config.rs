@@ -63,6 +63,8 @@ pub enum ConfigError {
 	},
 	#[error("invalid permission string {0:?}: must only contain 'r', 'w', and 'x'")]
 	InvalidPermission(String),
+	#[error("invalid permission string {0:?}: must contain 'r'")]
+	MissingReadPermission(String),
 	#[error("invalid path {0:?}: {1}")]
 	InvalidPath(String, &'static str),
 	#[error("environment variable {0:?} referenced in path {1:?} is not set")]
@@ -77,18 +79,22 @@ pub enum ConfigError {
 /// [`MountAttributes`].
 ///
 /// Each character must be one of `r`, `w`, `x`.  Presence of `w` clears
-/// `readonly`; presence of `x` clears `noexec`.  `r` is required to make a
-/// mount point useful, but extra `r`s or different orderings are allowed.
+/// `readonly`; presence of `x` clears `noexec`, and `r` is required.
+/// Different orderings or duplicate letters are allowed.
 pub fn parse_permissions(s: &str) -> Result<MountAttributes, ConfigError> {
 	let mut readonly = true;
 	let mut noexec = true;
+	let mut has_read = false;
 	for c in s.chars() {
 		match c {
-			'r' => {}
+			'r' => has_read = true,
 			'w' => readonly = false,
 			'x' => noexec = false,
 			_ => return Err(ConfigError::InvalidPermission(s.to_string())),
 		}
+	}
+	if !has_read {
+		return Err(ConfigError::MissingReadPermission(s.to_string()));
 	}
 	Ok(MountAttributes { readonly, noexec })
 }
@@ -156,13 +162,17 @@ fn is_var_char(b: u8) -> bool {
 	b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// A single resolved mount entry, ready to be passed to
-/// [`libturnstile::ManagedBindMountSandbox::update_mounts_from_list`].
-pub struct ResolvedMount {
+/// A single parsed config entry, ready to be passed to
+/// [`libturnstile::ManagedBindMountSandbox::update_from_list`].
+pub struct ConfigEntry {
 	/// Path inside the sandbox.
 	pub sandbox_path: OsString,
-	/// Mount point describing the host source and attributes.
-	pub mount: ManagedMountPoint,
+	/// Mount point describing the host source and attributes.  If None,
+	/// this is a placeholder only (aka. resolve-only) entry.
+	pub mount: Option<ManagedMountPoint>,
+	/// If self.mount is None, this is the host path that should be used
+	/// to create a placeholder.
+	pub placeholder_host_path: Option<CString>,
 }
 
 impl Config {
@@ -179,10 +189,10 @@ impl Config {
 		Ok(cfg)
 	}
 
-	/// Resolve all rules into a list of mount entries.  Performs path
-	/// expansion (`$$` / `$VAR`) and permission parsing, returning errors
-	/// produced along the way.
-	pub fn resolve_mounts(&self) -> Result<Vec<ResolvedMount>, ConfigError> {
+	/// Parse all rules into a list of entries.  Performs path expansion
+	/// (`$$` / `$VAR`) and permission parsing, returning errors produced
+	/// along the way.
+	pub fn parse_entries(&self) -> Result<Vec<ConfigEntry>, ConfigError> {
 		let mut out = Vec::with_capacity(self.rules.len());
 		for (sandbox_path_raw, rule) in &self.rules {
 			let (host_path_raw, permissions) = match rule {
@@ -206,12 +216,26 @@ impl Config {
 			if host_bytes.is_empty() {
 				return Err(ConfigError::EmptyPath(host_path_raw.to_string()));
 			}
-			let host_path = CString::new(host_bytes)
-				.map_err(|_| ConfigError::NulInPath(host_path_raw.to_string()))?;
-			let attrs = parse_permissions(permissions)?;
-			out.push(ResolvedMount {
+			let mut host_path = Some(
+				CString::new(host_bytes)
+					.map_err(|_| ConfigError::NulInPath(host_path_raw.to_string()))?,
+			);
+			let mount = if permissions.is_empty() {
+				None
+			} else {
+				Some(ManagedMountPoint {
+					host_path: host_path.take().unwrap(),
+					attrs: parse_permissions(permissions)?,
+				})
+			};
+			out.push(ConfigEntry {
 				sandbox_path: OsString::from_vec(sandbox_bytes),
-				mount: ManagedMountPoint { host_path, attrs },
+				placeholder_host_path: if mount.is_none() {
+					Some(host_path.take().unwrap())
+				} else {
+					None
+				},
+				mount,
 			});
 		}
 		Ok(out)
@@ -311,7 +335,7 @@ rules:
         permissions: rw
 "#;
 		let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
-		let mounts = cfg.resolve_mounts().unwrap();
+		let mounts = cfg.parse_entries().unwrap();
 		assert_eq!(mounts.len(), 3);
 		// rules are kept in BTreeMap order (sorted by sandbox path string).
 		let by_path: std::collections::HashMap<_, _> = mounts
@@ -319,19 +343,22 @@ rules:
 			.map(|m| (m.sandbox_path.as_bytes().to_vec(), m))
 			.collect();
 		let etc = by_path.get(&b"/etc"[..]).unwrap();
-		assert_eq!(etc.mount.host_path.to_bytes(), b"/etc");
-		assert_eq!(etc.mount.attrs.readonly, true);
-		assert_eq!(etc.mount.attrs.noexec, true);
+		let etc_mount = etc.mount.as_ref().unwrap();
+		assert_eq!(etc_mount.host_path.to_bytes(), b"/etc");
+		assert_eq!(etc_mount.attrs.readonly, true);
+		assert_eq!(etc_mount.attrs.noexec, true);
 
 		let code = by_path.get(&b"/home/mao/code"[..]).unwrap();
-		assert_eq!(code.mount.host_path.to_bytes(), b"/home/mao/code");
-		assert_eq!(code.mount.attrs.readonly, true);
-		assert_eq!(code.mount.attrs.noexec, false);
+		let code_mount = code.mount.as_ref().unwrap();
+		assert_eq!(code_mount.host_path.to_bytes(), b"/home/mao/code");
+		assert_eq!(code_mount.attrs.readonly, true);
+		assert_eq!(code_mount.attrs.noexec, false);
 
 		let rt = by_path.get(&b"/run/user/1000"[..]).unwrap();
-		assert_eq!(rt.mount.host_path.to_bytes(), b"/run/user/1000/my-app");
-		assert_eq!(rt.mount.attrs.readonly, false);
-		assert_eq!(rt.mount.attrs.noexec, true);
+		let rt_mount = rt.mount.as_ref().unwrap();
+		assert_eq!(rt_mount.host_path.to_bytes(), b"/run/user/1000/my-app");
+		assert_eq!(rt_mount.attrs.readonly, false);
+		assert_eq!(rt_mount.attrs.noexec, true);
 	}
 
 	#[test]
@@ -341,17 +368,20 @@ rules:
 		// bytes.
 		let yaml = "rules:\n    \"\\x12\\x34\": r\n";
 		let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
-		let mounts = cfg.resolve_mounts().unwrap();
+		let mounts = cfg.parse_entries().unwrap();
 		assert_eq!(mounts.len(), 1);
 		assert_eq!(mounts[0].sandbox_path.as_bytes(), &[0x12, 0x34]);
-		assert_eq!(mounts[0].mount.host_path.to_bytes(), &[0x12, 0x34]);
+		assert_eq!(
+			mounts[0].mount.as_ref().unwrap().host_path.to_bytes(),
+			&[0x12, 0x34]
+		);
 	}
 
 	#[test]
 	fn dollar_dollar_in_full_config() {
 		let yaml = "rules:\n    /a/$$b: r\n";
 		let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
-		let mounts = cfg.resolve_mounts().unwrap();
+		let mounts = cfg.parse_entries().unwrap();
 		assert_eq!(mounts[0].sandbox_path.as_bytes(), b"/a/$b");
 	}
 }

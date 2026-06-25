@@ -2027,6 +2027,7 @@ impl ManagedBindMountSandbox {
 		path: &OsStr,
 		entry: ManagedTreeEntry,
 	) -> Result<(), BindMountSandboxError> {
+		debug!("add_or_update_entry: path={:?}, entry={:?}", path, entry);
 		Self::check_path_no_nul(path)?;
 		let (mut pt, mut mt) = self.lock_trees();
 		let mut desired_entries = self.entries_from_state(&pt, &mt);
@@ -2063,6 +2064,7 @@ impl ManagedBindMountSandbox {
 		path: &OsStr,
 		ph: ManagedPlaceholder,
 	) -> Result<(), BindMountSandboxError> {
+		debug!("add_or_update_placeholder: path={:?}, ph={:?}", path, ph);
 		self.add_or_update_entry(path, ManagedTreeEntry::Placeholder(ph))
 	}
 
@@ -2540,6 +2542,15 @@ impl ManagedBindMountSandbox {
 				Ok((true, Some(mnt.user.clone())))
 			}
 		}
+	}
+
+	pub fn has_placeholder(&self, path: &CStr) -> Result<bool, BindMountSandboxError> {
+		validate_sandbox_path(path)?;
+		let pt = self
+			.current_placeholder_tree
+			.lock()
+			.expect("current_placeholder_tree lock poisoned");
+		Ok(pt.get(OsStr::from_bytes(path.to_bytes())).is_some())
 	}
 
 	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
