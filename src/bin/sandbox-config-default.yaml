@@ -3,5 +3,4 @@ rules:
   /bin: rx
   /lib: rx
   /lib64: rx
-  /proc: r
-  $HOME/.rustup/toolchains: rx # we can't detect mmap yet
+  /proc: rx

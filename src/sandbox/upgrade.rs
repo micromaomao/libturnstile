@@ -211,24 +211,11 @@ enum M1OpenError {
 	IdentityMismatch,
 }
 
-/// Result of attempting to upgrade (swap in place) a stale app-held fd
-/// via [`ManagedBindMountSandbox::try_upgrade_fd`].
+/// Result from [`ManagedBindMountSandbox::try_upgrade_fd`]
 enum UpgradeOutcome {
-	/// A fresh handle resolved on the live layout was swapped in at the
-	/// same fd number.
 	Upgraded,
-	/// The fd is a regular file (or otherwise not swap-safe): the caller
-	/// may proxy the operation instead.
 	NotUpgradable,
-	/// The fd is upgradable, but the swap could not be completed (the fd
-	/// could not be inspected, or the m1 reopen failed / mismatched).
-	/// Nothing was changed; callers should fail open and CONTINUE,
-	/// leaving the stale fd in place.  In particular, callers must *not*
-	/// proxy on this outcome — the fd may be an `O_PATH` fd, which a
-	/// path-based proxy would mis-handle.
 	UpgradeFailed,
-	/// The notification is no longer valid (the traced process is gone or
-	/// it was already answered); the caller should just return `Ok(())`.
 	RequestGone,
 }
 
@@ -760,6 +747,7 @@ impl ManagedBindMountSandbox {
 		if !cov_attrs.readonly && !cov_attrs.noexec {
 			return ctx.send_continue();
 		}
+		// todo: figure out why are we removing mounts???
 		// A mount already exists *exactly* at the target: cwd is pinned to
 		// a tracked mount whose identity reconcile preserves, so there is
 		// nothing to do.
