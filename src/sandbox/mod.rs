@@ -2553,6 +2553,24 @@ impl ManagedBindMountSandbox {
 		Ok(pt.get(OsStr::from_bytes(path.to_bytes())).is_some())
 	}
 
+	/// Return the sandbox path and current user-facing mount point of
+	/// every mount under `path`, not including `path` itself.
+	pub fn mounts_under(
+		&self,
+		path: &CStr,
+	) -> Result<Vec<(OsString, ManagedMountPoint)>, BindMountSandboxError> {
+		validate_sandbox_path(path)?;
+		let mt = self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned");
+		let mut out = Vec::new();
+		mt.walk_subtree_top_down(OsStr::from_bytes(path.to_bytes()), false, |p, m| {
+			out.push((p.to_os_string(), m.user.clone()));
+		});
+		Ok(out)
+	}
+
 	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
 		self.sandbox.restrict_self()
 	}

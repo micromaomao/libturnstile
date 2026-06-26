@@ -308,6 +308,54 @@ fn check_covered_or_placeholder(
 	}
 }
 
+/// Permissive-mode "inherit access down": after granting `attrs` at a
+/// path, upgrade every existing descendant mount so that it is at least
+/// as permissive. For example, if a ro mount is created on a subpath
+/// earlier due to read, but then a write is attempted on its parent, a
+/// reasonable policy would just grant read-write on the parent.
+fn inherit_attrs_to_descendants(
+	sandbox: &ManagedBindMountSandbox,
+	abspath: &CStr,
+	attrs: MountAttributes,
+) {
+	if attrs.readonly && attrs.noexec {
+		// Nothing more permissive than the default to propagate.
+		return;
+	}
+	let descendants = match sandbox.mounts_under(abspath) {
+		Ok(d) => d,
+		Err(e) => {
+			debug!("could not list mounts under {:?}: {}", abspath, e);
+			return;
+		}
+	};
+	for (sandbox_path, mut mp) in descendants {
+		let mut changed = false;
+		if !attrs.readonly && mp.attrs.readonly {
+			mp.attrs.readonly = false;
+			changed = true;
+		}
+		if !attrs.noexec && mp.attrs.noexec {
+			mp.attrs.noexec = false;
+			changed = true;
+		}
+		if !changed {
+			continue;
+		}
+		if let Err(e) = sandbox.add_or_update_mount(&sandbox_path, mp) {
+			error!(
+				"error inheriting access to descendant mount {:?}: {}",
+				sandbox_path, e
+			);
+		} else {
+			debug!(
+				"inherited access down to descendant mount {:?}",
+				sandbox_path
+			);
+		}
+	}
+}
+
 fn tracing_thread(context: &'static Context) {
 	if let Err(e) = context.tracer.receive_notify_fd() {
 		error!("error receiving notify fd: {}", e);
@@ -460,6 +508,11 @@ fn tracing_thread(context: &'static Context) {
 										if rwxp.exec { "x" } else { "-" },
 										t_local,
 									);
+									// TODO: using abspath here is technically wrong -
+									// we want to emit denials in the sandbox's path,
+									// so that if e.g. /tmp is mounted ro to
+									// /tmp/real_tmp, a write at /tmp/aa shows up as a
+									// denial at /tmp/aa, not /tmp/real_tmp/aa.
 									let d = denials.get_mut_or_insert(
 										OsStr::from_bytes(abspath.as_bytes()),
 										DenialLogNode::default,
@@ -538,30 +591,58 @@ fn tracing_thread(context: &'static Context) {
 								}
 							}
 							if add_mount {
-								let mut existing_mnt = cover.unwrap().1;
-								if let Some(ref mp) = existing_mnt
-									&& mp.host_path != abspath
-								{
-									existing_mnt = None;
-								}
-								let mut mp = existing_mnt.unwrap_or_else(|| ManagedMountPoint {
+								// `cover.1` is the deepest mount that is an
+								// ancestor-or-self of `abspath` (or None).  In
+								// permissive mode the sandbox mirrors the host
+								// 1:1, so a mount whose host_path == abspath is
+								// the exact mount at this path; anything else is
+								// an ancestor.
+								let covering = cover.unwrap().1;
+								let exact = covering
+									.as_ref()
+									.filter(|mp| mp.host_path == abspath)
+									.cloned();
+								let ancestor = covering.filter(|mp| mp.host_path != abspath);
+								let mut mp = exact.unwrap_or_else(|| ManagedMountPoint {
 									host_path: abspath.clone(),
 									attrs: MountAttributes {
 										readonly: true,
 										noexec: true,
 									},
 								});
+								// Inherit access down: a child must be at least
+								// as permissive as its covering ancestor, so a
+								// writable/executable parent is not shadowed by a
+								// more restrictive child.
+								if let Some(anc) = &ancestor {
+									if !anc.attrs.readonly {
+										mp.attrs.readonly = false;
+									}
+									if !anc.attrs.noexec {
+										mp.attrs.noexec = false;
+									}
+								}
 								if rwxp.write {
 									mp.attrs.readonly = false;
 								}
 								if rwxp.exec {
 									mp.attrs.noexec = false;
 								}
+								let new_attrs = mp.attrs;
 								match context
 									.sandbox
 									.add_or_update_mount(OsStr::from_bytes(abspath.as_bytes()), mp)
 								{
-									Ok(()) => {}
+									Ok(()) => {
+										// Propagate the (possibly newly granted)
+										// access down to any existing, more
+										// restrictive descendant mounts.
+										inherit_attrs_to_descendants(
+											&context.sandbox,
+											&abspath,
+											new_attrs,
+										);
+									}
 									Err(e) => {
 										error!("error updating mount for {:?}: {}", abspath, e);
 									}
@@ -620,27 +701,45 @@ fn tracing_thread(context: &'static Context) {
 		}
 	}
 	if !denials.is_empty() {
+		// "Inherit access down" also when summarising denials
 		let mut rules: std::collections::BTreeMap<String, String> =
 			std::collections::BTreeMap::new();
-		denials.walk_top_down(|path, val| {
-			let mut perms = String::new();
-			if val.need_read {
-				perms.push('r');
-			}
-			if val.need_write {
-				perms.push('w');
-			}
-			if val.need_exec {
-				perms.push('x');
-			}
-			// Translate $ to $$ so the path round-trips through the
-			// config's path expander.  Lossy UTF-8 conversion is used for
-			// the rare case of non-UTF-8 paths since YAML strings are
-			// fundamentally Unicode; serde_yaml_ng will handle quoting and
-			// escaping the resulting string for arbitrary code points.
-			let path_str = path.to_string_lossy().replace('$', "$$");
-			rules.insert(path_str, perms);
-		});
+		denials.fold_top_down_from(
+			|path, curr, (acc_r, acc_w, acc_x)| {
+				let (cr, cw, cx) = (
+					curr.need_read || acc_r,
+					curr.need_write || acc_w,
+					curr.need_exec || acc_x,
+				);
+				let is_placeholder = !curr.need_read && !curr.need_write && !curr.need_exec;
+				let parent_has_mounted = acc_r || acc_w || acc_x;
+				let redundant = (acc_r, acc_w, acc_x) == (cr, cw, cx)
+					&& !(is_placeholder && !parent_has_mounted);
+				// placeholders does not inherit down (i.e. a placeholder
+				// at /home does not mean that a placeholder at /home/user
+				// is redundant)
+				if !redundant {
+					let mut perms = String::new();
+					if cr || cw || cx {
+						// Read is always required for non-resolve-only entries.
+						perms.push('r');
+						if cw {
+							perms.push('w');
+						}
+						if cx {
+							perms.push('x');
+						}
+					}
+					// Escape $ to $$ (our config format has special
+					// handling for $)
+					let path_str = String::from_utf8_lossy(path.as_bytes()).replace('$', "$$");
+					rules.insert(path_str, perms);
+				}
+				(cr, cw, cx)
+			},
+			(false, false, false),
+			OsStr::new("/"),
+		);
 		// Wrap in a top-level `rules:` map so the output can be copy-pasted
 		// directly into a config file.
 		#[derive(serde::Serialize)]

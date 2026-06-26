@@ -464,6 +464,67 @@ impl<T> FsTree<T> {
 		self.walk_impl(&mut f, true, &mut vec![b'/'], &self.root);
 	}
 
+	/// Walks the tree in top-down order, e.g. /, /foo, /foo/bar, /baz,
+	/// starting from the given `path`, calling `f` for each node.  An
+	/// accumulator is passed to `f` and the return value of `f` is passed
+	/// to the next call to `f` one level down.  Siblings are visited with
+	/// the same accumulator value, and when the walk returns to a parent,
+	/// the accumulator is restored.
+	///
+	/// No calls to `f` will be made if `path` does not exist in the tree.
+	pub fn fold_top_down_from<F, R>(&mut self, mut f: F, init: R, path: &OsStr)
+	where
+		F: FnMut(&OsStr, &mut T, R) -> R,
+		R: Clone,
+	{
+		let mut current = &mut self.root;
+		for comp in path_to_components(path) {
+			if let Some(v) = current.children.get_mut(comp.name) {
+				current = v;
+			} else {
+				return;
+			}
+		}
+		let mut path_buf: Vec<u8> = path.as_encoded_bytes().to_vec();
+		while let Some(b'/') = path_buf.last().copied() {
+			path_buf.pop();
+		}
+		if path_buf.is_empty() {
+			// The starting path was the root; present it as "/" so the
+			// first call to `f` (and the paths built for its descendants)
+			// are absolute.
+			path_buf.push(b'/');
+		}
+		Self::fold_top_down_impl(&mut f, current, &mut path_buf, init)
+	}
+
+	fn fold_top_down_impl<F, R>(
+		f: &mut F,
+		node: &mut FsTreeNode<T>,
+		path: &mut Vec<u8>,
+		acc: R,
+	) where
+		F: FnMut(&OsStr, &mut T, R) -> R,
+		R: Clone,
+	{
+		// Nodes without data (incomplete parents) don't call `f`; they
+		// simply pass the accumulator down unchanged.
+		let acc = if let Some(data) = &mut node.data {
+			f(OsStr::from_bytes(path), data, acc)
+		} else {
+			acc
+		};
+		for (name, child) in node.children.iter_mut() {
+			let orig_len = path.len();
+			if path.last().copied() != Some(b'/') {
+				path.push(b'/');
+			}
+			path.extend_from_slice(name.as_bytes());
+			Self::fold_top_down_impl(f, child, path, acc.clone());
+			path.truncate(orig_len);
+		}
+	}
+
 	/// Fill in any "incomplete parent" nodes - that is, any internal
 	/// node that exists in the tree (because some descendant has data)
 	/// but does not itself have data.  For each such node,
