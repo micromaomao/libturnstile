@@ -495,6 +495,19 @@ fn prompt_for_request(
 	response
 }
 
+/// Trim a trailing "/." from a path (the only non-canonical form a
+/// realpath-derived path can take, produced when the syscall's path
+/// ended in "/", "/." or "/..").  Keeps "/" if trimming would empty the
+/// path.  The sandbox mount tree rejects "." path components, so any
+/// prompter-supplied path is run through this first.
+fn trim_trailing_dot(path: &[u8]) -> &[u8] {
+	match path.strip_suffix(b"/.") {
+		Some(b"") => b"/",
+		Some(stripped) => stripped,
+		None => path,
+	}
+}
+
 /// Apply the side effects requested by a [`PrompterResponse`]: an
 /// optional config reload, added mounts and placeholders, and the
 /// symlink-mirroring / descendant-widening conveniences.  The
@@ -508,7 +521,7 @@ fn apply_prompter_response(context: &Context, response: &PrompterResponse, t_loc
 	}
 
 	for m in &response.add_mounts {
-		let mount_bytes = m.mount_point.as_bytes();
+		let mount_bytes = trim_trailing_dot(m.mount_point.as_bytes());
 		debug!(
 			"prompter: adding mount at {:?} -> {:?} (ro={}, noexec={})",
 			m.mount_point, m.mount.host_path, m.mount.attrs.readonly, m.mount.attrs.noexec
@@ -533,6 +546,7 @@ fn apply_prompter_response(context: &Context, response: &PrompterResponse, t_loc
 	}
 
 	for p in &response.add_placeholders {
+		let path_bytes = trim_trailing_dot(p.path.as_bytes());
 		// `match_host` and an explicit placeholder are mutually
 		// exclusive; exactly one must be provided.
 		let placeholder = match (p.match_host, &p.placeholder) {
@@ -553,7 +567,7 @@ fn apply_prompter_response(context: &Context, response: &PrompterResponse, t_loc
 				continue;
 			}
 			(true, None) => {
-				let host_path = match CString::new(p.path.as_bytes().to_vec()) {
+				let host_path = match CString::new(path_bytes.to_vec()) {
 					Ok(c) => c,
 					Err(_) => {
 						error!(
@@ -582,7 +596,7 @@ fn apply_prompter_response(context: &Context, response: &PrompterResponse, t_loc
 		);
 		if let Err(e) = context
 			.sandbox
-			.add_or_update_placeholder(OsStr::from_bytes(p.path.as_bytes()), placeholder)
+			.add_or_update_placeholder(OsStr::from_bytes(path_bytes), placeholder)
 		{
 			error!("prompter: error adding placeholder at {:?}: {}", p.path, e);
 		}
