@@ -14,6 +14,9 @@ use std::{
 #[cfg(feature = "serialize")]
 use serde::Serialize;
 
+#[cfg(feature = "serialize")]
+use crate::utils::{serialize_cstring, serialize_timespec_pair};
+
 use crate::{AccessRequestError, syscalls::RequestContext};
 
 use smallvec::{SmallVec, smallvec};
@@ -756,8 +759,13 @@ pub struct CreateOperation {
 pub enum CreateKind {
 	File,
 	Directory,
-	Symlink { target: CString },
-	Device { dev: libc::dev_t },
+	Symlink {
+		#[cfg_attr(feature = "serialize", serde(serialize_with = "serialize_cstring"))]
+		target: CString,
+	},
+	Device {
+		dev: libc::dev_t,
+	},
 }
 
 impl CreateKind {
@@ -850,31 +858,6 @@ pub struct FallocateOperation {
 	pub length: i64,
 }
 
-/// Serialize a `[libc::timespec; 2]` as a two-element array of `{ sec,
-/// nsec }` objects.
-#[cfg(feature = "serialize")]
-fn serialize_timespec_pair<S>(times: &[libc::timespec; 2], serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: serde::Serializer,
-{
-	use serde::ser::SerializeSeq;
-
-	#[derive(Serialize)]
-	struct Timespec {
-		sec: i64,
-		nsec: i64,
-	}
-
-	let mut seq = serializer.serialize_seq(Some(times.len()))?;
-	for t in times {
-		seq.serialize_element(&Timespec {
-			sec: t.tv_sec as i64,
-			nsec: t.tv_nsec as i64,
-		})?;
-	}
-	seq.end()
-}
-
 /// `utimensat` / `futimesat` / `utimes`.  `times` is normalised to
 /// the `utimensat` representation.
 #[cfg_attr(feature = "serialize", derive(Serialize))]
@@ -908,6 +891,7 @@ pub struct ListXattrOperation {
 #[derive(Debug, Clone)]
 pub struct GetXattrOperation {
 	pub target: FsTarget,
+	#[cfg_attr(feature = "serialize", serde(serialize_with = "serialize_cstring"))]
 	pub name: CString,
 }
 
@@ -915,6 +899,7 @@ pub struct GetXattrOperation {
 #[derive(Debug, Clone)]
 pub struct SetXattrOperation {
 	pub target: FsTarget,
+	#[cfg_attr(feature = "serialize", serde(serialize_with = "serialize_cstring"))]
 	pub name: CString,
 	pub value: Vec<u8>,
 	pub flags: i32,
@@ -924,6 +909,7 @@ pub struct SetXattrOperation {
 #[derive(Debug, Clone)]
 pub struct RemoveXattrOperation {
 	pub target: FsTarget,
+	#[cfg_attr(feature = "serialize", serde(serialize_with = "serialize_cstring"))]
 	pub name: CString,
 }
 
