@@ -472,14 +472,14 @@ impl<T> FsTree<T> {
 	/// the accumulator is restored.
 	///
 	/// No calls to `f` will be made if `path` does not exist in the tree.
-	pub fn fold_top_down_from<F, R>(&mut self, mut f: F, init: R, path: &OsStr)
+	pub fn fold_top_down_from<F, R>(&self, mut f: F, init: R, path: &OsStr)
 	where
-		F: FnMut(&OsStr, &mut T, R) -> R,
+		F: FnMut(&OsStr, &T, R) -> R,
 		R: Clone,
 	{
-		let mut current = &mut self.root;
+		let mut current = &self.root;
 		for comp in path_to_components(path) {
-			if let Some(v) = current.children.get_mut(comp.name) {
+			if let Some(v) = current.children.get(comp.name) {
 				current = v;
 			} else {
 				return;
@@ -498,23 +498,19 @@ impl<T> FsTree<T> {
 		Self::fold_top_down_impl(&mut f, current, &mut path_buf, init)
 	}
 
-	fn fold_top_down_impl<F, R>(
-		f: &mut F,
-		node: &mut FsTreeNode<T>,
-		path: &mut Vec<u8>,
-		acc: R,
-	) where
-		F: FnMut(&OsStr, &mut T, R) -> R,
+	fn fold_top_down_impl<F, R>(f: &mut F, node: &FsTreeNode<T>, path: &mut Vec<u8>, acc: R)
+	where
+		F: FnMut(&OsStr, &T, R) -> R,
 		R: Clone,
 	{
 		// Nodes without data (incomplete parents) don't call `f`; they
 		// simply pass the accumulator down unchanged.
-		let acc = if let Some(data) = &mut node.data {
+		let acc = if let Some(data) = &node.data {
 			f(OsStr::from_bytes(path), data, acc)
 		} else {
 			acc
 		};
-		for (name, child) in node.children.iter_mut() {
+		for (name, child) in node.children.iter() {
 			let orig_len = path.len();
 			if path.last().copied() != Some(b'/') {
 				path.push(b'/');
