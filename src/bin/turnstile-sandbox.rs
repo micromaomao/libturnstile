@@ -706,27 +706,31 @@ fn tracing_thread(context: &'static Context) {
 			std::collections::BTreeMap::new();
 		denials.fold_top_down_from(
 			|path, curr, (acc_r, acc_w, acc_x)| {
-				let (cr, cw, cx) = (
-					curr.need_read || acc_r,
-					curr.need_write || acc_w,
-					curr.need_exec || acc_x,
-				);
-				let is_placeholder = !curr.need_read && !curr.need_write && !curr.need_exec;
-				let parent_has_mounted = acc_r || acc_w || acc_x;
-				let redundant = (acc_r, acc_w, acc_x) == (cr, cw, cx)
-					&& !(is_placeholder && !parent_has_mounted);
-				// placeholders does not inherit down (i.e. a placeholder
-				// at /home does not mean that a placeholder at /home/user
-				// is redundant)
+				let (r, w, x) = (curr.need_read, curr.need_write, curr.need_exec);
+				let is_mount = r || w || x;
+				let parent_has_mount = acc_r;
+				let redundant = if is_mount {
+					// Read is always covered by a covering mount, so we only
+					// need write/exec to also be covered for this mount to be
+					// redundant.
+					parent_has_mount && (!w || acc_w) && (!x || acc_x)
+				} else {
+					// Resolve-only placeholder: redundant once any covering
+					// mount makes it resolvable.  Placeholders do not inherit
+					// down (a placeholder at /home does not make a placeholder
+					// at /home/user redundant).
+					parent_has_mount
+				};
 				if !redundant {
 					let mut perms = String::new();
-					if cr || cw || cx {
-						// Read is always required for non-resolve-only entries.
+					if is_mount {
+						// A config entry must be either empty or contains
+						// 'r', so always emit it for a mount.
 						perms.push('r');
-						if cw {
+						if w {
 							perms.push('w');
 						}
-						if cx {
+						if x {
 							perms.push('x');
 						}
 					}
@@ -735,7 +739,7 @@ fn tracing_thread(context: &'static Context) {
 					let path_str = String::from_utf8_lossy(path.as_bytes()).replace('$', "$$");
 					rules.insert(path_str, perms);
 				}
-				(cr, cw, cx)
+				(acc_r || is_mount, acc_w || w, acc_x || x)
 			},
 			(false, false, false),
 			OsStr::new("/"),
