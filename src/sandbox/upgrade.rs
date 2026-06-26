@@ -747,7 +747,6 @@ impl ManagedBindMountSandbox {
 		if !cov_attrs.readonly && !cov_attrs.noexec {
 			return ctx.send_continue();
 		}
-		// todo: figure out why are we removing mounts???
 		// A mount already exists *exactly* at the target: cwd is pinned to
 		// a tracked mount whose identity reconcile preserves, so there is
 		// nothing to do.
