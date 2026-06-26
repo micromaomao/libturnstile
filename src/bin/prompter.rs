@@ -26,6 +26,14 @@ pub struct PrompterRequest {
 	/// (with space trimmed).
 	pub request_comm: String,
 	/// The access request data.
+	///
+	/// Unlike [`rwx_permissions`](Self::rwx_permissions), the paths here
+	/// are taken from the in-sandbox view of the request and may not be
+	/// fully resolved: if the path cannot be resolved inside the sandbox
+	/// (e.g. because a symlink along it has not been mirrored yet), the
+	/// serialized target falls back to the raw path the process passed
+	/// (with `valid: false`).  Prefer `rwx_permissions` for deciding what
+	/// to mount.
 	pub access_request: AccessRequest,
 	/// An opened fd number (passed to the prompter) for the /proc/<pid>
 	/// directory of the requesting process, or null if opening this fd
@@ -33,6 +41,15 @@ pub struct PrompterRequest {
 	pub pidfd: Option<u32>,
 	/// For filesystem operations, this is the request represented in a
 	/// "r/w/x <file>" format.
+	///
+	/// The target paths here are resolved against the real host root, so
+	/// all symlinks (including ones not yet mirrored into the sandbox)
+	/// are already followed and the paths are canonical host paths.  A
+	/// prompter can therefore just echo a path straight back as an
+	/// `add_mounts` / `add_placeholders` entry and set
+	/// [`auto_add_symlinks`](PrompterResponse::auto_add_symlinks) to let
+	/// turnstile-sandbox recreate the intermediate symlinks needed for
+	/// the process's original (pre-resolution) path to keep working.
 	pub rwx_permissions: Vec<RwxPermission>,
 	/// Path to the config file
 	pub config_path: String,

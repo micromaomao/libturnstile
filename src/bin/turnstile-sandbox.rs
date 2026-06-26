@@ -804,12 +804,39 @@ fn tracing_thread(context: &'static Context) {
 										// remaining permissions of this same syscall.
 										if !prompted {
 											prompted = true;
+											// Resolve every target into the real
+											// host root so the prompter receives
+											// canonical host realpaths.  The
+											// in-sandbox targets often don't
+											// resolve yet (e.g. a not-yet-created
+											// dir, or a path whose parent is not
+											// materialised in the sandbox) and
+											// would serialize as invalid,
+											// unresolved paths.
+											let resolved_rwxps: Vec<RwxPermission> = rwxps
+												.iter()
+												.map(|p| {
+													let mut p = p.clone();
+													match p
+														.target
+														.in_root(resolve_sandbox_root.as_raw_fd())
+													{
+														Ok(t) => p.target = t,
+														Err(e) => debug!(
+															"could not resolve {} in real \
+															 root for prompter: {}",
+															p, e
+														),
+													}
+													p
+												})
+												.collect();
 											match prompt_for_request(
 												context,
 												program,
 												&mut req_ctx,
 												&request,
-												rwxps.to_vec(),
+												resolved_rwxps,
 											) {
 												Some(response) => {
 													apply_prompter_response(
