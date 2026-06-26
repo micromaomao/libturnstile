@@ -462,6 +462,10 @@ fn tracing_thread(context: &'static Context) {
 									break;
 								}
 							};
+							if abspath.as_bytes() == b"/" {
+								debug!("skipping /");
+								continue;
+							}
 							let mut add_symlinks = false;
 							let mut add_placeholder = false;
 							let mut add_mount = false;
@@ -521,13 +525,6 @@ fn tracing_thread(context: &'static Context) {
 									d.need_write |= rwxp.write;
 									d.need_exec |= rwxp.exec;
 									if context.permissive {
-										if abspath.as_bytes() == b"/" {
-											// TODO: figure out a way to grant root, maybe
-											// we create the / mount anyway, and let the
-											// fd upgrade / proxy mechanism do the work.
-											debug!("skipping mount update on /");
-											continue;
-										}
 										add_symlinks = true;
 										if !resolve_only {
 											add_mount = true;
