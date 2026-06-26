@@ -11,6 +11,9 @@ use std::{
 	},
 };
 
+#[cfg(feature = "serialize")]
+use serde::Serialize;
+
 use crate::{AccessRequestError, syscalls::RequestContext};
 
 use smallvec::{SmallVec, smallvec};
@@ -658,7 +661,72 @@ impl std::fmt::Display for FsTarget {
 	}
 }
 
-#[derive(Debug)]
+#[cfg(feature = "serialize")]
+#[derive(Serialize)]
+struct SerializedFsTarget<'a> {
+	/// The absolute path of the target.  When `valid` is true this is the
+	/// fully resolved path, in which case everything except the last
+	/// component will exist, and the last component will exist for
+	/// non-dentry-modifying operations like opening a file without
+	/// `O_CREAT`.  Otherwise it is a join of the base fd's path and the
+	/// raw provided path, and any component of it may not exist.
+	pub path: &'a str,
+	/// Some bytes in path has been lost due to it being invalid UTF-8.
+	pub path_is_invalid_utf8: bool,
+	pub valid: bool,
+	pub no_follow: bool,
+	/// The original syscall used a relative path against the current
+	/// working directory (`AT_FDCWD` or a path-only syscall).
+	pub base_is_cwd: bool,
+	/// The original syscall used an absolute path.
+	pub base_is_root: bool,
+}
+
+#[cfg(feature = "serialize")]
+impl Serialize for FsTarget {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let (path, valid) = match self.realpath() {
+			Ok(rp) => (rp, true),
+			Err(rp_err) => {
+				debug!(
+					"realpath() on FsTarget failed during serialization: {}",
+					rp_err
+				);
+				// Best-effort: join the base fd's path with the raw path,
+				// mirroring the Display impl's handling of invalid targets.
+				let mut dfd_path_bytes = self
+					.dfd
+					.readlink()
+					.unwrap_or_else(|e| {
+						debug!("unable to readlink() on FsTarget's dfd: {}", e);
+						OsString::from("???")
+					})
+					.into_encoded_bytes();
+				if dfd_path_bytes.last().copied() != Some(b'/') {
+					dfd_path_bytes.push(b'/');
+				}
+				dfd_path_bytes.extend_from_slice(self.path.to_bytes());
+				(OsString::from_vec(dfd_path_bytes), false)
+			}
+		};
+		let path_str = path.to_string_lossy();
+		let obj = SerializedFsTarget {
+			path: path_str.as_ref(),
+			path_is_invalid_utf8: matches!(path_str, std::borrow::Cow::Owned(_)),
+			valid,
+			no_follow: self.no_follow,
+			base_is_cwd: self.original_handle == OriginalHandle::Cwd,
+			base_is_root: self.original_handle == OriginalHandle::Root,
+		};
+		obj.serialize(serializer)
+	}
+}
+
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct AccessOperation {
 	pub target: FsTarget,
 	pub need_read: bool,
@@ -666,7 +734,8 @@ pub struct AccessOperation {
 	pub need_exec: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct OpenOperation {
 	pub target: FsTarget,
 	pub need_read: bool,
@@ -674,14 +743,16 @@ pub struct OpenOperation {
 	pub create_mode: Option<libc::mode_t>,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct CreateOperation {
 	pub target: FsTarget,
 	pub mode: libc::mode_t,
 	pub kind: CreateKind,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub enum CreateKind {
 	File,
 	Directory,
@@ -706,62 +777,72 @@ impl std::fmt::Display for CreateKind {
 	}
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct RenameOperation {
 	pub from: FsTarget,
 	pub to: FsTarget,
 	pub exchange: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct UnlinkOperation {
 	pub target: FsTarget,
 	pub dir: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct LinkOperation {
 	pub from: FsTarget,
 	pub to: FsTarget,
 	pub follow_src_symlink: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct ExecOperation {
 	pub target: FsTarget,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct StatOperation {
 	pub target: FsTarget,
 	pub lstat: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct UnixBindOperation {
 	pub target: FsTarget,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct ChmodOperation {
 	pub target: FsTarget,
 	pub mode: u32,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct ChownOperation {
 	pub target: FsTarget,
 	pub uid: u32,
 	pub gid: u32,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct TruncateOperation {
 	pub target: FsTarget,
 	pub length: i64,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct FallocateOperation {
 	pub target: FsTarget,
 	pub mode: i32,
@@ -769,16 +850,47 @@ pub struct FallocateOperation {
 	pub length: i64,
 }
 
+/// Serialize a `[libc::timespec; 2]` as a two-element array of `{ sec,
+/// nsec }` objects.
+#[cfg(feature = "serialize")]
+fn serialize_timespec_pair<S>(times: &[libc::timespec; 2], serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: serde::Serializer,
+{
+	use serde::ser::SerializeSeq;
+
+	#[derive(Serialize)]
+	struct Timespec {
+		sec: i64,
+		nsec: i64,
+	}
+
+	let mut seq = serializer.serialize_seq(Some(times.len()))?;
+	for t in times {
+		seq.serialize_element(&Timespec {
+			sec: t.tv_sec as i64,
+			nsec: t.tv_nsec as i64,
+		})?;
+	}
+	seq.end()
+}
+
 /// `utimensat` / `futimesat` / `utimes`.  `times` is normalised to
 /// the `utimensat` representation.
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct UtimensOperation {
 	pub target: FsTarget,
 	/// [last access, last modification]
+	#[cfg_attr(
+		feature = "serialize",
+		serde(serialize_with = "serialize_timespec_pair")
+	)]
 	pub times: [libc::timespec; 2],
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct MmapOperation {
 	pub target: FsTarget,
 	pub need_read: bool,
@@ -786,18 +898,21 @@ pub struct MmapOperation {
 	pub need_exec: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct ListXattrOperation {
 	pub target: FsTarget,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct GetXattrOperation {
 	pub target: FsTarget,
 	pub name: CString,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct SetXattrOperation {
 	pub target: FsTarget,
 	pub name: CString,
@@ -805,13 +920,15 @@ pub struct SetXattrOperation {
 	pub flags: i32,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct RemoveXattrOperation {
 	pub target: FsTarget,
 	pub name: CString,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub enum FsOperation {
 	FsOpen(OpenOperation),
 	FsAccess(AccessOperation),
@@ -838,7 +955,8 @@ pub enum FsOperation {
 	UnixSendto(FsTarget),
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct RwxPermission {
 	/// Target path.
 	///

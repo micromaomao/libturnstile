@@ -115,7 +115,7 @@ pub(crate) fn handle_notification<'a>(
 				operation: Operation::FsOperation(op),
 			}));
 		}
-		// Not a Unix socket or no address - let the kernel handle it.
+		// Not a Unix socket or no address
 		return Ok(None);
 	}
 

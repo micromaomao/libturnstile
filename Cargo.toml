@@ -22,7 +22,8 @@ serde_yaml_ng = { version = "0.10.0", optional = true }
 
 [features]
 default = []
-tools = ["clap", "env_logger", "serde", "serde_yaml_ng"]
+tools = ["clap", "env_logger", "serde", "serde_yaml_ng", "serialize"]
+serialize = ["serde"]
 
 [[bin]]
 name = "fstrace"
