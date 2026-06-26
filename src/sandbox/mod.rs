@@ -20,6 +20,14 @@ use crate::{
 	utils::{fork_wait, unix_recv_fd, unix_send_fd},
 };
 
+#[cfg(feature = "serialize")]
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "serialize")]
+use crate::utils::{
+	deserialize_cstring, deserialize_timespec, serialize_cstring, serialize_timespec,
+};
+
 /// We technically can't safely log or format strings in fork or pre_exec
 /// context, but to make our life easier we will do it anyway in debug
 /// builds.
@@ -124,6 +132,7 @@ fn write_to_path(path: &CStr, content: &str) -> libc::c_int {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MountAttributes {
 	pub readonly: bool,
@@ -1444,8 +1453,16 @@ impl BindMountSandbox {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedMountPoint {
+	#[cfg_attr(
+		feature = "serialize",
+		serde(
+			serialize_with = "serialize_cstring",
+			deserialize_with = "deserialize_cstring"
+		)
+	)]
 	pub host_path: CString,
 	pub attrs: MountAttributes,
 }
@@ -1475,6 +1492,7 @@ pub enum ManagedTreeEntry {
 	BindMount(ManagedMountPoint),
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedPlaceholder {
 	PlaceholderDir(PlaceholderDirData),
@@ -1482,9 +1500,24 @@ pub enum ManagedPlaceholder {
 	PlaceholderSymlink(PlaceholderSymlinkData),
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct CommonPlaceholderData {
+	#[cfg_attr(
+		feature = "serialize",
+		serde(
+			serialize_with = "serialize_timespec",
+			deserialize_with = "deserialize_timespec"
+		)
+	)]
 	pub atime: libc::timespec,
+	#[cfg_attr(
+		feature = "serialize",
+		serde(
+			serialize_with = "serialize_timespec",
+			deserialize_with = "deserialize_timespec"
+		)
+	)]
 	pub mtime: libc::timespec,
 }
 
@@ -1514,8 +1547,10 @@ impl CommonPlaceholderData {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderDirData {
+	#[cfg_attr(feature = "serialize", serde(flatten))]
 	pub common: CommonPlaceholderData,
 	pub mode: u32,
 }
@@ -2125,8 +2160,10 @@ impl PlaceholderDirData {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderFileData {
+	#[cfg_attr(feature = "serialize", serde(flatten))]
 	pub common: CommonPlaceholderData,
 	pub mode: u32,
 	pub len: u64,
@@ -2142,9 +2179,18 @@ impl PlaceholderFileData {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderSymlinkData {
+	#[cfg_attr(feature = "serialize", serde(flatten))]
 	pub common: CommonPlaceholderData,
+	#[cfg_attr(
+		feature = "serialize",
+		serde(
+			serialize_with = "serialize_cstring",
+			deserialize_with = "deserialize_cstring"
+		)
+	)]
 	pub target: CString,
 }
 
