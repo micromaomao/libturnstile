@@ -1495,9 +1495,9 @@ pub enum ManagedTreeEntry {
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedPlaceholder {
-	PlaceholderDir(PlaceholderDirData),
-	PlaceholderFile(PlaceholderFileData),
-	PlaceholderSymlink(PlaceholderSymlinkData),
+	Dir(PlaceholderDirData),
+	File(PlaceholderFileData),
+	Symlink(PlaceholderSymlinkData),
 }
 
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
@@ -1728,17 +1728,17 @@ fn create_or_update_placeholder(
 		libc::mode_t,
 		Option<libc::mode_t>,
 	) = match placeholder_data {
-		ManagedPlaceholder::PlaceholderDir(d) => (
+		ManagedPlaceholder::Dir(d) => (
 			&d.common,
 			libc::S_IFDIR,
 			Some((d.mode & 0o7777) as libc::mode_t),
 		),
-		ManagedPlaceholder::PlaceholderFile(f) => (
+		ManagedPlaceholder::File(f) => (
 			&f.common,
 			libc::S_IFREG,
 			Some((f.mode & 0o7777) as libc::mode_t),
 		),
-		ManagedPlaceholder::PlaceholderSymlink(s) => (&s.common, libc::S_IFLNK, None),
+		ManagedPlaceholder::Symlink(s) => (&s.common, libc::S_IFLNK, None),
 	};
 
 	let mut attempts: u32 = 0;
@@ -1754,10 +1754,10 @@ fn create_or_update_placeholder(
 		let create_err: io::Error;
 		unsafe {
 			let res = match placeholder_data {
-				ManagedPlaceholder::PlaceholderDir(_) => {
+				ManagedPlaceholder::Dir(_) => {
 					libc::mkdirat(dirfd, name.as_ptr(), mode_perms.unwrap())
 				}
-				ManagedPlaceholder::PlaceholderFile(_) => {
+				ManagedPlaceholder::File(_) => {
 					let fd = libc::openat(
 						dirfd,
 						name.as_ptr(),
@@ -1773,7 +1773,7 @@ fn create_or_update_placeholder(
 						0
 					}
 				}
-				ManagedPlaceholder::PlaceholderSymlink(s) => {
+				ManagedPlaceholder::Symlink(s) => {
 					libc::symlinkat(s.target.as_ptr(), dirfd, name.as_ptr())
 				}
 			};
@@ -1791,13 +1791,13 @@ fn create_or_update_placeholder(
 
 		if create_err.kind() != io::ErrorKind::AlreadyExists {
 			return Err(match placeholder_data {
-				ManagedPlaceholder::PlaceholderDir(_) => {
+				ManagedPlaceholder::Dir(_) => {
 					BindMountSandboxError::Mkdir(name.to_owned(), create_err)
 				}
-				ManagedPlaceholder::PlaceholderFile(_) => {
+				ManagedPlaceholder::File(_) => {
 					BindMountSandboxError::Mkfile(name.to_owned(), create_err)
 				}
-				ManagedPlaceholder::PlaceholderSymlink(s) => {
+				ManagedPlaceholder::Symlink(s) => {
 					BindMountSandboxError::Symlinkat(name.to_owned(), s.target.clone(), create_err)
 				}
 			});
@@ -1824,7 +1824,7 @@ fn create_or_update_placeholder(
 		}
 
 		// Right type.  For symlinks, also verify the target.
-		if let ManagedPlaceholder::PlaceholderSymlink(s) = placeholder_data {
+		if let ManagedPlaceholder::Symlink(s) = placeholder_data {
 			let mut buf = vec![0u8; libc::PATH_MAX as usize];
 			let n = unsafe {
 				libc::readlinkat(dirfd, name.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
@@ -1951,12 +1951,12 @@ fn placeholder_default_no_metadata(kind_is_dir: bool) -> ManagedPlaceholder {
 		},
 	};
 	if kind_is_dir {
-		ManagedPlaceholder::PlaceholderDir(PlaceholderDirData {
+		ManagedPlaceholder::Dir(PlaceholderDirData {
 			common,
 			mode: 0o755,
 		})
 	} else {
-		ManagedPlaceholder::PlaceholderFile(PlaceholderFileData {
+		ManagedPlaceholder::File(PlaceholderFileData {
 			common,
 			mode: 0o644,
 			len: 0,
@@ -2136,7 +2136,7 @@ fn prune_useless_mounts(policy: &mut FsTree<ManagedTreeEntry>) {
 }
 
 fn placeholder_default_symlink(target: CString) -> ManagedPlaceholder {
-	ManagedPlaceholder::PlaceholderSymlink(PlaceholderSymlinkData {
+	ManagedPlaceholder::Symlink(PlaceholderSymlinkData {
 		common: CommonPlaceholderData {
 			atime: libc::timespec {
 				tv_sec: 0,

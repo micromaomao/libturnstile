@@ -34,6 +34,7 @@ use crate::config::Config;
 
 mod common;
 mod config;
+mod prompter;
 
 /// A simple interactive sandbox using libturnstile
 #[derive(Parser)]
@@ -50,10 +51,20 @@ struct Cli {
 	#[arg(required = true)]
 	config: PathBuf,
 
-	/// If set, the sandbox will log denials but always allow the
-	/// operation to continue.
+	/// If set, the sandbox will log denials in the form of a policy yaml,
+	/// but always allow the operation to continue.  This is mutually
+	/// exclusive with `--prompter`.
 	#[arg(long = "permissive")]
 	permissive: bool,
+
+	/// If set, on access denials the sandbox will launch the given
+	/// program and wait for it to make a decision.  The program is
+	/// expected to accept as input a JSON object, and output a JSON
+	/// object.  See src/bin/prompter.rs for the object's specification,
+	/// and an example implementation at `prompter/main.py`.  This is
+	/// mutually exclusive with `--permissive`.
+	#[arg(long = "prompter")]
+	prompter: Option<String>,
 
 	/// Program to run and its arguments
 	#[arg(required = true)]
@@ -99,7 +110,7 @@ fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io:
 	let common = CommonPlaceholderData::from_stat(&stat);
 	let kind = stat.st_mode & libc::S_IFMT;
 	Ok(match kind {
-		libc::S_IFDIR => ManagedPlaceholder::PlaceholderDir(PlaceholderDirData {
+		libc::S_IFDIR => ManagedPlaceholder::Dir(PlaceholderDirData {
 			common,
 			mode: stat.st_mode,
 		}),
@@ -107,12 +118,12 @@ fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io:
 			let target = std::fs::read_link(OsStr::from_bytes(host_path.to_bytes()))?;
 			let target_cstr = CString::new(target.into_os_string().into_encoded_bytes())
 				.map_err(|_| io::Error::other("symlink target contains NUL byte"))?;
-			ManagedPlaceholder::PlaceholderSymlink(PlaceholderSymlinkData {
+			ManagedPlaceholder::Symlink(PlaceholderSymlinkData {
 				common,
 				target: target_cstr,
 			})
 		}
-		_ => ManagedPlaceholder::PlaceholderFile(PlaceholderFileData {
+		_ => ManagedPlaceholder::File(PlaceholderFileData {
 			common,
 			mode: stat.st_mode,
 			len: stat.st_size as u64,
@@ -246,7 +257,7 @@ fn create_symlinks_for_user_path(
 				.map(|(covered, _)| covered)
 				.unwrap_or(false);
 			if !covered {
-				let placeholder = ManagedPlaceholder::PlaceholderSymlink(PlaceholderSymlinkData {
+				let placeholder = ManagedPlaceholder::Symlink(PlaceholderSymlinkData {
 					common: CommonPlaceholderData::from_stat(&stat),
 					target: target_cstr,
 				});
