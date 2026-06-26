@@ -461,7 +461,9 @@ impl FsTarget {
 			// 	return Ok(opened);
 			// }
 			return Ok(opened);
-			// todo
+			// todo: we may get a placeholder fd within the sandbox but
+			// obviously a fd pointing to the real file outside.  In that
+			// case we still want to get t_local.
 			debug!(
 				"open_target_dfd_in_root: attempt {} for {:?} got different inode \
 				 (expected id {:?}, got id {:?})",
