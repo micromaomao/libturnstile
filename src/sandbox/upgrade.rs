@@ -60,7 +60,7 @@ use crate::{
 	syscalls::fs as syscalls_fs,
 };
 
-use super::{ManagedBindMountSandbox, ManagedMountPoint, MountAttributes};
+use super::{ManagedBindMountSandbox, ManagedMountPoint, MountAttributes, ProcPidFd};
 
 /// Convert an absolute path (as bytes, no interior NUL) into a
 /// NUL-terminated `CString`, or `None` if it contains a NUL byte.
@@ -768,20 +768,37 @@ impl ManagedBindMountSandbox {
 		};
 		let host_path_bytes = join_under_mount(cov_host.as_bytes(), suffix);
 		if let Some(host_path) = to_cstring(&host_path_bytes) {
-			let mp = ManagedMountPoint {
-				host_path,
-				attrs: cov_attrs,
-			};
-			if let Err(e) = self.add_or_update_mount(target_os, mp) {
-				warn!(
-					"chdir: failed to add preemptive mount on {:?}: {}",
-					abspath, e
-				);
-			} else {
-				debug!(
-					"chdir: added preemptive {} mount on {:?}",
-					cov_attrs, abspath
-				);
+			// Capture a reuse-safe handle to the *thread* issuing the chdir
+			// (cwd is per-thread).  The transient mount is tracked against it
+			// so a later reconcile keeps it only while this thread's cwd
+			// still needs it, then reclaims it (§11.5).
+			match ProcPidFd::from_tid(ctx.pid()) {
+				Ok(pidfd) => {
+					let mp = ManagedMountPoint {
+						host_path,
+						attrs: cov_attrs,
+					};
+					if let Err(e) = self.reconcile_chdir(target_os, mp, std::sync::Arc::new(pidfd))
+					{
+						warn!(
+							"chdir: failed to add preemptive mount on {:?}: {}",
+							abspath, e
+						);
+					} else {
+						debug!(
+							"chdir: added preemptive {} mount on {:?}",
+							cov_attrs, abspath
+						);
+					}
+				}
+				Err(e) => {
+					warn!(
+						"chdir: cannot open pidfd for tid {} ({:?}): {} - skipping preemptive mount",
+						ctx.pid(),
+						abspath,
+						e
+					);
+				}
 			}
 		}
 		ctx.send_continue()

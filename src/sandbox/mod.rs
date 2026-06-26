@@ -1,13 +1,13 @@
 use std::{
 	borrow::Cow,
 	ffi::{CStr, CString, OsStr, OsString},
-	io::{self, Write},
+	io::{self, Read, Write},
 	mem,
 	os::{
-		fd::{AsRawFd, IntoRawFd},
-		unix::{ffi::OsStrExt, process::CommandExt},
+		fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+		unix::{ffi::OsStrExt, ffi::OsStringExt, process::CommandExt},
 	},
-	sync::Mutex,
+	sync::{Arc, Mutex, OnceLock},
 	thread,
 };
 
@@ -1461,6 +1461,12 @@ pub(crate) struct MountInternal {
 	/// Kernel `mnt_id` captured at creation via `statx(STATX_MNT_ID)`
 	/// from the m1 helper; 0 if the capture failed.
 	pub mnt_id: u64,
+	/// Threads (`/proc/<tid>` handles) whose cwd this mount was created
+	/// to back (via `chdir`/`fchdir`, §11.5).  Empty for ordinary policy
+	/// mounts.  A `Removed` reconcile defers unmounting while any holder
+	/// is still alive and either mid-`chdir` or with its cwd still here,
+	/// so a still-pinned cwd is never yanked out from under the app.
+	pub cwd_of: Vec<Arc<ProcPidFd>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1870,6 +1876,32 @@ fn stat_host(host_path: &CStr) -> Result<libc::stat, BindMountSandboxError> {
 	Ok(stat)
 }
 
+/// Compute the host path that a covering mount would expose at a
+/// descendant sandbox path.  Given a covering mount at sandbox path
+/// `par_sb` bound to host `par_host`, the descendant `path` (which must
+/// be `par_sb` plus a `/`-separated suffix) is exposed at
+/// `par_host` + that same suffix.  The result is normalised (no trailing
+/// or doubled slashes), e.g. `("/etc", "/", "/home/x") -> "/etc/home/x"`,
+/// `("/", "/home", "/home/x") -> "/x"`.
+fn join_host_suffix(par_host: &[u8], par_sb: &[u8], path: &[u8]) -> Vec<u8> {
+	let suffix = &path[par_sb.len().min(path.len())..];
+	let mut out: Vec<u8> = par_host.to_vec();
+	while out.len() > 1 && out.last() == Some(&b'/') {
+		out.pop();
+	}
+	if out == b"/" {
+		out.clear();
+	}
+	for comp in suffix.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+		out.push(b'/');
+		out.extend_from_slice(comp);
+	}
+	if out.is_empty() {
+		out.push(b'/');
+	}
+	out
+}
+
 /// Convenience for callers that just need to ensure an entry exists
 /// with sensible default mode and without touching timestamps.
 fn placeholder_default_no_metadata(kind_is_dir: bool) -> ManagedPlaceholder {
@@ -1894,6 +1926,177 @@ fn placeholder_default_no_metadata(kind_is_dir: bool) -> ManagedPlaceholder {
 			mode: 0o644,
 			len: 0,
 		})
+	}
+}
+
+/// Syscall numbers for `chdir` / `fchdir`, resolved once for the native
+/// architecture.  Used by [`ProcPidFd::in_chdir_syscall`] to tell whether
+/// a thread is *currently* executing a directory-change syscall.
+fn chdir_syscall_nrs() -> &'static [i64] {
+	static ONCE: OnceLock<Vec<i64>> = OnceLock::new();
+	ONCE.get_or_init(|| {
+		let mut v = Vec::new();
+		for name in ["chdir", "fchdir"] {
+			if let Ok(nr) = libseccomp::ScmpSyscall::from_name(name) {
+				v.push(i32::from(nr) as i64);
+			}
+		}
+		v
+	})
+}
+
+/// An `O_PATH` handle to `/proc/<tid>` (a *thread*, not a thread group)
+/// used to inspect a sandboxed thread's liveness, current working
+/// directory, and current syscall.  Holding the procfs directory open is
+/// reuse-safe: once the original task exits, the dentry is invalidated and
+/// `openat` / `readlinkat` through this handle fail with `ENOENT` / `ESRCH`
+/// even if the kernel later recycles the tid.
+#[derive(Debug)]
+pub(crate) struct ProcPidFd {
+	tid: libc::pid_t,
+	dirfd: OwnedFd,
+}
+
+impl ProcPidFd {
+	/// Open `/proc/<tid>` (the per-thread procfs directory).
+	pub(crate) fn from_tid(tid: libc::pid_t) -> io::Result<Self> {
+		let path = format!("/proc/{}\0", tid);
+		let fd = unsafe {
+			libc::open(
+				path.as_ptr() as *const libc::c_char,
+				libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+			)
+		};
+		if fd < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(Self {
+			tid,
+			dirfd: unsafe { OwnedFd::from_raw_fd(fd) },
+		})
+	}
+
+	pub(crate) fn tid(&self) -> libc::pid_t {
+		self.tid
+	}
+
+	/// Open a file relative to `/proc/<tid>` (e.g. `status`, `cwd`,
+	/// `syscall`) through the held directory handle.
+	fn open_proc_file(&self, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+		let fd = unsafe { libc::openat(self.dirfd.as_raw_fd(), name.as_ptr(), flags) };
+		if fd < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+	}
+
+	/// Whether the thread is still alive (not reaped / not a zombie).
+	pub(crate) fn is_alive(&self) -> io::Result<bool> {
+		match self.open_proc_file(c"status", libc::O_RDONLY | libc::O_CLOEXEC) {
+			Ok(fd) => {
+				let mut f = std::fs::File::from(fd);
+				let mut s = String::new();
+				f.read_to_string(&mut s)?;
+				Ok(!s.contains("State:\tZ"))
+			}
+			Err(e) => match e.raw_os_error() {
+				// Dentry invalidated: the task exited (and the tid may have
+				// been recycled - this handle still refers to the old one).
+				Some(libc::ENOENT) | Some(libc::ESRCH) => Ok(false),
+				_ => Err(e),
+			},
+		}
+	}
+
+	/// Read the thread's current working directory (as a sandbox-namespace
+	/// path) by `readlinkat`-ing `/proc/<tid>/cwd`.
+	pub(crate) fn cwd(&self) -> io::Result<OsString> {
+		let mut buf = vec![0u8; libc::PATH_MAX as usize];
+		let ret = unsafe {
+			libc::readlinkat(
+				self.dirfd.as_raw_fd(),
+				c"cwd".as_ptr(),
+				buf.as_mut_ptr() as *mut libc::c_char,
+				buf.len(),
+			)
+		};
+		if ret < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		buf.truncate(ret as usize);
+		Ok(OsString::from_vec(buf))
+	}
+
+	/// Whether the thread is *currently* executing a `chdir` / `fchdir`
+	/// syscall, read from the first token of `/proc/<tid>/syscall` (the
+	/// syscall number, or `running` in userspace, or `-1` when not in a
+	/// syscall).
+	///
+	/// Returns `true` on any read / parse failure so callers treat an
+	/// unreadable state conservatively (assume an in-flight chdir and keep
+	/// the mount).  This is the load-bearing in-flight guard that makes the
+	/// cwd-mount cleanup race-free: it must be read *before* [`Self::cwd`].
+	pub(crate) fn in_chdir_syscall(&self) -> bool {
+		let fd = match self.open_proc_file(c"syscall", libc::O_RDONLY | libc::O_CLOEXEC) {
+			Ok(fd) => fd,
+			Err(_) => return true,
+		};
+		let mut f = std::fs::File::from(fd);
+		let mut s = String::new();
+		if f.read_to_string(&mut s).is_err() {
+			return true;
+		}
+		let Some(first) = s.split_whitespace().next() else {
+			return true;
+		};
+		match first.parse::<i64>() {
+			// In a syscall: in-flight iff it's chdir/fchdir.
+			Ok(nr) => chdir_syscall_nrs().contains(&nr),
+			// "running" (userspace) or anything unparseable: not in chdir.
+			Err(_) => false,
+		}
+	}
+}
+
+/// Remove "useless" bind-mount entries from a *policy* tree in place: a
+/// bind mount whose attributes match the nearest covering parent mount and
+/// which exposes exactly the host subtree that parent already exposes
+/// (`host_path == parent_host + suffix`) is redundant, since the parent
+/// bind already makes that subtree visible with the same permissions.
+///
+/// This is applied to the saved policy by the policy-mutating entry points
+/// (`add_/remove_/update_*`) so stray redundant mounts (e.g. a per-request
+/// leaf that a broader grant later subsumed) don't accumulate.  It is
+/// deliberately *not* applied on the `chdir` path, whose temporary cwd
+/// mount is redundant by this very definition yet must be materialised.
+fn prune_useless_mounts(policy: &mut FsTree<ManagedTreeEntry>) {
+	let mut to_remove: Vec<OsString> = Vec::new();
+	policy.fold_top_down_from(
+		|path, entry, covering: Option<(Vec<u8>, Vec<u8>, MountAttributes)>| match entry {
+			ManagedTreeEntry::Placeholder(_) => covering,
+			ManagedTreeEntry::BindMount(mp) => {
+				if let Some((ref par_sb, ref par_host, par_attrs)) = covering {
+					let expected_host = join_host_suffix(par_host, par_sb, path.as_encoded_bytes());
+					if mp.attrs == par_attrs && mp.host_path.to_bytes() == expected_host.as_slice()
+					{
+						// Redundant: drop it, but keep the same covering mount
+						// for descendants (it renders identically).
+						to_remove.push(path.to_owned());
+						return covering;
+					}
+				}
+				Some((
+					path.as_encoded_bytes().to_vec(),
+					mp.host_path.to_bytes().to_vec(),
+					mp.attrs,
+				))
+			}
+		},
+		None,
+		OsStr::new("/"),
+	);
+	for p in to_remove {
+		policy.remove(&p);
 	}
 }
 
@@ -1991,6 +2194,14 @@ fn print_tree<T: std::fmt::Debug>(label: &str, tree: &FsTree<T>) {
 #[derive(Debug)]
 pub struct ManagedBindMountSandbox {
 	sandbox: BindMountSandbox,
+	/// The desired policy: the source of truth for what *should* be
+	/// mounted.  Mutated by `add_/remove_/update_*` and diffed against the
+	/// live state by `reconcile`.  Kept separate from the live trees below
+	/// (which reflect what is *actually* mounted) so transient mounts that
+	/// are reconciled in but never part of the policy - notably `chdir`
+	/// cwd mounts (§11.5) - are naturally cleaned up on a later reconcile
+	/// instead of lingering forever.
+	current_policy: Mutex<FsTree<ManagedTreeEntry>>,
 	current_placeholder_tree: Mutex<FsTree<ManagedPlaceholder>>,
 	current_mount_tree: Mutex<FsTree<MountInternal>>,
 }
@@ -1999,6 +2210,7 @@ impl ManagedBindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
 		Ok(Self {
 			sandbox: BindMountSandbox::new(disable_userns)?,
+			current_policy: Mutex::new(FsTree::new()),
 			current_placeholder_tree: Mutex::new(FsTree::new()),
 			current_mount_tree: Mutex::new(FsTree::new()),
 		})
@@ -2029,11 +2241,33 @@ impl ManagedBindMountSandbox {
 	) -> Result<(), BindMountSandboxError> {
 		debug!("add_or_update_entry: path={:?}, entry={:?}", path, entry);
 		Self::check_path_no_nul(path)?;
-		let (mut pt, mut mt) = self.lock_trees();
-		let mut desired_entries = self.entries_from_state(&pt, &mt);
-		desired_entries.insert(path, entry);
-		let errors = self.reconcile(&mut pt, &mut mt, &desired_entries);
+		let (mut policy, mut pt, mut mt) = self.lock_trees();
+		policy.insert(path, entry);
+		prune_useless_mounts(&mut policy);
+		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
 		Self::error_for_path(errors, path)
+	}
+
+	/// Reconcile a *transient* `chdir` cwd mount at `target` for the thread
+	/// `pidfd`, without persisting it to the policy (§11.5).  The mount is
+	/// force-materialised even though it mirrors its covering parent (and so
+	/// would be pruned as "useless"), and is tagged with `pidfd` so a later
+	/// reconcile keeps it alive only while that thread's cwd still needs it.
+	fn reconcile_chdir(
+		&self,
+		target: &OsStr,
+		mp: ManagedMountPoint,
+		pidfd: Arc<ProcPidFd>,
+	) -> Result<(), BindMountSandboxError> {
+		Self::check_path_no_nul(target)?;
+		let (policy, mut pt, mut mt) = self.lock_trees();
+		let errors = self.reconcile(
+			&mut pt,
+			&mut mt,
+			&policy,
+			Some((target.to_owned(), mp, pidfd)),
+		);
+		Self::error_for_path(errors, target)
 	}
 
 	/// Pick out the reconcile error (if any) that relates to `path`,
@@ -2071,10 +2305,10 @@ impl ManagedBindMountSandbox {
 	/// Remove either the placeholder or mount entry at the given path.
 	pub fn remove_entry(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
 		Self::check_path_no_nul(path)?;
-		let (mut pt, mut mt) = self.lock_trees();
-		let mut desired_entries = self.entries_from_state(&pt, &mt);
-		desired_entries.remove(path);
-		let errors = self.reconcile(&mut pt, &mut mt, &desired_entries);
+		let (mut policy, mut pt, mut mt) = self.lock_trees();
+		policy.remove(path);
+		prune_useless_mounts(&mut policy);
+		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
 		Self::error_for_path(errors, path)
 	}
 
@@ -2086,8 +2320,10 @@ impl ManagedBindMountSandbox {
 		&self,
 		desired_tree: &FsTree<ManagedTreeEntry>,
 	) -> Result<(), BindMountSandboxError> {
-		let (mut pt, mut mt) = self.lock_trees();
-		let errors = self.reconcile(&mut pt, &mut mt, desired_tree);
+		let (mut policy, mut pt, mut mt) = self.lock_trees();
+		*policy = desired_tree.clone();
+		prune_useless_mounts(&mut policy);
+		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
 		// A bulk update has no single "target" path, so surface the
 		// first error encountered (all are logged by `reconcile`).
 		match errors.into_iter().next() {
@@ -2133,10 +2369,15 @@ impl ManagedBindMountSandbox {
 	fn lock_trees(
 		&self,
 	) -> (
+		std::sync::MutexGuard<'_, FsTree<ManagedTreeEntry>>,
 		std::sync::MutexGuard<'_, FsTree<ManagedPlaceholder>>,
 		std::sync::MutexGuard<'_, FsTree<MountInternal>>,
 	) {
 		// Always acquire in the same order to avoid deadlocks.
+		let policy = self
+			.current_policy
+			.lock()
+			.expect("current_policy lock poisoned");
 		let pt = self
 			.current_placeholder_tree
 			.lock()
@@ -2145,26 +2386,7 @@ impl ManagedBindMountSandbox {
 			.current_mount_tree
 			.lock()
 			.expect("current_mount_tree lock poisoned");
-		(pt, mt)
-	}
-
-	/// Reconstruct an entry tree from the current internal state.  Mount
-	/// entries take precedence over placeholders at the same path
-	/// (they share the path when we created a placeholder under a
-	/// mount).
-	fn entries_from_state(
-		&self,
-		pt: &FsTree<ManagedPlaceholder>,
-		mt: &FsTree<MountInternal>,
-	) -> FsTree<ManagedTreeEntry> {
-		let mut out = FsTree::new();
-		pt.walk_top_down(|path, ph| {
-			out.insert(path, ManagedTreeEntry::Placeholder(ph.clone()));
-		});
-		mt.walk_top_down(|path, mp| {
-			out.insert(path, ManagedTreeEntry::BindMount(mp.user.clone()));
-		});
-		out
+		(policy, pt, mt)
 	}
 
 	/// Reconcile current state with `desired_entries`.  Caller locks the
@@ -2194,8 +2416,19 @@ impl ManagedBindMountSandbox {
 		current_pt: &mut FsTree<ManagedPlaceholder>,
 		current_mt: &mut FsTree<MountInternal>,
 		desired_entries: &FsTree<ManagedTreeEntry>,
+		chdir_mount: Option<(OsString, ManagedMountPoint, Arc<ProcPidFd>)>,
 	) -> Vec<(OsString, BindMountSandboxError)> {
-		let (desired_pt, desired_mt, mut errors) = self.build_desired_trees(desired_entries);
+		let (desired_pt, mut desired_mt, mut errors) = self.build_desired_trees(desired_entries);
+		if let Some((ref path, ref mp, _)) = chdir_mount {
+			// Force-add the transient cwd mount, bypassing the useless-mount
+			// merge in `build_desired_trees`: a chdir mount mirrors its
+			// covering parent (so it *is* "useless" by that test) yet must be
+			// materialised so a later attribute change can reach the pinned
+			// cwd (§11.5).  It lives under an existing covering mount, so the
+			// mountpoint dentry comes from that mount's host fs - no extra
+			// placeholder is needed.
+			desired_mt.insert(path.as_os_str(), mp.clone());
+		}
 		print_tree("Current placeholder tree", current_pt);
 		print_tree("Desired placeholder tree", &desired_pt);
 		print_tree("Current mount tree", current_mt);
@@ -2269,6 +2502,23 @@ impl ManagedBindMountSandbox {
 							new_mt.remove(sandbox_path);
 							return;
 						}
+						// §11.5: a mount that still backs a live thread's cwd
+						// (notably a transient `chdir` mount) must not be
+						// unmounted yet.  Prune holders that have died or moved
+						// away; if any survive (alive and either mid-`chdir` or
+						// with their cwd still here), keep the mount with the
+						// pruned holder list and defer removal to a later
+						// reconcile.  Ordinary policy mounts have an empty
+						// `cwd_of` and skip straight to the unmount below.
+						if !old.cwd_of.is_empty() {
+							let survivors = self.retained_cwd_holders(&old.cwd_of, sandbox_path);
+							let entry = new_mt.get_mut(sandbox_path).expect("must exist");
+							if !survivors.is_empty() {
+								entry.cwd_of = survivors;
+								return;
+							}
+							entry.cwd_of.clear();
+						}
 						// discover the direct (topmost) sub-mounts
 						// still present under this path in the live tree
 						// and hand them to the unmount routine, which
@@ -2338,6 +2588,7 @@ impl ManagedBindMountSandbox {
 							MountInternal {
 								user: (*new).clone(),
 								mnt_id,
+								cwd_of: Vec::new(),
 							},
 						);
 					}
@@ -2360,6 +2611,18 @@ impl ManagedBindMountSandbox {
 			|_, old, new| old.user.host_path != new.host_path,
 			false,
 		);
+
+		// Tag the (now-materialised) cwd mount with its holding thread so a
+		// later reconcile can tell it still backs a live cwd.  Covers both the
+		// freshly-`Added` case and a repeat/concurrent chdir to a target that
+		// already had a mount (which produces no diff).
+		if let Some((path, _, pidfd)) = chdir_mount {
+			if let Some(entry) = new_mt.get_mut(path.as_os_str()) {
+				if !entry.cwd_of.iter().any(|p| p.tid() == pidfd.tid()) {
+					entry.cwd_of.push(pidfd);
+				}
+			}
+		}
 
 		// Phase 3: remove placeholders no longer desired (bottom-up).
 		current_pt.diff(
@@ -2516,6 +2779,63 @@ impl ManagedBindMountSandbox {
 			}
 		});
 		best.unwrap_or_else(MountAttributes::ro)
+	}
+
+	/// Of the threads recorded as backing the cwd mount at `target`, return
+	/// those that still need it.  A holder is retained iff it is alive and
+	/// either currently mid-`chdir`/`fchdir` (its move onto `target` may not
+	/// have landed yet) or its cwd is still `target`; a dead or moved-away
+	/// holder is dropped.
+	///
+	/// The two reads are ordered `syscall` *before* `cwd` on purpose: if we
+	/// read `cwd != target` first and the chdir then landed before we read
+	/// `syscall`, both checks would say "gone" and we'd unmount the cwd the
+	/// thread just landed on.  Reading `syscall` first means a `not in
+	/// chdir` result guarantees the in-flight chdir has fully returned, so
+	/// the subsequent `cwd` read reflects its final, stable result.
+	fn retained_cwd_holders(
+		&self,
+		holders: &[Arc<ProcPidFd>],
+		target: &OsStr,
+	) -> Vec<Arc<ProcPidFd>> {
+		let target_bytes = target.as_encoded_bytes();
+		let mut out = Vec::new();
+		for h in holders {
+			match h.is_alive() {
+				Ok(false) => continue, // dead -> drop
+				Ok(true) => {}
+				Err(e) => {
+					// Can't determine liveness: keep conservatively.
+					debug!(
+						"retained_cwd_holders: liveness check failed for tid {}: {} - keeping",
+						h.tid(),
+						e
+					);
+					out.push(h.clone());
+					continue;
+				}
+			}
+			// READ ORDER IS LOAD-BEARING: syscall before cwd (see doc above).
+			if h.in_chdir_syscall() {
+				out.push(h.clone());
+				continue;
+			}
+			match h.cwd() {
+				Ok(cwd) if cwd.as_encoded_bytes() == target_bytes => out.push(h.clone()),
+				Ok(_) => { /* moved away -> drop */ }
+				Err(e) => {
+					// cwd unreadable (e.g. a race with exit): keep
+					// conservatively; a later reconcile will catch the death.
+					debug!(
+						"retained_cwd_holders: cwd read failed for tid {}: {} - keeping",
+						h.tid(),
+						e
+					);
+					out.push(h.clone());
+				}
+			}
+		}
+		out
 	}
 
 	pub fn check_covered<'a>(

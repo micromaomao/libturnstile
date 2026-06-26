@@ -66,13 +66,44 @@ privileges to peel back that bind mount.  `m1_scratch_fd` resolves to the
 scratch from the supervisor side and is the dirfd we use when parking
 mounts.
 
-### 2. Unified mount tree
+### 2. Policy vs. live state, and the unified mount tree
+
+`ManagedBindMountSandbox` keeps the **desired policy** explicitly, separate
+from the **live state**:
+
+- `current_policy: Mutex<FsTree<ManagedTreeEntry>>` — the source of truth
+  for what *should* be mounted.  `add_/remove_/update_*` mutate or replace
+  it (and prune redundant mounts from it, see below); each then reconciles
+  the live state against it.
+- `current_placeholder_tree` / `current_mount_tree` — what is *actually*
+  mounted right now.
+
+Keeping the policy explicit (rather than reconstructing a "desired" tree
+from the live state) is what lets a *transient* mount be reconciled in
+without becoming permanent: a `chdir` cwd mount (§11.5) is materialised in
+`current_mount_tree` but never written to `current_policy`, so the very
+next reconcile sees it as not-desired and is free to reclaim it once the
+app no longer needs it.  Without this split (the previous "rebuild desired
+from live state" approach) such a mount would be indistinguishable from a
+policy entry and would linger forever — especially in `--permissive` mode,
+where the bin keeps no policy of its own.
+
+**Pruning redundant mounts.**  Before each policy-saving reconcile, the
+policy is run through `prune_useless_mounts`: a bind mount whose attrs
+match its nearest covering parent mount and whose `host_path` is exactly
+`parent_host + suffix` is redundant (the parent bind already exposes that
+subtree identically) and is dropped, so stray per-request leaves a broader
+grant later subsumed don't accumulate.  This prune is deliberately **not**
+applied on the `chdir` path, whose cwd mount is redundant by this very
+definition yet must be materialised.
 
 `current_mount_tree: Mutex<FsTree<MountInternal>>` holds every active
 bind mount.  Each reconcile decides what to do with each entry by
 diffing against the desired tree; the kernel's `EBUSY` on a
-non-`MNT_DETACH` `umount2` is the source of truth on whether an entry
-is still in use.
+non-`MNT_DETACH` `umount2` remains the ultimate source of truth on
+whether an entry is still in use (the §11.5 cwd-holder check is an
+optimisation layered on top to avoid attempting — and logging — an
+`EBUSY` umount on a mount we already know still backs a live cwd).
 
 ```rust
 struct MountInternal {
@@ -84,6 +115,12 @@ struct MountInternal {
     expired: bool,            // set by refresh when mountinfo shows the bind
                               // source as `//deleted`; forces umount-and-readd
                               // on the next reconcile if still desired.
+    cwd_of: Vec<Arc<ProcPidFd>>, // threads (/proc/<tid> handles) whose cwd
+                              // this mount was created to back (§11.5);
+                              // empty for ordinary policy mounts.  A Removed
+                              // reconcile defers unmount while any holder is
+                              // still alive and either mid-chdir or with its
+                              // cwd still here.
     // No cached mount fd — see §9.
 }
 ```
@@ -225,6 +262,17 @@ desired tree is simply removed by its own op later (its mount is still in
 `new_mt` until then).  An app-held `P` is kept and locked down via
 `SetAttrToCovering`; a later reconcile retries once the app lets go
 (eventual consistency).
+
+**cwd-holder short-circuit.**  Before attempting the `umount`, if `P`'s
+`MountInternal.cwd_of` is non-empty (a `chdir` cwd mount, §11.5), the
+still-live holders are re-evaluated (`retained_cwd_holders`): a holder is
+kept iff it is alive and either currently mid-`chdir`/`fchdir` or its cwd
+is still `P`; dead / moved-away holders are dropped.  If any holder
+survives, `P` is kept with the pruned `cwd_of` and the `umount` is skipped
+entirely (no EBUSY, no log noise); a later reconcile re-checks.  Only once
+the holder list empties does the normal `Unmount` run — and the
+`SetAttrToCovering`-on-EBUSY path above still backstops the corner case
+where a holder thread died but a CLONE_FS sibling keeps the cwd alive.
 
 **Optional optimisations** (neither needed for correctness):
 
@@ -487,12 +535,45 @@ preemptive mounts are `chdir` targets, whose existence the app already
 established (else its chdir would have ENOENT'd before reaching
 seccomp).
 
-Impact: cwd churn (`cd a; cd b; cd c`) accumulates a mount per target.
-These are **not** reclaimed automatically — there is no background GC.
-A mount is only removed when the caller updates the desired tree to drop
-it and triggers a reconcile, at which point the diff finds it present in
-`current_mt` but absent from the desired tree and emits an `Unmount` for
-it (which still succeeds only once the app's cwd / fds let go).
+**The cwd mount is transient, not policy.**  It is reconciled in via a
+dedicated path (`reconcile_chdir`) that injects it into the desired mount
+tree *without* writing it to `current_policy` and *without* the
+useless-mount prune (the cwd mount mirrors its covering parent, so the
+prune would otherwise drop it; see §2).  The mount records the issuing
+**thread** as a holder in its `cwd_of` (an `Arc<ProcPidFd>` — an `O_PATH`
+handle on `/proc/<tid>`; cwd is per-thread, so the holder is the *tid*,
+not the tgid).  Because it is absent from the policy, every subsequent
+reconcile emits `Removed` for it and re-evaluates the holders (§6), so it
+is reclaimed automatically once no live thread needs it — no background GC
+thread, and no reliance on the caller dropping it.
+
+**Reclaiming without a race.**  After CONTINUE there is a window before
+the kernel actually updates `fs_struct.pwd`, during which `/proc/<tid>/cwd`
+still reads the *old* directory — indistinguishable, by `cwd` alone, from
+a thread that has already moved away.  `retained_cwd_holders` closes this
+by reading `/proc/<tid>/syscall` **before** `/proc/<tid>/cwd`:
+
+- holder dead (`/proc/<tid>` dentry invalidated) → drop it;
+- holder **in a `chdir`/`fchdir` syscall** → keep (its move onto the
+  target may still be in flight).  An unreadable `syscall` is treated
+  conservatively as in-flight;
+- otherwise the just-CONTINUE'd chdir has provably returned, so the
+  subsequent `cwd` read is its final, stable result: keep iff `cwd ==
+  target`, else drop.
+
+Reading `syscall` first is load-bearing: with the opposite order a chdir
+landing *between* the two reads would make both say "gone" and we'd
+unmount the cwd the thread just landed on.  And because reconcile holds
+the tree lock, any racing fresh `chdir(target)` must re-enter
+`reconcile_chdir` (which re-creates the mount before its own CONTINUE), so
+even a transient removal can't strand it.
+
+This is purely an optimisation over the EBUSY signal: a holder we wrongly
+keep just defers reclamation by one reconcile, and a holder we (correctly)
+drop while the app still pins the path falls back to the §6
+`SetAttrToCovering`-on-EBUSY keep.  The one bounded residual: a thread
+that does a `chdir` and then never traps again (e.g. blocks forever)
+leaves its cwd mount alive until the thread exits.
 
 #### 11.6  `execve` and `mmap(PROT_EXEC)`
 
@@ -524,13 +605,17 @@ it (which still succeeds only once the app's cwd / fds let go).
 
 #### 11.7 No "interactions tree"
 
-There is no separate interaction-tracking state.  The only
-mount-related state besides the policy is `current_mount_tree`.  When
-the bin wants a mount in response to a request, it calls
-`update_from_tree` / `update_from_list` between `yield_request` and
+There is no separate interaction-tracking state.  The mount-related state
+is the explicit policy (`current_policy`) plus the live trees
+(`current_placeholder_tree` / `current_mount_tree`); the only per-mount
+bookkeeping beyond the user-facing fields is `mnt_id` and the `cwd_of`
+holder list (§2).  When the bin wants a mount in response to a request, it
+calls `update_from_tree` / `update_from_list` between `yield_request` and
 `allow`/`deny`.  fd staleness is handled orthogonally by the
 upgrade-in-`allow()` machinery.  The sole exception is `chdir`/`fchdir`
-(§11.5), where the library must act before letting the syscall through.
+(§11.5), where the library must act before letting the syscall through —
+adding the transient cwd mount via `reconcile_chdir`, which does *not*
+touch `current_policy`.
 
 ## 12. Syscalls that the bind-mount layout could corrupt
 
@@ -691,10 +776,13 @@ suffices — no mount privilege needed); or an earlier
 2. **Scratch parking briefly breaks `..` from inside a parked mount.**
    The library does not service notify requests during the parking
    window (reconcile holds the tree lock).
-3. **`fs.mount-max` bounds accumulated mounts.**  No GC thread.  A
-   mount is freed only when the caller drops it from the desired tree
-   and a reconcile emits an `Unmount` for it; until then (e.g. churned
-   `chdir` targets) it stays in `current_mt`.
+3. **`fs.mount-max` bounds accumulated mounts.**  No GC thread.  Policy
+   mounts are freed only when the caller drops them from the desired tree
+   and a reconcile emits an `Unmount`.  Transient `chdir` cwd mounts *are*
+   reclaimed automatically (they're never in the policy, so each reconcile
+   re-evaluates them against their `cwd_of` holders, §11.5) — except the
+   bounded residual of a thread that `chdir`s and then never traps again,
+   whose last cwd mount stays in `current_mt` until the thread exits.
 4. **Exec via pre-grant held fds.**  `fexecve(fd)` / `execveat(fd, "",
    AT_EMPTY_PATH)` / `mmap(PROT_EXEC, fd, …)` check `path_noexec` against
    the fd's mount; if it was `noexec` at open time and exec was granted
@@ -756,11 +844,24 @@ suffices — no mount privilege needed); or an earlier
   RequestHandle)`.
 - `RequestHandle::allow()` dispatches per §11.2; `deny(errno)` sends an
   error.
+- Holds `current_policy: Mutex<FsTree<ManagedTreeEntry>>` (the desired
+  state) separate from the live `current_placeholder_tree` /
+  `current_mount_tree` (§2).
 - `current_mount_tree` value type → `MountInternal` (`mnt_id`,
-  `expired`).
-- `update_from_tree` / `update_from_list`: same signatures; internally
-  refresh from mountinfo before diffing.
-- `reconcile`: rewritten as plan-then-execute.
+  `expired`, `cwd_of: Vec<Arc<ProcPidFd>>`).
+- `add_/remove_/update_*`: mutate / replace `current_policy`, run
+  `prune_useless_mounts` on it, then `reconcile` against it.  (Will also
+  refresh from mountinfo before diffing once §13 lands.)
+- `reconcile(current_pt, current_mt, desired_entries, chdir_mount)`:
+  rewritten as plan-then-execute; takes an optional `chdir_mount`
+  (`(path, ManagedMountPoint, Arc<ProcPidFd>)`) that is force-injected
+  into the desired mount tree (bypassing the useless-mount prune) and
+  whose holder is attached to the materialised mount's `cwd_of`.
+- `reconcile_chdir(target, mp, pidfd)`: the `chdir`-only entry point —
+  reconciles against the *unmodified* saved policy plus the injected cwd
+  mount, persisting nothing to the policy (§11.5).
+- `retained_cwd_holders(holders, target)`: prunes a `cwd_of` list,
+  reading `/proc/<tid>/syscall` before `/proc/<tid>/cwd` (§11.5).
 - New `FsTree` helper:
   ```rust
   // Walk data entries under `root` top-down.  With `topmost_only`, stop
@@ -769,6 +870,14 @@ suffices — no mount privilege needed); or an earlier
   // otherwise visit every data entry in the subtree.
   pub fn walk_subtree_top_down<F>(&self, root: &OsStr, topmost_only: bool, f: F);
   ```
+
+### `ProcPidFd`
+
+- An `O_PATH` handle on `/proc/<tid>` (a *thread*), reuse-safe: once the
+  task exits, `openat` / `readlinkat` through it fail `ENOENT`/`ESRCH`.
+- `from_tid(tid)`, `is_alive()`, `cwd()` (readlinkat `cwd`),
+  `in_chdir_syscall()` (parse the first token of `syscall`; unreadable →
+  conservatively `true`).  Used by the §11.5 cwd-mount lifecycle.
 
 ### `ForeignFd`
 
