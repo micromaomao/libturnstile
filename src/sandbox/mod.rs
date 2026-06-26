@@ -1493,6 +1493,7 @@ pub enum ManagedTreeEntry {
 }
 
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "snake_case"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedPlaceholder {
 	Dir(PlaceholderDirData),

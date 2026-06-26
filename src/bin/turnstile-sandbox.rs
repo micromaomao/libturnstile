@@ -5,7 +5,7 @@ use std::{
 	fmt::write,
 	io::{self, Write},
 	os::{
-		fd::AsRawFd,
+		fd::{AsRawFd, BorrowedFd},
 		unix::{ffi::OsStrExt, process::CommandExt},
 	},
 	path::PathBuf,
@@ -20,10 +20,10 @@ use libturnstile::{
 	AccessRequestError, BindMountSandbox, BindMountSandboxError, CommonPlaceholderData,
 	ManagedBindMountSandbox, ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry,
 	MountAttributes, PlaceholderDirData, PlaceholderFileData, PlaceholderSymlinkData,
-	TracerOptions, TurnstileTracer,
+	RequestContext, TracerOptions, TurnstileTracer,
 	access::{
-		Operation,
-		fs::{ForeignFd, FsOperation, RwxPermission},
+		AccessRequest, Operation,
+		fs::{ForeignFd, FsOperation, FsTarget, RwxPermission},
 	},
 	fstree::FsTree,
 };
@@ -31,6 +31,7 @@ use log::{debug, error, info};
 
 use crate::common::{ProcPidFd, handle_child_result};
 use crate::config::Config;
+use crate::prompter::{Action, PrompterRequest, PrompterResponse, run_prompter};
 
 mod common;
 mod config;
@@ -90,6 +91,32 @@ struct Context {
 	pidfd: OnceLock<ProcPidFd>,
 	should_exit: AtomicBool,
 	permissive: bool,
+	/// If set, on otherwise-denied access requests the sandbox launches
+	/// this program and lets it decide what to do.  See
+	/// [`prompter`](crate::prompter).  Mutually exclusive with
+	/// `permissive`.
+	prompter: Option<String>,
+	/// Path to the config file, forwarded to the prompter and used when
+	/// it requests a config reload.
+	config_path: PathBuf,
+	/// The original command line used to launch this sandbox, forwarded
+	/// to the prompter.
+	sandbox_cmd: Vec<String>,
+	/// Randomly generated ID identifying this sandbox instance, forwarded
+	/// to the prompter so it can group requests coming from the same
+	/// sandbox.
+	sandbox_id: u64,
+}
+
+/// Generate a random `u64` to identify this sandbox instance using
+/// `getrandom()`.
+fn random_sandbox_id() -> u64 {
+	let mut buf = [0u8; 8];
+	let ret = unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+	if ret != buf.len() as isize {
+		panic!("getrandom failed: {}", io::Error::last_os_error());
+	}
+	u64::from_ne_bytes(buf)
 }
 
 /// Stat `host_path` (no symlink following) and build a ManagedPlaceholder
@@ -367,6 +394,213 @@ fn inherit_attrs_to_descendants(
 	}
 }
 
+/// (Re)load the user config file referenced by `context.config_path` and
+/// apply it to the sandbox, replacing the current mount/placeholder set.
+/// Used both at startup and when a prompter requests a config reload.
+fn load_config_into_sandbox(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
+	let cfg = Config::load(&context.config_path)?;
+	let resolved_entries = cfg.parse_entries()?;
+	if resolved_entries.is_empty() {
+		info!(
+			"config file {:?} has no rules; sandbox will start empty",
+			context.config_path
+		);
+	}
+	let mut entries: Vec<(&OsStr, ManagedTreeEntry)> = Vec::with_capacity(resolved_entries.len());
+	for e in &resolved_entries {
+		let entry = match e.mount {
+			Some(ref m) => ManagedTreeEntry::BindMount(m.clone()),
+			None => {
+				let p = build_resolve_placeholder(
+					e.placeholder_host_path
+						.as_deref()
+						.expect("placeholder_host_path must be non-empty when mount is None"),
+				)?;
+				ManagedTreeEntry::Placeholder(p)
+			}
+		};
+		entries.push((e.sandbox_path.as_os_str(), entry));
+	}
+	context.sandbox.update_from_list(entries)?;
+	Ok(())
+}
+
+/// Build a [`PrompterRequest`] describing the access request and run the
+/// configured prompter program, returning its decision.  Returns `None`
+/// if the prompter could not be launched or its response could not be
+/// parsed (in which case the caller should fail the syscall safely).
+fn prompt_for_request(
+	context: &Context,
+	program: &str,
+	req_ctx: &mut RequestContext,
+	access_request: &AccessRequest,
+	rwx_permissions: Vec<RwxPermission>,
+) -> Option<PrompterResponse> {
+	let pid = req_ctx.pid();
+	let request_comm = req_ctx
+		.comm()
+		.map(|c| c.to_string_lossy().into_owned())
+		.unwrap_or_default();
+	// Open an O_PATH fd to /proc/<pid> for the prompter so it can inspect
+	// the requesting process.  Passed to the child by clearing CLOEXEC in
+	// `run_prompter`.
+	let proc_fd = unsafe {
+		libc::open(
+			format!("/proc/{pid}\0").as_ptr() as *const libc::c_char,
+			libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+		)
+	};
+	let pidfd = if proc_fd >= 0 {
+		Some(proc_fd as u32)
+	} else {
+		debug!(
+			"could not open /proc/{} to pass to prompter: {}",
+			pid,
+			io::Error::last_os_error()
+		);
+		None
+	};
+	let request = PrompterRequest {
+		sandbox_id: context.sandbox_id,
+		sandbox_cmd: context.sandbox_cmd.clone(),
+		request_pid: pid as u32,
+		request_comm,
+		access_request: access_request.clone(),
+		pidfd,
+		rwx_permissions,
+		config_path: context.config_path.to_string_lossy().into_owned(),
+	};
+	let pass_fd = (proc_fd >= 0).then(|| unsafe { BorrowedFd::borrow_raw(proc_fd) });
+	if req_ctx.still_valid().ok() != Some(true) {
+		debug!("request is no longer valid; not prompting");
+		if proc_fd >= 0 {
+			unsafe {
+				libc::close(proc_fd);
+			}
+		}
+		return None;
+	}
+	let response = match run_prompter(program, &request, pass_fd) {
+		Ok(r) => Some(r),
+		Err(e) => {
+			error!("error running prompter {:?}: {}", program, e);
+			None
+		}
+	};
+	if proc_fd >= 0 {
+		unsafe {
+			libc::close(proc_fd);
+		}
+	}
+	response
+}
+
+/// Apply the side effects requested by a [`PrompterResponse`]: an
+/// optional config reload, added mounts and placeholders, and the
+/// symlink-mirroring / descendant-widening conveniences.  The
+/// syscall-level decision in `response.action` is handled by the caller.
+fn apply_prompter_response(context: &Context, response: &PrompterResponse, t_local: &FsTarget) {
+	if response.reload_config {
+		match load_config_into_sandbox(context) {
+			Ok(()) => debug!("prompter: reloaded config from {:?}", context.config_path),
+			Err(e) => error!("prompter: error reloading config: {}", e),
+		}
+	}
+
+	for m in &response.add_mounts {
+		let mount_bytes = m.mount_point.as_bytes();
+		debug!(
+			"prompter: adding mount at {:?} -> {:?} (ro={}, noexec={})",
+			m.mount_point, m.mount.host_path, m.mount.attrs.readonly, m.mount.attrs.noexec
+		);
+		match context
+			.sandbox
+			.add_or_update_mount(OsStr::from_bytes(mount_bytes), m.mount.clone())
+		{
+			Ok(()) => {
+				if response.auto_widen_descendant_permissions {
+					match CString::new(mount_bytes.to_vec()) {
+						Ok(c) => inherit_attrs_to_descendants(&context.sandbox, &c, m.mount.attrs),
+						Err(_) => error!(
+							"prompter: mount point {:?} contains a NUL byte",
+							m.mount_point
+						),
+					}
+				}
+			}
+			Err(e) => error!("prompter: error adding mount at {:?}: {}", m.mount_point, e),
+		}
+	}
+
+	for p in &response.add_placeholders {
+		// `match_host` and an explicit placeholder are mutually
+		// exclusive; exactly one must be provided.
+		let placeholder = match (p.match_host, &p.placeholder) {
+			(true, Some(_)) => {
+				error!(
+					"prompter: placeholder add for {:?} sets both match_host and an explicit \
+					 placeholder; skipping",
+					p.path
+				);
+				continue;
+			}
+			(false, None) => {
+				error!(
+					"prompter: placeholder add for {:?} sets neither match_host nor an explicit \
+					 placeholder; skipping",
+					p.path
+				);
+				continue;
+			}
+			(true, None) => {
+				let host_path = match CString::new(p.path.as_bytes().to_vec()) {
+					Ok(c) => c,
+					Err(_) => {
+						error!(
+							"prompter: placeholder path {:?} contains a NUL byte",
+							p.path
+						);
+						continue;
+					}
+				};
+				match build_resolve_placeholder(&host_path) {
+					Ok(ph) => ph,
+					Err(e) => {
+						error!(
+							"prompter: error building match_host placeholder for {:?}: {}",
+							p.path, e
+						);
+						continue;
+					}
+				}
+			}
+			(false, Some(ph)) => ph.clone(),
+		};
+		debug!(
+			"prompter: adding placeholder at {:?}: {:?}",
+			p.path, placeholder
+		);
+		if let Err(e) = context
+			.sandbox
+			.add_or_update_placeholder(OsStr::from_bytes(p.path.as_bytes()), placeholder)
+		{
+			error!("prompter: error adding placeholder at {:?}: {}", p.path, e);
+		}
+	}
+
+	if response.auto_add_symlinks {
+		debug!("prompter: auto-adding symlinks for requested path");
+		if let Err(e) = create_symlinks_for_user_path(
+			&context.sandbox,
+			t_local.dfd(),
+			t_local.path(),
+			!t_local.no_follow(),
+		) {
+			debug!("prompter: could not mirror symlinks: {}", e);
+		}
+	}
+}
+
 fn tracing_thread(context: &'static Context) {
 	if let Err(e) = context.tracer.receive_notify_fd() {
 		error!("error receiving notify fd: {}", e);
@@ -391,6 +625,12 @@ fn tracing_thread(context: &'static Context) {
 			Ok(Some((request, mut req_ctx))) => {
 				debug!("got request: {:?}", request);
 				let mut send_eperm = false;
+				// Set to the errno the prompter asked us to fail the
+				// syscall with, if any.
+				let mut send_errno: Option<i32> = None;
+				// Set once we have prompted for this syscall, so we do not
+				// prompt again for its remaining permissions.
+				let mut prompted = false;
 				// Set when we cannot evaluate the request at all (e.g.
 				// request is for an anonymous pipe or socket)
 				let mut force_continue = false;
@@ -401,7 +641,7 @@ fn tracing_thread(context: &'static Context) {
 							debug!("request is no longer valid");
 							continue;
 						}
-						for rwxp in rwxps {
+						for rwxp in &rwxps {
 							macro_rules! check_req_valid {
 								() => {
 									if req_ctx.still_valid().ok() != Some(true) {
@@ -542,13 +782,53 @@ fn tracing_thread(context: &'static Context) {
 										} else {
 											add_placeholder = true;
 										}
+									} else if let Some(program) = &context.prompter {
+										// Ask the prompter what to do.  We prompt at
+										// most once per syscall, sending all of its
+										// rwx permissions; the mounts / placeholders
+										// the prompter adds may then also cover the
+										// remaining permissions of this same syscall.
+										if !prompted {
+											prompted = true;
+											match prompt_for_request(
+												context,
+												program,
+												&mut req_ctx,
+												&request,
+												rwxps.to_vec(),
+											) {
+												Some(response) => {
+													apply_prompter_response(
+														context, &response, &t_local,
+													);
+													match response.action {
+														// Allow the syscall; the
+														// applied mounts /
+														// placeholders provide the
+														// granted access.
+														Action::Continue(_) => {}
+														Action::SendError(errno) => {
+															send_errno = Some(errno);
+															break;
+														}
+													}
+												}
+												None => {
+													// Prompter failed; fail the
+													// syscall safely with EPERM.
+													send_eperm = true;
+													break;
+												}
+											}
+										}
 									} else {
-										// Not covered and not in permissive mode -
-										// send a eperm so that the process doesn't
-										// get ENOENT or EROFS instead.  (This denial
-										// is not for security).  Also, don't add
-										// symlinks to avoid exposing symlink data
-										// which the user does not intend to expose.
+										// Not covered and neither permissive nor a
+										// prompter is configured - send an EPERM so
+										// the process doesn't get ENOENT or EROFS
+										// instead.  (This denial is not for
+										// security).  Also, don't add symlinks to
+										// avoid exposing symlink data which the user
+										// does not intend to expose.
 										send_eperm = true;
 									}
 								}
@@ -674,7 +954,9 @@ fn tracing_thread(context: &'static Context) {
 				// the traced process's fd view on allow, or fails the
 				// syscall on deny.
 				let handle = context.sandbox.new_request_handle(request, req_ctx);
-				let res = if send_eperm {
+				let res = if let Some(errno) = send_errno {
+					handle.deny(errno)
+				} else if send_eperm {
 					handle.deny(libc::EPERM)
 				} else {
 					handle.allow()
@@ -771,6 +1053,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	let cli = Cli::parse();
 
+	if cli.permissive && cli.prompter.is_some() {
+		return Err("--permissive and --prompter are mutually exclusive".into());
+	}
+
 	let sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns)?;
 	let path_res_sandbox = ManagedBindMountSandbox::new(true)?;
 
@@ -781,46 +1067,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		pidfd: OnceLock::new(),
 		should_exit: AtomicBool::new(false),
 		permissive: cli.permissive,
+		prompter: cli.prompter.clone(),
+		config_path: cli.config.clone(),
+		sandbox_cmd: env::args().collect(),
+		sandbox_id: random_sandbox_id(),
 	}));
 
 	// Load mounts from the user-provided config file, replacing the
 	// previously hard-coded default initial mount list.
-	let cfg = Config::load(&cli.config)?;
-	let resolved_entries = cfg.parse_entries()?;
-	if resolved_entries.is_empty() {
-		info!(
-			"config file {:?} has no rules; sandbox will start empty",
-			cli.config
-		);
-	}
-	context
-		.sandbox
-		.update_from_list(resolved_entries.iter().map(|e| {
-			(
-				e.sandbox_path.as_os_str(),
-				match e.mount {
-					Some(ref m) => ManagedTreeEntry::BindMount(m.clone()),
-					None => {
-						let p = match build_resolve_placeholder(
-							e.placeholder_host_path.as_deref().expect(
-								"placeholder_host_path must be non-empty when mount is None",
-							),
-						) {
-							Ok(p) => p,
-							Err(err) => {
-								error!(
-									"error building placeholder for {:?}: {}",
-									e.placeholder_host_path, err
-								);
-								std::process::exit(1);
-							}
-						};
-
-						ManagedTreeEntry::Placeholder(p)
-					}
-				},
-			)
-		}))?;
+	load_config_into_sandbox(context)?;
 
 	context.path_res_sandbox.update_mounts_from_list([(
 		OsStr::new("/"),
