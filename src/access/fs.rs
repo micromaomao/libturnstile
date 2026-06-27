@@ -533,12 +533,12 @@ impl FsTarget {
 	///
 	/// This function tries to be the equivalent of filename_parentat /
 	/// path_parentat in fs/namei.c, except with simplified last component
-	/// cases.  If the path ends with a ".", the returned "parent" will be
-	/// the part without the ".", and the returned "file name" will be "."
-	/// A path ending with a "/" or an empty path will be treated as if it
-	/// ended with "/.".  If the path ends with "/..", the dir after
-	/// resolving the .. will be returned as the "parent", and the file
-	/// name will be ".".
+	/// cases.  If the path ends with (or is) a ".", the returned "parent"
+	/// will be the part without the ".", and the returned "file name" will
+	/// be "."  A path ending with a "/" or an empty path will be treated as
+	/// if it ended with "/.".  If the path ends with (or is) "..", the dir
+	/// after resolving the .. will be returned as the "parent", and the
+	/// file name will be ".".
 	pub fn open_target_dir(&self) -> Result<(ForeignFd, &CStr), io::Error> {
 		let p = self.path.to_bytes();
 		let p_with_nul = self.path.to_bytes_with_nul();
@@ -553,9 +553,9 @@ impl FsTarget {
 			dot = true;
 		} else if p.ends_with(b"/") {
 			dot = true;
-		} else if p.ends_with(b"/.") {
+		} else if p == b"." || p.ends_with(b"/.") {
 			dot = true;
-		} else if p.ends_with(b"/..") {
+		} else if p == b".." || p.ends_with(b"/..") {
 			dotdot = true;
 		}
 
