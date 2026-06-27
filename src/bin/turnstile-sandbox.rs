@@ -7,7 +7,7 @@ use std::{
 		fd::{AsRawFd, BorrowedFd},
 		unix::{ffi::OsStrExt, process::CommandExt},
 	},
-	path::PathBuf,
+	path::{Path, PathBuf},
 	process::{Command, ExitStatus},
 	sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
 	thread::{self, sleep},
@@ -422,6 +422,45 @@ fn path_is_ignored(ignore_paths: &[Vec<u8>], abspath: &[u8]) -> bool {
 	})
 }
 
+/// Create a redirect target on the host if it does not yet exist.
+///
+/// A "redirect" is a rule whose mount source (`host_path`) differs from
+/// its sandbox path (e.g. mapping `/dev/shm` to `/tmp/anki-shm`).  If the
+/// host source does not exist the bind mount would fail, so create it
+/// here, before the mounts are built.  The new entry mirrors the sandbox
+/// path's type on the host (a regular file when the sandbox path is a
+/// regular file, otherwise a directory), defaulting to a directory.
+fn create_missing_redirect_target(sandbox_path: &OsStr, host_path: &CStr) -> io::Result<()> {
+	// Only for genuine redirects (source differs from the sandbox path);
+	// real paths that happen to be missing should not be conjured up.
+	if host_path.to_bytes() == sandbox_path.as_bytes() {
+		return Ok(());
+	}
+	let host = Path::new(OsStr::from_bytes(host_path.to_bytes()));
+	// If the target already exists as anything (file, directory, symlink,
+	// ...), leave it untouched.
+	if host.symlink_metadata().is_ok() {
+		return Ok(());
+	}
+	let as_file = std::fs::metadata(sandbox_path)
+		.map(|m| m.is_file())
+		.unwrap_or(false);
+	if as_file {
+		if let Some(parent) = host.parent() {
+			std::fs::create_dir_all(parent)?;
+		}
+		std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(host)?;
+		debug!("created missing redirect target file {:?}", host);
+	} else {
+		std::fs::create_dir_all(host)?;
+		debug!("created missing redirect target directory {:?}", host);
+	}
+	Ok(())
+}
+
 /// (Re)load the user config file referenced by `context.config_path` and
 /// apply it to the sandbox, replacing the current mount/placeholder set.
 /// Used both at startup and when a prompter requests a config reload.
@@ -433,6 +472,21 @@ fn load_config_into_sandbox(context: &Context) -> Result<(), Box<dyn std::error:
 			"config file {:?} has no rules; sandbox will start empty",
 			context.config_path
 		);
+	}
+	// Create any redirect targets that don't exist on the host yet, so the
+	// bind mounts below have a source to bind from.  Done before building
+	// the mount list.
+	for e in &resolved_entries {
+		if let Some(m) = &e.mount {
+			if let Err(err) =
+				create_missing_redirect_target(e.sandbox_path.as_os_str(), &m.host_path)
+			{
+				error!(
+					"could not create redirect target {:?} for {:?}: {}",
+					m.host_path, e.sandbox_path, err
+				);
+			}
+		}
 	}
 	let mut entries: Vec<(&OsStr, ManagedTreeEntry)> = Vec::with_capacity(resolved_entries.len());
 	let mut ignore_paths: Vec<Vec<u8>> = Vec::new();
@@ -1283,7 +1337,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-	use super::path_is_ignored;
+	use super::{create_missing_redirect_target, path_is_ignored};
+	use std::ffi::CString;
+	use std::os::unix::ffi::OsStrExt;
 
 	#[test]
 	fn ignore_exact_and_descendants() {
@@ -1308,5 +1364,34 @@ mod tests {
 	#[test]
 	fn ignore_empty_list_matches_nothing() {
 		assert!(!path_is_ignored(&[], b"/proc"));
+	}
+
+	#[test]
+	fn create_redirect_target_dir_file_and_skip() {
+		let tmp = std::env::temp_dir().join(format!("turnstile-rt-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+		let c = |p: &std::path::Path| CString::new(p.as_os_str().as_bytes()).unwrap();
+
+		// Sandbox path is an existing directory -> target created as a dir.
+		let src_dir = tmp.join("srcdir");
+		std::fs::create_dir_all(&src_dir).unwrap();
+		let dst_dir = tmp.join("nested/dstdir");
+		create_missing_redirect_target(src_dir.as_os_str(), &c(&dst_dir)).unwrap();
+		assert!(dst_dir.is_dir());
+
+		// Sandbox path is an existing file -> target created as a file.
+		let src_file = tmp.join("srcfile");
+		std::fs::write(&src_file, b"x").unwrap();
+		let dst_file = tmp.join("sub/dstfile");
+		create_missing_redirect_target(src_file.as_os_str(), &c(&dst_file)).unwrap();
+		assert!(dst_file.is_file());
+
+		// Not a redirect (host == sandbox) -> nothing is created.
+		let none = tmp.join("nope");
+		create_missing_redirect_target(none.as_os_str(), &c(&none)).unwrap();
+		assert!(!none.exists());
+
+		std::fs::remove_dir_all(&tmp).unwrap();
 	}
 }
