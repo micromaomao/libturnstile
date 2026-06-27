@@ -1,5 +1,5 @@
 rules:
-  $PWD: rwx
+  $PWD: r
   /usr: rx
   /etc: rx
   /bin: rx
