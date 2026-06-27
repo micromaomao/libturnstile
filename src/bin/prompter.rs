@@ -18,7 +18,7 @@ pub struct PrompterRequest {
 	/// This will be the same value for all requests coming from this
 	/// sandbox.
 	pub sandbox_id: u64,
-	/// The original command line used to launch this sandbox.
+	/// The command (program and arguments) being run inside the sandbox.
 	pub sandbox_cmd: Vec<String>,
 	/// The PID of the process that caused this access request.
 	pub request_pid: u32,

@@ -1,6 +1,5 @@
 use std::{
 	collections::VecDeque,
-	env,
 	ffi::{CStr, CString, OsStr, OsString},
 	fmt::write,
 	io::{self, Write},
@@ -99,8 +98,8 @@ struct Context {
 	/// Path to the config file, forwarded to the prompter and used when
 	/// it requests a config reload.
 	config_path: PathBuf,
-	/// The original command line used to launch this sandbox, forwarded
-	/// to the prompter.
+	/// The command (program and arguments) being run inside the sandbox,
+	/// forwarded to the prompter for display.
 	sandbox_cmd: Vec<String>,
 	/// Randomly generated ID identifying this sandbox instance, forwarded
 	/// to the prompter so it can group requests coming from the same
@@ -1118,7 +1117,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		permissive: cli.permissive,
 		prompter: cli.prompter.clone(),
 		config_path: cli.config.clone(),
-		sandbox_cmd: env::args().collect(),
+		sandbox_cmd: cli
+			.command
+			.iter()
+			.map(|s| s.to_string_lossy().into_owned())
+			.collect(),
 		sandbox_id: random_sandbox_id(),
 	}));
 

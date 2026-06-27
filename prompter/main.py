@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+
+"""Interactive GUI prompter for turnstile-sandbox.
+
+Reads a single ``PrompterRequest`` JSON object on stdin and writes a
+single ``PrompterResponse`` JSON object on stdout (see
+``src/bin/prompter.rs`` for the protocol).
+
+The window shows the sandbox launch command, the access the sandboxed
+process is asking for, and an editable filesystem tree of r/w/x
+checkboxes.  The user can grant access at the requested paths or widen it
+to parent directories, then *Continue* (grant + let the syscall proceed)
+or *Cancel and deny* (reject with ``EPERM``).
+
+Simplifications (left as TODO for now):
+  * Resolve-only requests (no r/w/x needed, just path resolution) are
+    always allowed by emitting ``match_host`` placeholders; they are not
+    shown in the tree.
+  * "Persist these rules in the config" does not yet write the config.
+  * There is no directory "redirect" (->) support yet.
+"""
+
+import json
+import os
+import sys
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+
+EPERM = 1
+
+# Pixels of indentation per filesystem-tree depth level.
+INDENT_PX = 22
+
+# Window-scale (Ctrl+scroll zoom) bounds and step.
+MIN_SCALE = 0.5
+MAX_SCALE = 4.0
+SCALE_STEP = 0.1
+
+
+def config_path():
+    """Path to the prompter's persisted settings file."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return os.path.join(base, "turnstile-prompter", "settings.json")
+
+
+def load_scale():
+    """Load the persisted window scale factor (defaults to 1.0)."""
+    try:
+        with open(config_path()) as f:
+            return float(json.load(f).get("scale", 1.0))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 1.0
+
+
+def save_scale(scale):
+    """Persist the window scale factor, best-effort."""
+    path = config_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"scale": scale}, f)
+    except OSError:
+        pass
+
+
+class ScaleManager:
+    """Live, persisted UI scaling driven by the application font size.
+
+    Most Qt widgets size themselves from the font, so scaling the font
+    scales the whole dialog.  The chosen factor is remembered in the
+    config file so the next prompt opens at the same size.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.base_font = app.font()
+        self.base_pt = self.base_font.pointSizeF()
+        if self.base_pt <= 0:
+            self.base_pt = 10.0
+        self.scale = max(MIN_SCALE, min(MAX_SCALE, load_scale()))
+
+    def apply(self, root=None):
+        """Apply the current scale to the app and an optional widget tree."""
+        font = QtGui.QFont(self.base_font)
+        font.setPointSizeF(self.base_pt * self.scale)
+        self.app.setFont(font)
+        if root is not None:
+            root.setFont(font)
+            for child in root.findChildren(QtWidgets.QWidget):
+                child.setFont(font)
+
+    def zoom(self, steps):
+        """Adjust the scale by ``steps`` (each ``SCALE_STEP``) and persist."""
+        new = max(MIN_SCALE, min(MAX_SCALE, self.scale + steps * SCALE_STEP))
+        if new == self.scale:
+            return False
+        self.scale = new
+        save_scale(self.scale)
+        return True
+
+
+def needed_perms(perm):
+    """Return (need_read, need_write, need_exec) for a rwx_permission."""
+    need_read = bool(perm.get("read")) or bool(perm.get("chdir"))
+    need_write = bool(perm.get("write"))
+    need_exec = bool(perm.get("exec"))
+    return need_read, need_write, need_exec
+
+
+def rwx_string(need_read, need_write, need_exec):
+    return (
+        ("r" if need_read else "-")
+        + ("w" if need_write else "-")
+        + ("x" if need_exec else "-")
+    )
+
+
+def trim_trailing_dot(path):
+    """Trim a trailing ``/.`` from a path.
+
+    This is the only non-canonical form a realpath-derived path can take
+    (produced when the syscall's path ended in ``/``, ``/.`` or ``/..``).
+    Keeps ``/`` if trimming would empty the path.
+    """
+    if path.endswith("/."):
+        return path[:-2] or "/"
+    return path
+
+
+def target_path(perm):
+    """The displayed/host path of a rwx_permission, normalised."""
+    return trim_trailing_dot(perm["target"]["path"])
+
+
+def grant_path_for(perm, create_like=False):
+    """Host path the permission is really required on.
+
+    For directory operations (create / unlink / rename / ...) the
+    permission is normally required on the *parent* directory of the
+    target, so we grant there.
+
+    Exception: for create-like operations (open ``O_CREAT``, mkdir,
+    symlink, mknod) whose target *already exists* on the host, no entry
+    will actually be created in the parent - continuing the syscall will
+    instead open the existing entry or fail with ``EEXIST``.  In that case
+    we can grant on the target itself rather than exposing write on the
+    whole parent directory.  (The parent is still offered as a widen-able
+    node in the tree if the user wants it.)
+    """
+    path = target_path(perm)
+    if perm.get("is_dir_op"):
+        if create_like and os.path.lexists(path):
+            return path
+        path = os.path.dirname(path.rstrip("/")) or "/"
+    return path
+
+
+def operation_name(access_request):
+    """Best-effort human name of the operation, e.g. ``FsRename``."""
+    op = access_request.get("operation")
+    # op looks like {"FsOperation": {"FsRename": {...}}}
+    if isinstance(op, dict):
+        for _outer, inner in op.items():
+            if isinstance(inner, dict):
+                for variant in inner:
+                    return variant
+            return _outer
+    return "operation"
+
+
+class FsNode:
+    """A node in the editable filesystem-permission tree."""
+
+    def __init__(self, name, path, depth, parent):
+        self.name = name
+        self.path = path
+        self.depth = depth
+        self.parent = parent
+        self.children = {}
+
+        # The user's *direct* selection on this node (as opposed to
+        # permissions inherited from an ancestor).
+        self.own_r = False
+        self.own_w = False
+        self.own_x = False
+
+        # Effective state after inheritance, filled in by TreeWidget.refresh.
+        self.eff_r = False
+        self.eff_w = False
+        self.eff_x = False
+
+        # Checkboxes, created lazily by TreeWidget.
+        self.cb_r = None
+        self.cb_w = None
+        self.cb_x = None
+
+    def child(self, name):
+        node = self.children.get(name)
+        if node is None:
+            if self.path == "/":
+                path = "/" + name
+            else:
+                path = self.path + "/" + name
+            node = FsNode(name, path, self.depth + 1, self)
+            self.children[name] = node
+        return node
+
+
+class TreeWidget(QtWidgets.QWidget):
+    """Editable filesystem-permission tree with r/w/x checkboxes per row.
+
+    Rules implemented:
+      * Checking ``w`` or ``x`` on a line also checks ``r`` on it, and
+        deselecting ``r`` clears ``w`` and ``x``, since a mount always
+        implies read.
+      * Selecting a permission on a parent forces the same box checked and
+        disabled on every descendant (inheritance).
+    """
+
+    def __init__(self, grants, parent=None):
+        super().__init__(parent)
+        self.root = FsNode("/", "/", 0, None)
+        self._build(grants)
+
+        self.nodes_preorder = []
+        self._flatten(self.root)
+
+        grid = QtWidgets.QGridLayout(self)
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(2)
+
+        for row, node in enumerate(self.nodes_preorder):
+            if node.depth == 0 or node.children:
+                text = node.name if node.depth == 0 else node.name + "/"
+            else:
+                text = node.name
+            label = QtWidgets.QLabel(text)
+            label.setContentsMargins(node.depth * INDENT_PX, 0, 0, 0)
+            grid.addWidget(label, row, 0)
+
+            node.cb_r = self._make_box(node, "r")
+            node.cb_w = self._make_box(node, "w")
+            node.cb_x = self._make_box(node, "x")
+            grid.addWidget(node.cb_r, row, 1)
+            grid.addWidget(node.cb_w, row, 2)
+            grid.addWidget(node.cb_x, row, 3)
+
+        grid.setColumnStretch(0, 1)
+        # Absorb extra vertical space below the rows so they stay compact
+        # at the top instead of spreading out when the window is tall.
+        grid.setRowStretch(len(self.nodes_preorder), 1)
+        self.refresh()
+
+    def _make_box(self, node, perm):
+        box = QtWidgets.QCheckBox(perm)
+        box.toggled.connect(
+            lambda checked, n=node, p=perm: self._on_toggle(n, p, checked)
+        )
+        return box
+
+    def _build(self, grants):
+        """Insert every grant path into the trie and seed required perms."""
+        for path, need_write, need_exec in grants:
+            node = self.root
+            for comp in path.strip("/").split("/"):
+                if comp:
+                    node = node.child(comp)
+            # Mark this node as a requested grant target.  A mount always
+            # grants read, so own_r is always set for a target.
+            node.own_r = True
+            node.own_w = node.own_w or need_write
+            node.own_x = node.own_x or need_exec
+
+    def _flatten(self, node):
+        self.nodes_preorder.append(node)
+        for _name, child in sorted(node.children.items()):
+            self._flatten(child)
+
+    def _on_toggle(self, node, perm, checked):
+        if perm == "r":
+            node.own_r = checked
+            if not checked:
+                node.own_w = False
+                node.own_x = False
+        elif perm == "w":
+            node.own_w = checked
+            if checked:
+                node.own_r = True
+        else:
+            node.own_x = checked
+            if checked:
+                node.own_r = True
+        self.refresh()
+
+    def refresh(self):
+        """Recompute effective state and update every checkbox."""
+        for node in self.nodes_preorder:  # parents before children
+            pr = node.parent.eff_r if node.parent else False
+            pw = node.parent.eff_w if node.parent else False
+            px = node.parent.eff_x if node.parent else False
+
+            node.eff_r = node.own_r or pr
+            node.eff_w = node.own_w or pw
+            node.eff_x = node.own_x or px
+
+            for box, checked, enabled in (
+                (node.cb_r, node.eff_r, not pr),
+                (node.cb_w, node.eff_w, not pw),
+                (node.cb_x, node.eff_x, not px),
+            ):
+                box.blockSignals(True)
+                box.setChecked(checked)
+                box.setEnabled(enabled)
+                box.blockSignals(False)
+
+    def mounts(self):
+        """Build the ``add_mounts`` list from the current selection.
+
+        A node gets its own mount only when it introduces a permission its
+        parent does not already grant, which keeps the mount set minimal
+        while still covering descendants that need *more* than the parent.
+        """
+        result = []
+        seen = set()
+        for node in self.nodes_preorder:
+            pr = node.parent.eff_r if node.parent else False
+            pw = node.parent.eff_w if node.parent else False
+            px = node.parent.eff_x if node.parent else False
+            introduces = (
+                (node.eff_r and not pr)
+                or (node.eff_w and not pw)
+                or (node.eff_x and not px)
+            )
+            if not (node.eff_r and introduces):
+                continue
+            if node.path in seen:
+                continue
+            seen.add(node.path)
+            result.append(
+                {
+                    "mount_point": node.path,
+                    "host_path": node.path,
+                    "attrs": {
+                        "readonly": not node.eff_w,
+                        "noexec": not node.eff_x,
+                    },
+                }
+            )
+        return result
+
+
+class PrompterDialog(QtWidgets.QDialog):
+    def __init__(self, request, grants, placeholders):
+        super().__init__()
+        self.placeholders = placeholders
+        self.response = deny_response()  # default if the window is closed
+        self.scale_mgr = None  # set by main() before exec()
+
+        access_request = request.get("access_request", {})
+        op = operation_name(access_request)
+        comm = request.get("request_comm", "?")
+        pid = request.get("request_pid", "?")
+        cmd = " ".join(request.get("sandbox_cmd", [])) or "(unknown)"
+
+        self.setWindowTitle("Turnstile-sandbox access request")
+        # Mark the window as a dialog so tiling window managers (i3, sway,
+        # ...) float it instead of tiling/maximizing it.
+        self.setWindowFlag(QtCore.Qt.Dialog, True)
+        self.setWindowModality(QtCore.Qt.ApplicationModal)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        layout.addWidget(QtWidgets.QLabel("The sandbox"))
+        cmd_field = QtWidgets.QLineEdit(cmd)
+        cmd_field.setReadOnly(True)
+        cmd_field.setCursorPosition(0)
+        layout.addWidget(cmd_field)
+
+        layout.addWidget(
+            QtWidgets.QLabel(
+                f"is requesting the following access to execute a "
+                f"<b>{op}</b> from <b>{comm}[{pid}]</b>:"
+            )
+        )
+
+        layout.addWidget(self._build_request_table(request))
+        layout.addWidget(self._build_show_request(access_request))
+
+        self.allow_box = QtWidgets.QCheckBox(
+            "Allow this request by granting the following access:"
+        )
+        self.allow_box.setChecked(True)
+        self.allow_box.toggled.connect(self._on_allow_toggled)
+        layout.addWidget(self.allow_box)
+
+        self.tree = TreeWidget(grants)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(self.tree)
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumHeight(160)
+        layout.addWidget(scroll)
+
+        self.persist_box = QtWidgets.QCheckBox("Persist these rules in the config")
+        self.persist_box.setChecked(True)
+        # TODO: actually write the granted rules back to the config file
+        # (and set reload_config) when this is checked.
+        layout.addWidget(self.persist_box)
+
+        buttons = QtWidgets.QHBoxLayout()
+        style = self.style()
+        cancel = QtWidgets.QPushButton(
+            style.standardIcon(QtWidgets.QStyle.SP_DialogCancelButton),
+            "Cancel and deny",
+        )
+        cancel.clicked.connect(self._on_cancel)
+        cont = QtWidgets.QPushButton(
+            style.standardIcon(QtWidgets.QStyle.SP_DialogOkButton),
+            "Continue",
+        )
+        cont.setDefault(True)
+        cont.clicked.connect(self._on_continue)
+        buttons.addWidget(cancel)
+        buttons.addStretch(1)
+        buttons.addWidget(cont)
+        layout.addLayout(buttons)
+
+    def _build_request_table(self, request):
+        perms = request.get("rwx_permissions", [])
+        table = QtWidgets.QTableWidget(len(perms), 2)
+        table.setHorizontalHeaderLabels(["access", "path"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        for row, perm in enumerate(perms):
+            need_read, need_write, need_exec = needed_perms(perm)
+            table.setItem(
+                row, 0, QtWidgets.QTableWidgetItem(rwx_string(need_read, need_write, need_exec))
+            )
+            table.setItem(row, 1, QtWidgets.QTableWidgetItem(target_path(perm)))
+        self.table = table
+        self._fit_table()
+        return table
+
+    def _fit_table(self):
+        """Resize the access table's columns and height to its content.
+
+        Called on build and after every scale change so zooming widens the
+        columns and grows the height instead of clipping the content.
+        """
+        table = self.table
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setMaximumHeight(
+            table.horizontalHeader().height()
+            + sum(table.rowHeight(r) for r in range(table.rowCount()))
+            + 2
+        )
+
+    def _build_show_request(self, access_request):
+        container = QtWidgets.QWidget()
+        box = QtWidgets.QVBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 0)
+
+        toggle = QtWidgets.QToolButton()
+        toggle.setText("Show request")
+        toggle.setCheckable(True)
+        toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        toggle.setArrowType(QtCore.Qt.RightArrow)
+        box.addWidget(toggle)
+
+        text = QtWidgets.QPlainTextEdit(json.dumps(access_request, indent=2))
+        text.setReadOnly(True)
+        text.setVisible(False)
+        box.addWidget(text)
+
+        def on_toggle(checked):
+            toggle.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
+            text.setVisible(checked)
+
+        toggle.toggled.connect(on_toggle)
+        return container
+
+    def _on_allow_toggled(self, checked):
+        self.tree.setEnabled(checked)
+
+    def _apply_scale(self):
+        """Apply the current scale and re-fit scale-dependent widgets."""
+        if self.scale_mgr is not None:
+            self.scale_mgr.apply(self)
+        self._fit_table()
+        self.adjustSize()
+
+    def eventFilter(self, obj, event):
+        # Ctrl+scroll anywhere in the window zooms the whole UI up/down.
+        if (
+            self.scale_mgr is not None
+            and event.type() == QtCore.QEvent.Wheel
+            and (event.modifiers() & QtCore.Qt.ControlModifier)
+        ):
+            dy = event.angleDelta().y()
+            if dy and self.scale_mgr.zoom(1 if dy > 0 else -1):
+                self._apply_scale()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _on_cancel(self):
+        self.response = deny_response()
+        self.reject()
+
+    def _on_continue(self):
+        if self.allow_box.isChecked():
+            self.response = {
+                "action": {"continue": True},
+                "add_mounts": self.tree.mounts(),
+                "add_placeholders": self.placeholders,
+                "auto_add_symlinks": True,
+                "auto_widen_descendant_permissions": True,
+            }
+        else:
+            # Don't grant anything, but still let the syscall proceed
+            # against the current sandbox view rather than forcing EPERM.
+            # It may fail naturally (EEXIST / ENOENT / EROFS / ...), and
+            # the user can arrange things manually (e.g. create the
+            # missing dir) without exposing the whole parent.  Resolve-only
+            # placeholders are still applied.
+            self.response = {
+                "action": {"continue": True},
+                "add_placeholders": self.placeholders,
+                "auto_add_symlinks": True,
+            }
+        self.accept()
+
+
+def deny_response():
+    return {"action": {"send_error": EPERM}}
+
+
+def main():
+    request = json.load(sys.stdin)
+    perms = request.get("rwx_permissions", [])
+
+    # Create-like operations (open O_CREAT, mkdir, symlink, mknod) can be
+    # granted on an already-existing target instead of its parent; see
+    # grant_path_for.  Operations that genuinely mutate the parent
+    # (unlink, rename, link) must not, so gate on the operation type.
+    op_name = operation_name(request.get("access_request", {}))
+    create_like = op_name in ("FsOpen", "FsCreate")
+
+    # Resolve-only requests (no r/w/x) are always allowed via match_host
+    # placeholders and never shown in the UI.  Everything else becomes an
+    # editable grant in the tree.
+    placeholders = []
+    seen_placeholders = set()
+    grants = {}
+    for perm in perms:
+        need_read, need_write, need_exec = needed_perms(perm)
+        if not (need_read or need_write or need_exec):
+            path = target_path(perm)
+            if path not in seen_placeholders:
+                seen_placeholders.add(path)
+                placeholders.append({"path": path, "match_host": True})
+            continue
+        path = grant_path_for(perm, create_like)
+        cur_w, cur_x = grants.get(path, (False, False))
+        grants[path] = (cur_w or need_write, cur_x or need_exec)
+
+    grant_list = [(path, w, x) for path, (w, x) in grants.items()]
+
+    if not grant_list:
+        # Nothing to decide interactively: just allow the resolve-only
+        # placeholders and continue without showing a window.
+        response = {
+            "action": {"continue": True},
+            "add_placeholders": placeholders,
+            "auto_add_symlinks": True,
+            "auto_widen_descendant_permissions": True,
+        }
+        json.dump(response, sys.stdout)
+        sys.stdout.write("\n")
+        return
+
+    app = QtWidgets.QApplication([])
+    scale_mgr = ScaleManager(app)
+    dialog = PrompterDialog(request, grant_list, placeholders)
+    dialog.scale_mgr = scale_mgr
+    # Receive every wheel event so Ctrl+scroll zooms regardless of which
+    # widget is under the cursor.
+    app.installEventFilter(dialog)
+    dialog._apply_scale()
+    dialog.exec()
+    app  # keep a reference until here
+
+    json.dump(dialog.response, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
