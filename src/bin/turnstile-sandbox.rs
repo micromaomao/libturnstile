@@ -175,6 +175,9 @@ fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io:
 /// ancestor, so a symlink leaf (e.g. `/etc/localtime`) is mirrored and
 /// resolution continues into its target; when false, the leaf is left
 /// untouched (the mount / placeholder flow handles the symlink itself).
+/// Note that a trailing slash on `path` also forces the final component
+/// to be followed regardless of `follow_final`, since the kernel must
+/// resolve it to a directory.
 ///
 /// This makes sure that an app accessing e.g. `/home/user1/file` (where
 /// `/home/user1` is a host symlink to `/home/user2`) sees the same
@@ -216,6 +219,11 @@ fn create_symlinks_for_user_path(
 		// Empty path (AT_EMPTY_PATH): the dfd itself is the target.
 		return Ok(());
 	}
+	// A trailing slash forces the kernel to follow the final component
+	// (it must resolve to a directory) even when AT_SYMLINK_NOFOLLOW /
+	// O_NOFOLLOW was requested.  In that case the leaf behaves like an
+	// intermediate component and must be mirrored too.
+	let follow_final = follow_final || path.to_bytes().ends_with(b"/");
 	let walk_upto = if follow_final {
 		path_comps.len()
 	} else {

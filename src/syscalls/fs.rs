@@ -101,20 +101,26 @@ fn handle_exec_like(
 }
 
 fn handle_mknod_like(
-	target: FsTarget,
+	mut target: FsTarget,
 	mode: libc::mode_t,
 	kind: CreateKind,
 ) -> Result<Operation, AccessRequestError> {
+	// mkdir / mknod never dereference an existing final symlink: they
+	// operate on the name itself and fail with EEXIST onto a symlink, so
+	// the leaf must not be followed when resolving the target.
+	target.no_follow = true;
 	Ok(fsop(FsCreate(CreateOperation { target, mode, kind })))
 }
 
 fn handle_symlink_like(
 	req: &mut RequestContext,
-	target: FsTarget,
+	mut target: FsTarget,
 	src_arg_index: u8,
 ) -> Result<Operation, AccessRequestError> {
 	let src_ptr = req.arg(src_arg_index as usize) as *const libc::c_char;
 	let src = req.cstr_from_target_memory(src_ptr)?;
+	// The link being created is a name, not something to dereference.
+	target.no_follow = true;
 	Ok(fsop(FsCreate(CreateOperation {
 		target,
 		mode: 0o777,
@@ -216,7 +222,10 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"rmdir",
-		|_req, target| Ok(fsop(FsUnlink(UnlinkOperation { target, dir: true }))),
+		|_req, mut target| {
+			target.no_follow = true;
+			Ok(fsop(FsUnlink(UnlinkOperation { target, dir: true })))
+		},
 		0,
 	),
 	(
@@ -241,7 +250,10 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"unlink",
-		|_req, target| Ok(fsop(FsUnlink(UnlinkOperation { target, dir: false }))),
+		|_req, mut target| {
+			target.no_follow = true;
+			Ok(fsop(FsUnlink(UnlinkOperation { target, dir: false })))
+		},
 		0,
 	),
 	("execve", handle_exec_like, 0),
@@ -427,9 +439,10 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	),
 	(
 		"unlinkat",
-		|req, target| {
+		|req, mut target| {
 			let flags = req.arg(2);
 			let dir = flags & libc::AT_REMOVEDIR as u64 != 0;
+			target.no_follow = true;
 			Ok(fsop(FsUnlink(UnlinkOperation { target, dir })))
 		},
 		0,
@@ -614,7 +627,11 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
 	(
 		"rename",
-		|_req, target1, target2| {
+		|_req, mut target1, mut target2| {
+			// rename operates on the names themselves; neither final
+			// component is dereferenced.
+			target1.no_follow = true;
+			target2.no_follow = true;
 			Ok(fsop(FsRename(RenameOperation {
 				from: target1,
 				to: target2,
@@ -626,7 +643,11 @@ const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
 	),
 	(
 		"link",
-		|_req, target1, target2| {
+		|_req, mut target1, mut target2| {
+			// Without AT_SYMLINK_FOLLOW the source symlink is hard-linked
+			// as-is, and the destination name is never dereferenced.
+			target1.no_follow = true;
+			target2.no_follow = true;
 			Ok(fsop(FsLink(LinkOperation {
 				from: target1,
 				to: target2,
@@ -641,7 +662,9 @@ const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
 const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, Option<u8>)] = &[
 	(
 		"renameat",
-		|_req, target1, target2| {
+		|_req, mut target1, mut target2| {
+			target1.no_follow = true;
+			target2.no_follow = true;
 			Ok(fsop(FsRename(RenameOperation {
 				from: target1,
 				to: target2,
@@ -656,8 +679,10 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 	),
 	(
 		"renameat2",
-		|req, target1, target2| {
+		|req, mut target1, mut target2| {
 			let exchange = req.arg(4) & libc::RENAME_EXCHANGE as u64 != 0;
+			target1.no_follow = true;
+			target2.no_follow = true;
 			Ok(fsop(FsRename(RenameOperation {
 				from: target1,
 				to: target2,
@@ -672,9 +697,13 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 	),
 	(
 		"linkat",
-		|req, target1, target2| {
+		|req, mut target1, mut target2| {
 			let flags = req.arg(4);
 			let follow_src_symlink = flags & libc::AT_SYMLINK_FOLLOW as u64 != 0;
+			// The source is followed only with AT_SYMLINK_FOLLOW; the
+			// destination name is never dereferenced.
+			target1.no_follow = !follow_src_symlink;
+			target2.no_follow = true;
 			Ok(fsop(FsLink(LinkOperation {
 				from: target1,
 				to: target2,

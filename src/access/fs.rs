@@ -250,6 +250,25 @@ fn trim_leading_slashes(path: &CStr) -> &CStr {
 	CStr::from_bytes_with_nul(&bytes[start..]).unwrap()
 }
 
+/// `readlinkat(2)` on a [`ForeignFd`] directory and a relative `name`,
+/// returning the raw (unresolved) symlink target.
+fn readlinkat_foreign(dir_fd: &ForeignFd, name: &CStr) -> Result<OsString, io::Error> {
+	let mut buf = vec![0u8; libc::PATH_MAX as usize];
+	let ret = unsafe {
+		libc::readlinkat(
+			dir_fd.as_raw_fd(),
+			name.as_ptr(),
+			buf.as_mut_ptr() as *mut libc::c_char,
+			buf.len(),
+		)
+	};
+	if ret < 0 {
+		return Err(io::Error::last_os_error());
+	}
+	buf.truncate(ret as usize);
+	Ok(OsString::from_vec(buf))
+}
+
 impl FsTarget {
 	pub(crate) fn from_path(
 		req: &mut RequestContext,
@@ -580,10 +599,24 @@ impl FsTarget {
 		Ok((opened_dfd, filename))
 	}
 
-	/// Return the absolute path of the target.  This requires everything
-	/// except the final component of the path to exist (which is a normal
-	/// requirement of most fs syscalls anyway).
+	/// Return the absolute path of the target.
+	///
+	/// Everything up to the final component is always resolved (and must
+	/// exist).  The final component is resolved too — if it is a symlink
+	/// it is followed to its ultimate target — *unless* the operation
+	/// does not dereference it (see [`no_follow`](Self::no_follow), which
+	/// is set for `AT_SYMLINK_NOFOLLOW` as well as dentry-name operations
+	/// like `mkdir` / `unlink` / `rename`).  The final component need not
+	/// exist.
 	pub fn realpath(&self) -> Result<OsString, io::Error> {
+		self.realpath_impl(0)
+	}
+
+	/// Maximum number of leaf symlinks to follow, matching the kernel's
+	/// `MAXSYMLINKS`, to guard against symlink loops.
+	const MAX_SYMLINK_DEPTH: u32 = 40;
+
+	fn realpath_impl(&self, depth: u32) -> Result<OsString, io::Error> {
 		let path_bytes = self.path.to_bytes();
 
 		// AT_EMPTY_PATH: the target is the dfd itself — read its proc symlink.
@@ -597,12 +630,68 @@ impl FsTarget {
 		if file_name_bytes.is_empty() {
 			return Ok(dir_path);
 		}
+
+		// The resolved path of the leaf, taking it literally (i.e. not
+		// following it).
 		let mut result = dir_path.into_encoded_bytes();
 		if result.last().copied() != Some(b'/') {
 			result.push(b'/');
 		}
 		result.extend_from_slice(file_name_bytes);
-		Ok(OsString::from_vec(result))
+
+		// When the operation does not dereference the final component
+		// (`AT_SYMLINK_NOFOLLOW`, or a dentry-name op like mkdir/unlink),
+		// the leaf itself is the target.
+		if self.no_follow {
+			return Ok(OsString::from_vec(result));
+		}
+
+		if depth >= Self::MAX_SYMLINK_DEPTH {
+			return Err(io::Error::from_raw_os_error(libc::ELOOP));
+		}
+
+		// Read the leaf without following it.  `ENOENT` (does not exist)
+		// or `EINVAL` (not a symlink) both mean `result` is already the
+		// final resolved path.
+		let link_target = match readlinkat_foreign(&dir_fd, file_name) {
+			Ok(t) => t,
+			Err(e) => match e.raw_os_error() {
+				Some(libc::ENOENT) | Some(libc::EINVAL) => {
+					return Ok(OsString::from_vec(result));
+				}
+				_ => return Err(e),
+			},
+		};
+		let target_bytes = link_target.as_bytes();
+
+		// Follow the symlink: resolve its target against the right base
+		// and recurse (its target may itself be / contain symlinks).
+		let next = if let Some(mut rest) = target_bytes.strip_prefix(b"/") {
+			// Absolute target: resolve against the root.
+			while rest.first() == Some(&b'/') {
+				rest = &rest[1..];
+			}
+			// TODO record root in FsTarget
+			let root = ForeignFd::from_path(c"/")?;
+			FsTarget {
+				dfd: root,
+				path: CString::new(rest)
+					.map_err(|_| io::Error::other("symlink target contains NUL byte"))?,
+				no_follow: false,
+				original_handle: OriginalHandle::Root,
+			}
+		} else {
+			// Relative target: resolve against the directory that holds
+			// the symlink.
+			FsTarget {
+				dfd: dir_fd,
+				path: CString::new(target_bytes)
+					.map_err(|_| io::Error::other("symlink target contains NUL byte"))?,
+				no_follow: false,
+				original_handle: self.original_handle,
+			}
+		};
+		next.realpath_impl(depth + 1)
 	}
 
 	/// The base fd of the target, which may be the root of the process
