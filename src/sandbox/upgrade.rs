@@ -771,7 +771,7 @@ impl ManagedBindMountSandbox {
 			// Capture a reuse-safe handle to the *thread* issuing the chdir
 			// (cwd is per-thread).  The transient mount is tracked against it
 			// so a later reconcile keeps it only while this thread's cwd
-			// still needs it, then reclaims it (§11.5).
+			// still needs it, then reclaims it.
 			match ProcPidFd::from_tid(ctx.pid()) {
 				Ok(pidfd) => {
 					let mp = ManagedMountPoint {

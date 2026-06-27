@@ -1354,7 +1354,7 @@ impl BindMountSandbox {
 	/// `child_ns_paths` must list the *direct* (topmost) sub-mounts of
 	/// `ns_path` in the live mount tree - parking all present children
 	/// (not just still-desired ones) is required so that none of them
-	/// pins the parent and causes a spurious `EBUSY` (see §6).  Their
+	/// pins the parent and causes a spurious `EBUSY`.  Their
 	/// mountpoint dentries must exist on the layer revealed by the umount
 	/// (the placeholder hierarchy), which the caller is responsible for.
 	pub(self) fn unmount_covering(
@@ -1469,8 +1469,9 @@ pub struct ManagedMountPoint {
 
 /// Internal per-mount bookkeeping kept in `current_mount_tree`.  Wraps
 /// the user-facing [`ManagedMountPoint`] with the kernel `mnt_id`
-/// captured at mount-creation time, used as the fd-staleness key for
-/// §11.
+/// captured at mount-creation time, used as the staleness key when
+/// deciding whether a held fd must be re-resolved through the current
+/// mount layout.
 #[derive(Debug, Clone)]
 pub(crate) struct MountInternal {
 	/// host_path + currently-applied attrs (the user-visible part).
@@ -1479,7 +1480,7 @@ pub(crate) struct MountInternal {
 	/// from the m1 helper; 0 if the capture failed.
 	pub mnt_id: u64,
 	/// Threads (`/proc/<tid>` handles) whose cwd this mount was created
-	/// to back (via `chdir`/`fchdir`, §11.5).  Empty for ordinary policy
+	/// to back (via `chdir`/`fchdir`).  Empty for ordinary policy
 	/// mounts.  A `Removed` reconcile defers unmounting while any holder
 	/// is still alive and either mid-`chdir` or with its cwd still here,
 	/// so a still-pinned cwd is never yanked out from under the app.
@@ -2246,7 +2247,7 @@ pub struct ManagedBindMountSandbox {
 	/// live state by `reconcile`.  Kept separate from the live trees below
 	/// (which reflect what is *actually* mounted) so transient mounts that
 	/// are reconciled in but never part of the policy - notably `chdir`
-	/// cwd mounts (§11.5) - are naturally cleaned up on a later reconcile
+	/// cwd mounts - are naturally cleaned up on a later reconcile
 	/// instead of lingering forever.
 	current_policy: Mutex<FsTree<ManagedTreeEntry>>,
 	current_placeholder_tree: Mutex<FsTree<ManagedPlaceholder>>,
@@ -2296,7 +2297,7 @@ impl ManagedBindMountSandbox {
 	}
 
 	/// Reconcile a *transient* `chdir` cwd mount at `target` for the thread
-	/// `pidfd`, without persisting it to the policy (§11.5).  The mount is
+	/// `pidfd`, without persisting it to the policy.  The mount is
 	/// force-materialised even though it mirrors its covering parent (and so
 	/// would be pruned as "useless"), and is tagged with `pidfd` so a later
 	/// reconcile keeps it alive only while that thread's cwd still needs it.
@@ -2471,7 +2472,7 @@ impl ManagedBindMountSandbox {
 			// merge in `build_desired_trees`: a chdir mount mirrors its
 			// covering parent (so it *is* "useless" by that test) yet must be
 			// materialised so a later attribute change can reach the pinned
-			// cwd (§11.5).  It lives under an existing covering mount, so the
+			// cwd.  It lives under an existing covering mount, so the
 			// mountpoint dentry comes from that mount's host fs - no extra
 			// placeholder is needed.
 			desired_mt.insert(path.as_os_str(), mp.clone());
@@ -2522,20 +2523,20 @@ impl ManagedBindMountSandbox {
 					crate::fstree::DiffTree::Removed(old) => {
 						// A `Removed` whose path still exists in the desired
 						// mount tree *with a different host_path* is the
-						// removed half of a host_path-change "split" (§5):
+						// removed half of a host_path-change "split":
 						// the diff emits Removed(P) then Added(P).  That
 						// mount's identity is being discarded and the
 						// following Added re-covers P, so detach the old
 						// bind unconditionally (MNT_DETACH) rather than
-						// running the §6 keep-on-EBUSY dance - keeping it
+						// running the keep-on-EBUSY dance - keeping it
 						// would leave the new bind shadowing the old one.
 						//
 						// A `Removed` whose path is gone from the desired
 						// tree, or still present with the *same* host_path,
 						// is not a split: it is a genuine removal (e.g. a
 						// dummy `chdir` mount being garbage-collected now
-						// that the caller dropped it from the desired tree,
-						// §11.5; or a child swept into a split because an
+						// that the caller dropped it from the desired tree;
+						// or a child swept into a split because an
 						// *ancestor's* host_path changed).  Those go through
 						// the gentle keep-on-EBUSY unmount below so a
 						// still-held cwd / fd isn't broken by a MNT_DETACH.
@@ -2549,7 +2550,7 @@ impl ManagedBindMountSandbox {
 							new_mt.remove(sandbox_path);
 							return;
 						}
-						// §11.5: a mount that still backs a live thread's cwd
+						// a mount that still backs a live thread's cwd
 						// (notably a transient `chdir` mount) must not be
 						// unmounted yet.  Prune holders that have died or moved
 						// away; if any survive (alive and either mid-`chdir` or
@@ -2586,7 +2587,7 @@ impl ManagedBindMountSandbox {
 							Ok(false) => {
 								// EBUSY: the app itself still holds this
 								// path.  Keep it but lock it down to the
-								// covering attrs (§4 SetAttrToCovering);
+								// covering attrs;
 								// a later reconcile retries the removal
 								// once the app lets go (eventual
 								// consistency).
@@ -2611,7 +2612,7 @@ impl ManagedBindMountSandbox {
 						}
 					}
 					crate::fstree::DiffTree::Added(new) => {
-						// §7: discover the immediate sub-mounts this new
+						// discover the immediate sub-mounts this new
 						// bind would shadow (topmost mounts strictly under
 						// the path in the live tree) and re-expose them.
 						let mut children: Vec<CString> = Vec::new();
@@ -2774,7 +2775,7 @@ impl ManagedBindMountSandbox {
 	/// Capture the kernel `mnt_id` of the mount currently topmost at
 	/// `ns_path`, by opening an `O_PATH` handle to it in m1 and running
 	/// `statx(STATX_MNT_ID)`.  Returns 0 (and logs) if the capture
-	/// fails, since a missing id only degrades the §11 fd-staleness check
+	/// fails, since a missing id only degrades the fd-staleness check
 	/// for that one entry rather than breaking the mount.
 	fn capture_mnt_id(&self, ns_path: &CStr) -> u64 {
 		let mut openhow: libc::open_how = unsafe { mem::zeroed() };
@@ -2798,11 +2799,10 @@ impl ManagedBindMountSandbox {
 		}
 	}
 
-	/// §4 `SetAttrToCovering`: the attributes a path should fall back to
-	/// when an entry we tried to remove is kept (app still holds it).
-	/// This is the attrs of the deepest desired entry that is a proper
-	/// prefix of `path`, or the safe default `ro,noexec` when none
-	/// covers it.
+	/// The attributes a path should fall back to when an entry we tried to
+	/// remove is kept (app still holds it).  This is the attrs of the
+	/// deepest desired entry that is a proper prefix of `path`, or the safe
+	/// default `ro,noexec` when none covers it.
 	fn covering_attrs(
 		&self,
 		desired_mt: &FsTree<ManagedMountPoint>,
@@ -3033,7 +3033,7 @@ mod sandbox_integration_tests {
 		);
 	}
 
-	/// Exercise `unmount_covering` (§6): a parent mount with a child
+	/// Exercise `unmount_covering`: a parent mount with a child
 	/// sub-mount is unmounted while the child's `struct mount` identity is
 	/// preserved.  Afterwards the parent is gone but the child
 	/// is restored on the revealed placeholder layer.
@@ -3086,7 +3086,7 @@ mod sandbox_integration_tests {
 		);
 	}
 
-	/// End-to-end §6 check through the managed reconcile API: removing a
+	/// End-to-end check through the managed reconcile API: removing a
 	/// parent mount that has a still-desired child preserves the child
 	/// (the `Removed` branch routes through `unmount_covering`).
 	#[test]
@@ -3127,7 +3127,7 @@ mod sandbox_integration_tests {
 		);
 	}
 
-	/// A host_path change is handled as a §5 split (Removed then Added).
+	/// A host_path change is handled as a split (Removed then Added).
 	/// The mountpoint must survive and rebind to the new host source.
 	#[test]
 	fn managed_host_path_change_rebinds() {

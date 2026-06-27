@@ -1,8 +1,8 @@
 //! A small hand-rolled parser for `/proc/<pid>/mountinfo`.
 //!
 //! Currently used only by the integration tests to introspect the live
-//! mount layout (a mountinfo-based mount-tree refresh is future work, see
-//! §13 in `design.fd-upgrade.md`).  Only the few fields needed are
+//! mount layout (a mountinfo-based mount-tree refresh is future work).
+//! Only the few fields needed are
 //! extracted: the kernel mount id, the parent mount id, the source-root
 //! path within the backing superblock (field 4, whose only reliable
 //! signal is the `//deleted` marker of an unlinked source - it is *not*
