@@ -34,7 +34,8 @@ https://github.com/user-attachments/assets/667bd18a-999d-4347-916f-1e99dc3f7f1a
   and discovering mmaps that needs execute permissions
 - API is designed to be maximally data-preserving: files are identified by
   their original path as passed from the application, possibly with a dir
-  fd for *at() operations.
+  fd for *at() operations, and accesses to non-existent files are
+  traceable too.
 
 ### Sandbox
 
