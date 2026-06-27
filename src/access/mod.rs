@@ -1,12 +1,17 @@
+#[cfg(feature = "serialize")]
+use serde::Serialize;
+
 pub mod fs;
 
 /// Represents a traced syscall.
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct AccessRequest {
 	pub(crate) operation: Operation,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Operation {
 	FsOperation(fs::FsOperation),

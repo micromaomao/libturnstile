@@ -1,0 +1,10 @@
+[project]
+name = "turnstile_example_prompter"
+version = "0.1.0"
+description = "Example GUI prompter for turnstile-sandbox"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyside6>=6.11.1",
+    "pyyaml>=6.0",
+]

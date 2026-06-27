@@ -10,10 +10,12 @@ them.
 
 The tracer may also be used together with other sandboxing mechanisms
 (like Landlock), or used on its own for non-security scenarios to find out
-what files are used by a program.
+what files are used by a program.  Example sandbox demo using this library:
+
+https://github.com/user-attachments/assets/667bd18a-999d-4347-916f-1e99dc3f7f1a
 
 > [!WARNING]
-> **Work in progress**. API will not be stable at all.
+> **Work in progress**. API and implementation not stable.
 
 > [!WARNING]
 > Using the BindMountSandbox struct on its own is likely to be insecure.
@@ -21,14 +23,15 @@ what files are used by a program.
 > outside-sandbox processes via Landlock, terminal escape sequences from
 > output, restricting direct access to the tty via stdin/stdout/stderr, etc.
 >
-> At this moment, the included turnstile-sandbox binary is not protected
-> against the above.
+> At this moment, the included `turnstile-sandbox` binary is also not
+> protected against the above, but this is WIP.
 
 ## Features
 
 ### Tracer
 
 - Support most non-metadata fs accesses, including Unix socket connects
+  and discovering mmaps that needs execute permissions
 - API is designed to be maximally data-preserving: files are identified by
   their original path as passed from the application, possibly with a dir
   fd for *at() operations.
@@ -37,6 +40,11 @@ what files are used by a program.
 
 - Support dynamic manipulation of the sandbox's view of the filesystem
   using bind mounts or placeholder files in a tmpfs.
+- Supports differentiating read and execute permission needs.
+- The example `turnstile-sandbox` binary implements config parsing, launching
+  a program on denials to prompt the user, symlink chasing to expose the
+  full set of required paths, and mapping places like /tmp to a separate
+  location, as specified in the config.
 
 ## Goals
 
@@ -44,7 +52,7 @@ what files are used by a program.
 - The library itself should be non-opinionated
 - The library will support building a batteries-included, fully dynamic
   and inspectable sandbox.
-- The included turnstile-sandbox binary will eventually be such an implementation, ready for general use.
+- The included turnstile-sandbox binary should be such an implementation, ready for general use.
 
 ## Example: fstrace
 
@@ -90,50 +98,68 @@ Benchmark 1: /tmp/fstrace -o /tmp/fstrace.log cargo build --features tools
 ## Example: turnstile-sandbox
 
 ```
-> cat /tmp/sandbox-config.yaml
-rules:
-  /usr: rx
-  /bin: rx
-  /lib: rx
-  /lib64: rx
-  /proc: r
-  /home: r
-  /home/mao/turnstile: rwx
-  /home/mao/.rustup: rx
-
-> target/debug/turnstile-sandbox /tmp/sandbox-config.yaml --permissive cargo build --features tools
+> rm -r target/release/
+> time RUST_LOG=none target/debug/turnstile-sandbox --permissive src/bin/sandbox-config-default.yaml cargo build --release
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.183
+   Compiling libseccomp-sys v0.3.0
+   Compiling pkg-config v0.3.32
+   Compiling thiserror v2.0.18
+   Compiling bitflags v2.11.0
+   Compiling log v0.4.29
+   Compiling smallvec v1.15.1
+   Compiling libseccomp v0.4.0
 ...
-[2026-05-09T17:37:23Z INFO  turnstile_sandbox] rust-lld[226136] need fs permission r-- on "/sys/devices/system/cpu/online"
-[2026-05-09T17:37:23Z INFO  libturnstile::sandbox] Mount bind "/sys/devices/system/cpu/online" "/sys/devices/system/cpu/online" ro,noexec
-warning: `libturnstile` (bin "turnstile-sandbox") generated 5 warnings (run `cargo fix --bin "turnstile-sandbox" -p libturnstile` to apply 4 suggestions)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s
-[2026-05-09T17:37:23Z INFO  turnstile_sandbox] Child process exited successfully
+
+    Finished `release` profile [optimized] target(s) in 5.51s
 Denials:
 rules:
-  /: rw
-  /dev/null: r
-  /dev/urandom: r
-  /etc/ca-certificates/extracted/tls-ca-bundle.pem: ''
-  /etc/ld.so.cache: r
-  /etc/ssl: ''
-  /home/mao/.cache/ccache/4/b: w
+  /dev/pts/11: ''
+  /dev/tty: r
   /home/mao/.cargo: rw
-  /run/user/1000: ''
-  /run/user/1000/ccache-tmp: w
+  /home/mao/.gitconfig: r
+  /home/mao/code/libturnstile/target: rw
+  /home/mao/code/libturnstile/target/release/build/libc-504a5ce082bd595c/build-script-build: rx
+  /home/mao/code/libturnstile/target/release/build/libseccomp-d738e9bb4eb6d81f/build-script-build: rx
+  /home/mao/code/libturnstile/target/release/build/libseccomp-sys-c627e7d1953383fd/build-script-build: rx
+  /home/mao/code/libturnstile/target/release/build/proc-macro2-bbe06dc318ece6a7/build-script-build: rx
+  /home/mao/code/libturnstile/target/release/build/quote-23db72bd56e2b78a/build-script-build: rx
+  /home/mao/code/libturnstile/target/release/build/thiserror-abd8cf72cc63e711/build-script-build: rx
+  /home/mao/code/libturnstile/target/release/deps/libthiserror_impl-163ddbb09a2d8755.so: rx
   /sys/devices/system/cpu/online: r
   /sys/fs/cgroup/user.slice/cpu.max: r
   /sys/fs/cgroup/user.slice/user-1000.slice/cpu.max: r
-  /sys/fs/cgroup/user.slice/user-1000.slice/session-27.scope/cgroup.controllers: ''
-  /sys/fs/cgroup/user.slice/user-1000.slice/session-27.scope/cpu.max: r
-  /sys/kernel/mm/transparent_hugepage/enabled: r
+  /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/cpu.max: r
+  /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/kitty-249158-0.scope/cgroup.controllers: ''
+  /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cpu.max: r
   /tmp: rwx
+
+________________________________________________________
+Executed in    5.57 secs    fish           external
+   usr time   13.54 secs    0.21 millis   13.54 secs
+   sys time    2.17 secs    1.02 millis    2.17 secs
+
+> rm -r target/release/
+> time cargo build --release
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling libc v0.2.183
+   Compiling libseccomp-sys v0.3.0
+   Compiling pkg-config v0.3.32
+...
+    Finished `release` profile [optimized] target(s) in 4.39s
+
+________________________________________________________
+Executed in    4.40 secs    fish           external
+   usr time   13.36 secs  100.00 micros   13.36 secs
+   sys time    1.37 secs  997.00 micros    1.37 secs
 ```
 
 ## TODO
 
-- Rework sandbox to move child mount into new parent mount when parent needs to be remounted, e.g. allowing /home/mao when /home/mao/turnstile is already allowed, without breaking existing fds / cwd to /home/mao/turnstile
-- Rework sandbox to support resolve-only permissions (with placeholders)
 - Improve API for performance and ergonomics
 - sendmm?msg, recvmm?sg handling (hard to do without deadlocking at the start)
-- io_uring (very hard to do properly, but maybe we can just disable)
 - Landlock support to restrict fstrace itself

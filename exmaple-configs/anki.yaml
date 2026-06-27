@@ -1,0 +1,49 @@
+rules:
+  /usr:
+    permissions: rx
+    ignore: true
+  /etc: rx
+  /bin: rx
+  /lib: rx
+  /lib64: rx
+  /dev/null: rw
+  /dev/zero: rw
+  /dev/urandom: rw
+  /proc: rwx
+  $HOME/.local/share/Anki2: rwx
+  /sys: r
+  $XDG_RUNTIME_DIR/wayland-1: rw
+  $XDG_RUNTIME_DIR/bus: rw
+  /tmp:
+    target: /tmp/anki-tmp
+    permissions: rwx
+  /dev/tty:
+    ignore: true
+  $HOME/.config/user-dirs.dirs: r
+  /dev/dri: rw
+  $HOME/.cache/mesa_shader_cache: rw
+  /usr/share/qt6/resources:
+    ignore: true
+  /usr/share/qt6:
+    ignore: true
+  $HOME/.mozilla:
+    ignore: true
+  $HOME/.config/chromium/WidevineCdm:
+    ignore: true
+  /run/dbus/system_bus_socket: rw
+  /dev/shm:
+    target: /tmp/anki-shm
+    permissions: rwx
+  $HOME/.config/fontconfig: r
+  $HOME/.local/share/fonts: r
+  $HOME/.cache/fontconfig: r
+  /var/cache/fontconfig: r
+  $HOME/.fonts: r
+  $HOME/.cache/Anki: rwx
+  $HOME/.cache/qtshadercache-x86_64-little_endian-lp64: rw
+  /dev/pts:
+    ignore: true
+  $HOME/.config/QtProject.conf: r
+  /var/lib/flatpak/exports/share/icons: r
+  /dev:
+    ignore: true

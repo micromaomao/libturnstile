@@ -1,0 +1,22 @@
+rules:
+  $PWD: rwx
+  /usr: rx
+  /etc: rx
+  /bin: rx
+  /lib: rx
+  /lib64: rx
+  /dev/null: rw
+  /dev/zero: rw
+  /dev/urandom: rw
+  /proc: rx
+  $HOME/.gitconfig: r
+  /sys: r
+  $HOME/.cargo: rwx
+  /tmp:
+    target: /tmp/cargo-tmp
+    permissions: rwx
+  /dev/tty:
+    ignore: true
+  /run/systemd/userdb:
+    permissions: r
+    ignore: true

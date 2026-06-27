@@ -1,5 +1,8 @@
 use log::{debug, error};
 
+#[cfg(feature = "serialize")]
+use serde::{Deserialize, Serialize};
+
 /// Send a file descriptor to another process via a Unix socket using
 /// SCM_RIGHTS.  This function can safely be used in pre_exec context
 pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
@@ -138,4 +141,145 @@ pub unsafe fn fork_wait<F: FnOnce() -> libc::c_int + Send>(f: F) -> std::io::Res
 			}
 		}
 	}
+}
+
+/// Serializable `{ sec, nsec }` representation of a `libc::timespec`.
+#[cfg(feature = "serialize")]
+#[derive(Serialize, Deserialize)]
+struct Timespec {
+	sec: i64,
+	nsec: i64,
+}
+
+#[cfg(feature = "serialize")]
+impl From<&libc::timespec> for Timespec {
+	fn from(t: &libc::timespec) -> Self {
+		Timespec {
+			sec: t.tv_sec as i64,
+			nsec: t.tv_nsec as i64,
+		}
+	}
+}
+
+#[cfg(feature = "serialize")]
+impl From<Timespec> for libc::timespec {
+	fn from(t: Timespec) -> Self {
+		libc::timespec {
+			tv_sec: t.sec as libc::time_t,
+			tv_nsec: t.nsec as libc::c_long,
+		}
+	}
+}
+
+/// Serialize a `libc::timespec` as a `{ sec, nsec }` object.
+#[cfg(feature = "serialize")]
+pub fn serialize_timespec<S>(time: &libc::timespec, serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: serde::Serializer,
+{
+	Timespec::from(time).serialize(serializer)
+}
+
+/// Deserialize a `libc::timespec` from a `{ sec, nsec }` object.
+#[cfg(feature = "serialize")]
+pub fn deserialize_timespec<'de, D>(deserializer: D) -> Result<libc::timespec, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	Ok(Timespec::deserialize(deserializer)?.into())
+}
+
+/// Serialize a `[libc::timespec; 2]` as a two-element array of `{ sec,
+/// nsec }` objects.
+#[cfg(feature = "serialize")]
+pub fn serialize_timespec_pair<S>(
+	times: &[libc::timespec; 2],
+	serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+	S: serde::Serializer,
+{
+	use serde::ser::SerializeSeq;
+
+	let mut seq = serializer.serialize_seq(Some(times.len()))?;
+	for t in times {
+		seq.serialize_element(&Timespec::from(t))?;
+	}
+	seq.end()
+}
+
+/// Deserialize a `[libc::timespec; 2]` from a two-element array of `{ sec,
+/// nsec }` objects.
+#[cfg(feature = "serialize")]
+pub fn deserialize_timespec_pair<'de, D>(deserializer: D) -> Result<[libc::timespec; 2], D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	let times: Vec<Timespec> = Vec::deserialize(deserializer)?;
+	if times.len() != 2 {
+		return Err(serde::de::Error::custom(format!(
+			"expected array of length 2, got length {}",
+			times.len()
+		)));
+	}
+	let mut iter = times.into_iter();
+	Ok([iter.next().unwrap().into(), iter.next().unwrap().into()])
+}
+
+/// Serialize a `CString` as a human-readable string.
+///
+/// serde already has a built-in `CString` impl, but it encodes the value
+/// as a sequence of raw bytes (e.g. a JSON array of numbers).  For paths
+/// in a human-facing protocol we instead emit a plain string when the
+/// bytes are valid UTF-8, falling back to a byte array for the rare
+/// non-UTF-8 path so the value still round-trips losslessly.
+#[cfg(feature = "serialize")]
+pub fn serialize_cstring<S>(value: &std::ffi::CString, serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: serde::Serializer,
+{
+	let bytes = value.to_bytes();
+	match std::str::from_utf8(bytes) {
+		Ok(s) => serializer.serialize_str(s),
+		Err(_) => serializer.serialize_bytes(bytes),
+	}
+}
+
+/// Deserialize a `CString` from either a string or a byte array (the two
+/// forms produced by [`serialize_cstring`]).
+#[cfg(feature = "serialize")]
+pub fn deserialize_cstring<'de, D>(deserializer: D) -> Result<std::ffi::CString, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	struct CStringVisitor;
+
+	impl<'de> serde::de::Visitor<'de> for CStringVisitor {
+		type Value = std::ffi::CString;
+
+		fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+			f.write_str("a string or byte array without interior NUL bytes")
+		}
+
+		fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+			self.visit_bytes(v.as_bytes())
+		}
+
+		fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+			std::ffi::CString::new(v).map_err(|_| E::custom("interior NUL byte in CString"))
+		}
+
+		fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+		where
+			A: serde::de::SeqAccess<'de>,
+		{
+			let mut bytes = Vec::new();
+			while let Some(b) = seq.next_element::<u8>()? {
+				bytes.push(b);
+			}
+			self.visit_bytes(&bytes)
+		}
+	}
+
+	deserializer.deserialize_any(CStringVisitor)
 }

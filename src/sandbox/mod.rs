@@ -1,16 +1,17 @@
 use std::{
 	borrow::Cow,
-	ffi::{CStr, CString, OsStr},
-	io, mem,
+	ffi::{CStr, CString, OsStr, OsString},
+	io::{self, Read, Write},
+	mem,
 	os::{
-		fd::{AsRawFd, IntoRawFd},
-		unix::{ffi::OsStrExt, process::CommandExt},
+		fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+		unix::{ffi::OsStrExt, ffi::OsStringExt, process::CommandExt},
 	},
-	sync::Mutex,
+	sync::{Arc, Mutex, OnceLock},
 	thread,
 };
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use crate::{
 	BindMountSandboxError,
@@ -19,10 +20,57 @@ use crate::{
 	utils::{fork_wait, unix_recv_fd, unix_send_fd},
 };
 
+#[cfg(feature = "serialize")]
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "serialize")]
+use crate::utils::{
+	deserialize_cstring, deserialize_timespec, serialize_cstring, serialize_timespec,
+};
+
 /// We technically can't safely log or format strings in fork or pre_exec
 /// context, but to make our life easier we will do it anyway in debug
 /// builds.
 const ENABLE_LOG_IN_FORK: bool = cfg!(debug_assertions);
+
+/// Generate a process-unique scratch directory name for parking a mount
+/// into the hidden scratch tmpfs (see [`BindMountSandbox::park_to_scratch`]).
+/// The name need only be unique among concurrently-parked mounts within
+/// this process; a monotonic counter combined with the pid suffices.
+fn next_scratch_name() -> CString {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+	let pid = unsafe { libc::getpid() };
+	CString::new(format!("park-{pid}-{n}")).expect("no NUL in generated name")
+}
+
+/// Call umount("/proc/self/fd/<fd>", MNT_DETACH) in a async-signal-safe
+/// manner.
+unsafe fn umount_detach_fd(fd: libc::c_int) -> Result<(), io::Error> {
+	const PREFIX: &[u8] = b"/proc/self/fd/";
+	let mut buf = [0u8; PREFIX.len() + 11];
+	buf[..PREFIX.len()].copy_from_slice(PREFIX);
+	if let Err(e) = write!(&mut buf[PREFIX.len()..], "{}", fd) {
+		if ENABLE_LOG_IN_FORK {
+			error!("Failed to format fd path for umount: {}", e);
+		}
+		return Err(io::Error::from_raw_os_error(libc::EINVAL));
+	}
+	unsafe {
+		if libc::umount2(buf.as_ptr() as *const libc::c_char, libc::MNT_DETACH) != 0 {
+			let errno = libc::__errno_location().read();
+			if ENABLE_LOG_IN_FORK {
+				error!(
+					"umount2(MNT_DETACH) of unmovable child failed: errno {}",
+					errno
+				);
+			}
+			return Err(io::Error::from_raw_os_error(errno));
+		}
+	}
+	Ok(())
+}
 macro_rules! perror {
 	($s:literal) => {{
 		let err = libc::__errno_location().read();
@@ -39,11 +87,15 @@ macro_rules! perror {
 }
 
 mod mount_obj;
+#[cfg(test)]
+mod mountinfo;
 mod namespace;
+mod upgrade;
 mod utils;
 
 use mount_obj::MountObj;
 use namespace::ManagedNamespaces;
+pub use upgrade::RequestHandle;
 use utils::{split_parent_leaf, validate_sandbox_path};
 
 fn write_to_path(path: &CStr, content: &str) -> libc::c_int {
@@ -80,6 +132,7 @@ fn write_to_path(path: &CStr, content: &str) -> libc::c_int {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MountAttributes {
 	pub readonly: bool,
@@ -131,13 +184,21 @@ impl std::fmt::Display for MountAttributes {
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	namespaces: ManagedNamespaces,
+	/// A fd to the placeholder tmpfs opened inside m0 (the outer mount
+	/// namespace).
 	root_tmpfs: MountObj,
-	/// O_PATH fd to "/" opened inside the m0 (outer) mount namespace.
-	/// Used as the dirfd when resolving caller-provided host paths so
-	/// that the resulting fd is associated with m0's mount namespace and
-	/// is therefore acceptable to `open_tree()` once the helper process
-	/// enters m0.
+	/// O_PATH fd to the actual, outside-sandbox "/" opened inside m0.  Used as
+	/// the dirfd when resolving caller-provided host paths so that the
+	/// resulting fd is associated with m0's mount namespace and is therefore
+	/// acceptable to `open_tree()` once the helper process enters m0.
 	host_root_fd: ForeignFd,
+	/// O_PATH fd to the scratch tmpfs root inside m1.  The scratch is a
+	/// separate tmpfs (distinct from `root_tmpfs`) that is first mounted
+	/// into m1, and then by mounting root_tmpfs on top, it eventually is
+	/// shadowed, so the sandboxed app never sees it.  It is used by
+	/// [`Self::park_to_scratch`] to temporarily park a mount, in order to
+	/// unmount a parent, before moving it back.
+	m1_scratch_fd: ForeignFd,
 }
 
 #[derive(Debug)]
@@ -171,14 +232,17 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 	// }
 
 	pub fn mount(self) -> Result<(), BindMountSandboxError> {
-		self.sandbox.mount_host_into_sandbox_impl(
-			self.host_path,
-			self.sandbox_path,
-			self.attrs,
-			self.follow_host_symlinks,
-			// self.follow_sandbox_symlinks,
-			false,
-		)
+		self.sandbox
+			.mount_host_into_sandbox_impl(
+				self.host_path,
+				self.sandbox_path,
+				self.attrs,
+				self.follow_host_symlinks,
+				// self.follow_sandbox_symlinks,
+				false,
+				true,
+			)
+			.map(|_| ())
 	}
 }
 
@@ -320,11 +384,34 @@ impl BindMountSandbox {
 			)?;
 			ForeignFd { local_fd: raw_fd }
 		};
+		// Create the scratch tmpfs inside m1 and make it m1's root, then
+		// capture an O_PATH handle to it.  This happens before the
+		// root_tmpfs bind below, so the scratch ends up shadowed beneath
+		// the placeholder tmpfs and is invisible to the app.
+		let m1_scratch_fd = unsafe {
+			// Enter the first user namespace (where the outside uid is
+			// mapped to root) and then m1.
+			let nsenter_fn = namespaces.nsenter_fn(true, false, true, false);
+			let raw_fd = send_fd_from_ns(
+				nsenter_fn,
+				|| {
+					// fsmount a brand-new tmpfs (distinct from root_tmpfs),
+					// move_mount it onto "/" of m1, and return its fd.
+					let scratch = MountObj::new_tmpfs()?;
+					scratch.mount(libc::AT_FDCWD, c"/", false)?;
+					Ok(scratch.into_raw_fd())
+				},
+				BindMountSandboxError::SetupScratchFailed,
+			)?;
+			ForeignFd { local_fd: raw_fd }
+		};
 		let s = Self {
 			namespaces,
 			root_tmpfs,
 			host_root_fd,
+			m1_scratch_fd,
 		};
+		// Bind-mount root_tmpfs over m1's "/", shadowing the scratch.
 		s.mount_host_into_sandbox_impl(
 			CStr::from_bytes_with_nul(
 				format!("/proc/self/fd/{}\0", s.root_tmpfs.0.as_raw_fd()).as_bytes(),
@@ -334,6 +421,7 @@ impl BindMountSandbox {
 			MountAttributes::ro(),
 			true,
 			false,
+			true,
 		)?;
 		Ok(s)
 	}
@@ -464,18 +552,12 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	// todo: the semantic of follow_ns_symlinks is ill-defined due to use
-	// of create_hierarchy, which has no visibility into bind-mounted
-	// symlinks
-	pub(self) fn mount_host_into_sandbox_impl(
+	/// Resolve `host_path` to an `O_PATH` fd in m0.
+	fn host_to_m0(
 		&self,
 		host_path: &CStr,
-		ns_path: &CStr,
-		attrs: MountAttributes,
 		follow_host_symlinks: bool,
-		follow_ns_symlinks: bool,
-	) -> Result<(), BindMountSandboxError> {
-		validate_sandbox_path(ns_path)?;
+	) -> Result<ForeignFd, BindMountSandboxError> {
 		let mut open_how: libc::open_how = unsafe { std::mem::zeroed() };
 		open_how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
 		if !follow_host_symlinks {
@@ -508,27 +590,42 @@ impl BindMountSandbox {
 			) as libc::c_int
 		};
 		if host_fd < 0 {
-			let err = io::Error::last_os_error();
 			return Err(BindMountSandboxError::ResolveHostPath(
 				host_path.to_owned(),
-				err,
+				io::Error::last_os_error(),
 			));
 		}
-		let host_fd = ForeignFd { local_fd: host_fd };
+		Ok(ForeignFd { local_fd: host_fd })
+	}
 
-		let mut stat: libc::stat;
-		unsafe {
-			stat = std::mem::zeroed();
-			if libc::fstat(host_fd.as_raw_fd(), &mut stat) != 0 {
-				let err = io::Error::last_os_error();
+	// todo: the semantic of follow_ns_symlinks is ill-defined due to use
+	// of create_hierarchy, which has no visibility into bind-mounted
+	// symlinks
+	pub(self) fn mount_host_into_sandbox_impl(
+		&self,
+		host_path: &CStr,
+		ns_path: &CStr,
+		attrs: MountAttributes,
+		follow_host_symlinks: bool,
+		follow_ns_symlinks: bool,
+		create_placeholders: bool,
+	) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(ns_path)?;
+		let host_fd = self.host_to_m0(host_path, follow_host_symlinks)?;
+
+		if create_placeholders {
+			let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+			if unsafe { libc::fstat(host_fd.as_raw_fd(), &mut stat) } != 0 {
 				return Err(BindMountSandboxError::StatHostPath(
 					host_path.to_owned(),
-					err,
+					io::Error::last_os_error(),
 				));
 			}
+			self.create_placeholder_hierarchy(
+				ns_path,
+				stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+			)?;
 		}
-
-		self.create_placeholder_hierarchy(ns_path, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
 
 		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
 		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
@@ -564,10 +661,6 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
-				let res = libc::chdir(c"/".as_ptr());
-				if res != 0 {
-					return perror!("chdir");
-				}
 				match source_tree.mount(libc::AT_FDCWD, ns_path, follow_ns_symlinks) {
 					Ok(()) => (),
 					Err(e) => {
@@ -589,6 +682,217 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
+	/// Bind-mount `host_path` at `ns_path` while "carrying over" any
+	/// existing direct sub-mounts that the new bind would otherwise
+	/// shadow.
+	///
+	/// `child_ns_paths` lists the immediate sub-mounts of `ns_path`.
+	///
+	/// Roughly, this function does:
+	///
+	/// - (in m0) `open_tree` the host source.
+	/// - (in m1) open an `O_PATH` fd to every child.
+	/// - (in m1) `move_mount` the source onto `ns_path` (the children are
+	///   now shadowed).
+	/// - (in m1) `move_mount` each child back onto its own path resolved
+	///   inside the new bind mount.
+	///
+	/// A child whose mountpoint dentry is absent from the new parent's
+	/// host fs cannot be moved back, and so will be unmounted.
+	///
+	/// With no children this is exactly a plain bind mount.
+	pub(self) fn mount_covering(
+		&self,
+		host_path: &CStr,
+		ns_path: &CStr,
+		attrs: MountAttributes,
+		child_ns_paths: &[CString],
+	) -> Result<(), BindMountSandboxError> {
+		if child_ns_paths.is_empty() {
+			return self
+				.mount_host_into_sandbox_impl(host_path, ns_path, attrs, false, false, false);
+		}
+		validate_sandbox_path(ns_path)?;
+
+		let mut o_path_openhow: libc::open_how = unsafe { mem::zeroed() };
+		o_path_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+		o_path_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+		if log::log_enabled!(log::Level::Debug) {
+			let ns_path_open = self.open_in_m1(ns_path, &o_path_openhow).unwrap();
+			let mnt_id = ns_path_open.mnt_id().unwrap();
+			debug!(
+				"Mounting {:?} over {:?} (current mnt_id = {}) with {} children",
+				host_path,
+				ns_path,
+				mnt_id,
+				child_ns_paths.len()
+			);
+			for c in child_ns_paths {
+				let c_open = self.open_in_m1(c, &o_path_openhow).unwrap();
+				let c_mnt_id = c_open.mnt_id().unwrap();
+				debug!("  will move child {:?} with mnt_id = {}", c, c_mnt_id)
+			}
+		}
+
+		let host_fd = self.host_to_m0(host_path, false)?;
+
+		// Pre-allocate the fd buffer before we fork so the forked child
+		// does not allocate.
+		let mut child_fds: Vec<libc::c_int> = vec![-1; child_ns_paths.len()];
+		let child_fds_slice = child_fds.as_mut_slice();
+		let n_children = child_ns_paths.len();
+
+		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
+		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
+		let host_fd_raw = host_fd.as_raw_fd();
+		let fork_res = unsafe {
+			fork_wait(move || {
+				if let Err(e) = nsenter_fn_m0() {
+					return e.raw_os_error().unwrap_or(libc::EIO);
+				}
+				let source_tree = match MountObj::new_bind(host_fd_raw, c"", attrs, false) {
+					Ok(tree) => tree,
+					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
+				};
+				if let Err(e) = nsenter_fn_m1() {
+					return e.raw_os_error().unwrap_or(libc::EIO);
+				}
+				// Open every child while still reachable.
+				let mut child_openhow: libc::open_how = mem::zeroed();
+				child_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				child_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				for i in 0..n_children {
+					let fd = libc::syscall(
+						libc::SYS_openat2,
+						libc::AT_FDCWD,
+						child_ns_paths[i].as_ptr(),
+						&child_openhow as *const _,
+						std::mem::size_of::<libc::open_how>(),
+					) as libc::c_int;
+					if fd < 0 {
+						let err = libc::__errno_location().read();
+						if ENABLE_LOG_IN_FORK {
+							error!(
+								"Failed to open child {:?} for move_mount: errno {}",
+								child_ns_paths[i], err
+							);
+						}
+					}
+					// A child that can't be opened (already gone) is just
+					// skipped; -1 stays in the slot.
+					child_fds_slice[i] = fd;
+				}
+				// Bind the parent over ns_path (shadows the children).
+				if let Err(e) = source_tree.mount(libc::AT_FDCWD, ns_path, false) {
+					if ENABLE_LOG_IN_FORK {
+						error!(
+							"Failed to mount covering {:?} to {:?} with {}: {}",
+							host_path, ns_path, attrs, e
+						);
+					}
+					for &mut fd in child_fds_slice {
+						if fd >= 0 {
+							libc::close(fd);
+						}
+					}
+					return e.raw_os_error().unwrap_or(libc::EIO);
+				}
+				// Move each child back onto its path inside the new bind
+				// mount.  If the mountpoint dentry is missing in the new
+				// parent the child can't be moved back, so lazily detach
+				// it (MNT_DETACH) rather than leaving it shadowed; we
+				// don't fail the whole op.
+				for i in 0..n_children {
+					let fd = child_fds_slice[i];
+					if fd < 0 {
+						continue;
+					}
+					let res = libc::syscall(
+						libc::SYS_move_mount,
+						fd,
+						c"".as_ptr(),
+						libc::AT_FDCWD,
+						child_ns_paths[i].as_ptr(),
+						libc::MOVE_MOUNT_F_EMPTY_PATH,
+					);
+					if res != 0 {
+						let err = libc::__errno_location().read();
+						if ENABLE_LOG_IN_FORK {
+							error!("move_mount(child back) failed: errno {}", err);
+						}
+						if let Err(e) = umount_detach_fd(fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!("umount_detach_fd failed: {}", e);
+							}
+						}
+					}
+					libc::close(fd);
+				}
+				0
+			})
+		}
+		.map_err(BindMountSandboxError::ForkError)?;
+		if fork_res != 0 {
+			error!(
+				"Failed to mount (covering) {:?} to {:?} with {}: errno {}",
+				host_path, ns_path, attrs, fork_res
+			);
+			return Err(BindMountSandboxError::MountFailed(fork_res));
+		}
+		info!(
+			"Mount bind (covering {} children) {:?} {:?} {}",
+			n_children, host_path, ns_path, attrs
+		);
+		if log::log_enabled!(log::Level::Debug) {
+			for c in child_ns_paths {
+				let c_open = self.open_in_m1(c, &o_path_openhow).unwrap();
+				let c_mnt_id = c_open.mnt_id().unwrap();
+				debug!("  moved child {:?} now with mnt_id = {}", c, c_mnt_id)
+			}
+		}
+		Ok(())
+	}
+
+	/// Open the parent directory of `sandbox_path` within the backing
+	/// tmpfs, without creating any intermediate components.  The parent
+	/// must already exist.
+	pub(self) fn open_sandbox_parent(
+		&self,
+		sandbox_path: &CStr,
+	) -> Result<ForeignFd, BindMountSandboxError> {
+		let (parent, _) = split_parent_leaf(sandbox_path);
+		if parent.as_c_str() == c"/" {
+			let dup =
+				unsafe { libc::fcntl(self.root_tmpfs.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+			if dup < 0 {
+				return Err(BindMountSandboxError::ResolveSandboxPath(
+					io::Error::last_os_error(),
+				));
+			}
+			return Ok(ForeignFd { local_fd: dup });
+		}
+		unsafe {
+			let mut openhow: libc::open_how = mem::zeroed();
+			openhow.flags =
+				(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64;
+			openhow.resolve =
+				libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_XDEV;
+			let fd = libc::syscall(
+				libc::SYS_openat2,
+				self.root_tmpfs.0.as_raw_fd(),
+				parent.as_ptr(),
+				&openhow as *const _,
+				std::mem::size_of::<libc::open_how>(),
+			) as libc::c_int;
+			if fd < 0 {
+				return Err(BindMountSandboxError::ResolveSandboxPath(
+					io::Error::last_os_error(),
+				));
+			}
+			Ok(ForeignFd { local_fd: fd })
+		}
+	}
+
 	pub fn mount_host_into_sandbox<'a, 'b>(
 		&'b self,
 		host_path: &'a CStr,
@@ -608,7 +912,15 @@ impl BindMountSandbox {
 	/// sandbox.  Symlinks are not followed.  The path must not be "/".
 	/// The path must have been previously bind-mounted with
 	/// [`Self::mount_host_into_sandbox`].
-	pub fn unmount(&self, ns_path: &CStr) -> Result<(), BindMountSandboxError> {
+	///
+	/// When `forcibly` is false (the default for steady-state
+	/// reconcile), a plain `umount2` is used: it fails with `EBUSY` if
+	/// the app still holds the mount (an open fd or cwd), which the
+	/// caller uses as the source of truth for "still in use".  When
+	/// `forcibly` is true, `MNT_DETACH` is added so the unmount always
+	/// succeeds, detaching the subtree lazily (held references keep it
+	/// alive until they close).
+	pub fn unmount(&self, ns_path: &CStr, forcibly: bool) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(ns_path)?;
 		if ns_path.to_bytes() == b"/" {
 			return Err(BindMountSandboxError::InvalidSandboxPath(
@@ -617,6 +929,11 @@ impl BindMountSandbox {
 			));
 		}
 		let (parent_path, leaf) = split_parent_leaf(ns_path);
+
+		debug!(
+			"Umounting {:?} from sandbox (forcibly = {})",
+			ns_path, forcibly
+		);
 
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
 		let fork_res = unsafe {
@@ -629,10 +946,6 @@ impl BindMountSandbox {
 						}
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
-				}
-				let res = libc::chdir(c"/".as_ptr());
-				if res != 0 {
-					return perror!("chdir");
 				}
 				let mut openhow: libc::open_how = mem::zeroed();
 				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY) as u64;
@@ -652,7 +965,11 @@ impl BindMountSandbox {
 				if res != 0 {
 					return perror!("fchdir");
 				}
-				let res = libc::umount2(leaf.as_ptr(), libc::MNT_DETACH | libc::UMOUNT_NOFOLLOW);
+				let mut flags = libc::UMOUNT_NOFOLLOW;
+				if forcibly {
+					flags |= libc::MNT_DETACH;
+				}
+				let res = libc::umount2(leaf.as_ptr(), flags);
 				if res != 0 {
 					return perror!("umount2");
 				}
@@ -661,7 +978,9 @@ impl BindMountSandbox {
 		}
 		.map_err(BindMountSandboxError::ForkError)?;
 		if fork_res != 0 {
-			error!("Failed to unmount {:?}: errno {}", ns_path, fork_res);
+			if fork_res != libc::EBUSY {
+				error!("Failed to unmount {:?}: errno {}", ns_path, fork_res);
+			}
 			return Err(BindMountSandboxError::UnmountFailed(fork_res));
 		} else {
 			info!("Unmounted {:?}", ns_path);
@@ -692,10 +1011,6 @@ impl BindMountSandbox {
 						}
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
-				}
-				let res = libc::chdir(c"/".as_ptr());
-				if res != 0 {
-					return perror!("chdir");
 				}
 				let mut openhow: libc::open_how = mem::zeroed();
 				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
@@ -730,7 +1045,360 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// Join the current thread into the sandbox.  This can be used
+	/// Open the absolute `path` inside m1, resolving through the
+	/// sandbox's mount layout.
+	pub fn open_in_m1(
+		&self,
+		path: &CStr,
+		openhow: &libc::open_how,
+	) -> Result<ForeignFd, BindMountSandboxError> {
+		let raw_fd = unsafe {
+			let nsenter_fn = self.namespaces.nsenter_fn(true, false, true, true);
+			send_fd_from_ns(
+				nsenter_fn,
+				|| {
+					let fd = libc::syscall(
+						libc::SYS_openat2,
+						libc::AT_FDCWD,
+						path.as_ptr(),
+						openhow,
+						std::mem::size_of::<libc::open_how>(),
+					) as libc::c_int;
+					if fd < 0 {
+						return Err(io::Error::last_os_error());
+					}
+					Ok(fd)
+				},
+				BindMountSandboxError::OpenInM1Failed,
+			)?
+		};
+		Ok(ForeignFd { local_fd: raw_fd })
+	}
+
+	/// Read `/proc/self/mountinfo` as seen from inside m1, returning its
+	/// raw bytes.  A short-lived helper forks, `setns`es into m1, reads
+	/// its own mountinfo (now m1's view) and streams it back.  Used by the
+	/// integration tests to introspect the live mount layout.
+	pub fn read_m1_mountinfo(&self) -> Result<Vec<u8>, BindMountSandboxError> {
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, false, true, false) };
+		unsafe {
+			thread::scope(|s| {
+				let mut pipe_fds = [-1i32; 2];
+				if libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+					return Err(BindMountSandboxError::ReadMountinfoFailed(
+						io::Error::last_os_error(),
+					));
+				}
+				let read_fd = pipe_fds[0];
+				let write_fd = pipe_fds[1];
+
+				// Read the whole pipe concurrently with the child writing,
+				// so a mountinfo larger than the pipe buffer can't
+				// deadlock.
+				let reader = s.spawn(move || {
+					let mut out = Vec::new();
+					let mut buf = [0u8; 8192];
+					loop {
+						let n =
+							libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+						if n < 0 {
+							let err = io::Error::last_os_error();
+							if err.kind() == io::ErrorKind::Interrupted {
+								continue;
+							}
+							libc::close(read_fd);
+							return Err(err);
+						}
+						if n == 0 {
+							break;
+						}
+						out.extend_from_slice(&buf[..n as usize]);
+					}
+					libc::close(read_fd);
+					Ok(out)
+				});
+
+				let fork_res = fork_wait(|| {
+					libc::close(read_fd);
+					// Pin a handle to the host procfs *before* entering m1,
+					// because m1's mount layout has no /proc mounted.  An
+					// fd to procfs stays valid across setns; reading
+					// `self/mountinfo` through it still reflects the
+					// reader's *current* mount namespace (m1 after setns),
+					// rendered relative to m1's root (mntns_install sets
+					// our fs root/pwd to m1's root).
+					let proc_fd = libc::open(
+						c"/proc".as_ptr(),
+						libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+					);
+					if proc_fd < 0 {
+						return perror!("open(/proc)");
+					}
+					match nsenter_fn() {
+						Ok(()) => (),
+						Err(e) => {
+							if ENABLE_LOG_IN_FORK {
+								error!("Failed to enter m1 for mountinfo: {}", e);
+							}
+							libc::close(proc_fd);
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+					}
+					let src = libc::openat(
+						proc_fd,
+						c"self/mountinfo".as_ptr(),
+						libc::O_RDONLY | libc::O_CLOEXEC,
+					);
+					libc::close(proc_fd);
+					if src < 0 {
+						return perror!("openat(/proc/self/mountinfo)");
+					}
+					let mut buf = [0u8; 8192];
+					loop {
+						let n = libc::read(src, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+						if n < 0 {
+							let err = libc::__errno_location().read();
+							if err == libc::EINTR {
+								continue;
+							}
+							libc::close(src);
+							return err;
+						}
+						if n == 0 {
+							break;
+						}
+						let mut off = 0isize;
+						while off < n {
+							let w = libc::write(
+								write_fd,
+								buf.as_ptr().offset(off) as *const libc::c_void,
+								(n - off) as usize,
+							);
+							if w < 0 {
+								let err = libc::__errno_location().read();
+								if err == libc::EINTR {
+									continue;
+								}
+								libc::close(src);
+								return err;
+							}
+							off += w;
+						}
+					}
+					libc::close(src);
+					0
+				});
+				// Closing our copy of the write end lets the reader see EOF.
+				libc::close(write_fd);
+
+				let fork_res = match fork_res {
+					Ok(c) => c,
+					Err(e) => {
+						let _ = reader.join();
+						return Err(BindMountSandboxError::ForkError(e));
+					}
+				};
+				let read_res = reader.join().expect("mountinfo reader thread panicked");
+				if fork_res != 0 {
+					return Err(BindMountSandboxError::ReadMountinfoFailed(
+						io::Error::from_raw_os_error(fork_res),
+					));
+				}
+				read_res.map_err(BindMountSandboxError::ReadMountinfoFailed)
+			})
+		}
+	}
+
+	/// Move the mount currently at `ns_path` into the hidden scratch
+	/// tmpfs at `scratch/<name>`, preserving its `struct mount` identity.
+	/// Used to temporarily "park" a child (or a soon-to-be-rebuilt
+	/// parent's descendants) out of the way during reconcile so a
+	/// non-`MNT_DETACH` umount of its old location can proceed.  The
+	/// `name` must be a single path component (no slashes).
+	pub fn park_to_scratch(
+		&self,
+		ns_path: &CStr,
+		name: &CStr,
+	) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(ns_path)?;
+		let scratch_fd = self.m1_scratch_fd.as_raw_fd();
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
+		let fork_res = unsafe {
+			fork_wait(|| {
+				match nsenter_fn() {
+					Ok(()) => (),
+					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
+				}
+				// Create scratch/<name> to receive the parked mount.
+				if libc::mkdirat(scratch_fd, name.as_ptr(), 0o700) != 0 {
+					let err = libc::__errno_location().read();
+					if err != libc::EEXIST {
+						return perror!("mkdirat(scratch/name)");
+					}
+				}
+				let mut openhow: libc::open_how = mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				let src_fd = libc::syscall(
+					libc::SYS_openat2,
+					libc::AT_FDCWD,
+					ns_path.as_ptr(),
+					&openhow as *const _,
+					std::mem::size_of::<libc::open_how>(),
+				) as libc::c_int;
+				if src_fd < 0 {
+					return perror!("openat2(park source)");
+				}
+				let res = libc::syscall(
+					libc::SYS_move_mount,
+					src_fd,
+					c"".as_ptr(),
+					scratch_fd,
+					name.as_ptr(),
+					libc::MOVE_MOUNT_F_EMPTY_PATH,
+				);
+				libc::close(src_fd);
+				if res != 0 {
+					return perror!("move_mount(park)");
+				}
+				0
+			})
+		}
+		.map_err(BindMountSandboxError::ForkError)?;
+		if fork_res != 0 {
+			return Err(BindMountSandboxError::ParkToScratchFailed(fork_res));
+		}
+		Ok(())
+	}
+
+	/// Move a previously parked mount at `scratch/<name>` back to
+	/// `dest` (an absolute m1 path whose mountpoint dentry must exist),
+	/// then remove the now-empty `scratch/<name>` directory.  The inverse
+	/// of [`Self::park_to_scratch`].
+	pub fn restore_from_scratch(
+		&self,
+		name: &CStr,
+		dest: &CStr,
+	) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(dest)?;
+		let scratch_fd = self.m1_scratch_fd.as_raw_fd();
+		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
+		let fork_res = unsafe {
+			fork_wait(|| {
+				match nsenter_fn() {
+					Ok(()) => (),
+					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
+				}
+				let mut openhow: libc::open_how = mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS;
+				let src_fd = libc::syscall(
+					libc::SYS_openat2,
+					scratch_fd,
+					name.as_ptr(),
+					&openhow as *const _,
+					std::mem::size_of::<libc::open_how>(),
+				) as libc::c_int;
+				if src_fd < 0 {
+					return perror!("openat2(scratch/name)");
+				}
+				let mut dest_openhow: libc::open_how = mem::zeroed();
+				dest_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				dest_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				let dest_fd = libc::syscall(
+					libc::SYS_openat2,
+					libc::AT_FDCWD,
+					dest.as_ptr(),
+					&dest_openhow as *const _,
+					std::mem::size_of::<libc::open_how>(),
+				) as libc::c_int;
+				if dest_fd < 0 {
+					libc::close(src_fd);
+					return perror!("openat2(restore dest)");
+				}
+				let res = libc::syscall(
+					libc::SYS_move_mount,
+					src_fd,
+					c"".as_ptr(),
+					dest_fd,
+					c"".as_ptr(),
+					libc::MOVE_MOUNT_F_EMPTY_PATH | libc::MOVE_MOUNT_T_EMPTY_PATH,
+				);
+				libc::close(src_fd);
+				libc::close(dest_fd);
+				if res != 0 {
+					return perror!("move_mount(restore)");
+				}
+				// Best-effort cleanup of the now-empty scratch dir.
+				libc::unlinkat(scratch_fd, name.as_ptr(), libc::AT_REMOVEDIR);
+				0
+			})
+		}
+		.map_err(BindMountSandboxError::ForkError)?;
+		if fork_res != 0 {
+			return Err(BindMountSandboxError::RestoreFromScratchFailed(fork_res));
+		}
+		Ok(())
+	}
+
+	/// Unmount `ns_path` while preserving its sub-mounts: park every
+	/// direct sub-mount under `ns_path` to the hidden scratch tmpfs,
+	/// attempt a non-detach
+	/// `umount2(ns_path)`, then restore the parked sub-mounts onto their
+	/// original paths.  Returns `Ok(true)` if the parent mount was
+	/// successfully unmounted, or `Ok(false)` if it was kept because the
+	/// app still holds it (the umount returned `EBUSY`).  In both cases
+	/// the children keep their `struct mount` identity (and thus any app
+	/// fds / cwd resolving through them remain valid).
+	///
+	/// `child_ns_paths` must list the *direct* (topmost) sub-mounts of
+	/// `ns_path` in the live mount tree - parking all present children
+	/// (not just still-desired ones) is required so that none of them
+	/// pins the parent and causes a spurious `EBUSY`.  Their
+	/// mountpoint dentries must exist on the layer revealed by the umount
+	/// (the placeholder hierarchy), which the caller is responsible for.
+	pub(self) fn unmount_covering(
+		&self,
+		ns_path: &CStr,
+		child_ns_paths: &[CString],
+	) -> Result<bool, BindMountSandboxError> {
+		validate_sandbox_path(ns_path)?;
+		// Park each direct child out of the way so it can't pin the
+		// parent; each gets a unique scratch directory.
+		let mut parked: Vec<(CString, &CStr)> = Vec::with_capacity(child_ns_paths.len());
+		for child in child_ns_paths {
+			let name = next_scratch_name();
+			if let Err(e) = self.park_to_scratch(child, &name) {
+				// Best-effort: restore anything already parked before
+				// propagating the failure.
+				for (name, dest) in &parked {
+					let _ = self.restore_from_scratch(name, dest);
+				}
+				return Err(e);
+			}
+			parked.push((name, child.as_c_str()));
+		}
+		// Attempt a non-detach unmount.  With every child parked, only the
+		// app's own references on `ns_path` can still pin it.
+		let unmounted = match self.unmount(ns_path, false) {
+			Ok(()) => true,
+			Err(BindMountSandboxError::UnmountFailed(e)) if e == libc::EBUSY => false,
+			Err(e) => {
+				for (name, dest) in &parked {
+					let _ = self.restore_from_scratch(name, dest);
+				}
+				return Err(e);
+			}
+		};
+		// Restore each parked child onto its original path: on the
+		// revealed placeholder layer when unmounted, or under the kept
+		// mount on EBUSY.
+		for (name, dest) in &parked {
+			self.restore_from_scratch(name, dest)?;
+		}
+		Ok(unmounted)
+	}
+
 	/// instead of [`Self::run_command`], most likely within a pre_exec
 	/// hook or after fork()ing.  This cannot be used if the current
 	/// process contains more than one threads.
@@ -785,10 +1453,38 @@ impl BindMountSandbox {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedMountPoint {
+	#[cfg_attr(
+		feature = "serialize",
+		serde(
+			serialize_with = "serialize_cstring",
+			deserialize_with = "deserialize_cstring"
+		)
+	)]
 	pub host_path: CString,
 	pub attrs: MountAttributes,
+}
+
+/// Internal per-mount bookkeeping kept in `current_mount_tree`.  Wraps
+/// the user-facing [`ManagedMountPoint`] with the kernel `mnt_id`
+/// captured at mount-creation time, used as the staleness key when
+/// deciding whether a held fd must be re-resolved through the current
+/// mount layout.
+#[derive(Debug, Clone)]
+pub(crate) struct MountInternal {
+	/// host_path + currently-applied attrs (the user-visible part).
+	pub user: ManagedMountPoint,
+	/// Kernel `mnt_id` captured at creation via `statx(STATX_MNT_ID)`
+	/// from the m1 helper; 0 if the capture failed.
+	pub mnt_id: u64,
+	/// Threads (`/proc/<tid>` handles) whose cwd this mount was created
+	/// to back (via `chdir`/`fchdir`).  Empty for ordinary policy
+	/// mounts.  A `Removed` reconcile defers unmounting while any holder
+	/// is still alive and either mid-`chdir` or with its cwd still here,
+	/// so a still-pinned cwd is never yanked out from under the app.
+	pub cwd_of: Vec<Arc<ProcPidFd>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,16 +1493,33 @@ pub enum ManagedTreeEntry {
 	BindMount(ManagedMountPoint),
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "snake_case"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedPlaceholder {
-	PlaceholderDir(PlaceholderDirData),
-	PlaceholderFile(PlaceholderFileData),
-	PlaceholderSymlink(PlaceholderSymlinkData),
+	Dir(PlaceholderDirData),
+	File(PlaceholderFileData),
+	Symlink(PlaceholderSymlinkData),
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct CommonPlaceholderData {
+	#[cfg_attr(
+		feature = "serialize",
+		serde(
+			serialize_with = "serialize_timespec",
+			deserialize_with = "deserialize_timespec"
+		)
+	)]
 	pub atime: libc::timespec,
+	#[cfg_attr(
+		feature = "serialize",
+		serde(
+			serialize_with = "serialize_timespec",
+			deserialize_with = "deserialize_timespec"
+		)
+	)]
 	pub mtime: libc::timespec,
 }
 
@@ -836,8 +1549,10 @@ impl CommonPlaceholderData {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderDirData {
+	#[cfg_attr(feature = "serialize", serde(flatten))]
 	pub common: CommonPlaceholderData,
 	pub mode: u32,
 }
@@ -1015,17 +1730,17 @@ fn create_or_update_placeholder(
 		libc::mode_t,
 		Option<libc::mode_t>,
 	) = match placeholder_data {
-		ManagedPlaceholder::PlaceholderDir(d) => (
+		ManagedPlaceholder::Dir(d) => (
 			&d.common,
 			libc::S_IFDIR,
 			Some((d.mode & 0o7777) as libc::mode_t),
 		),
-		ManagedPlaceholder::PlaceholderFile(f) => (
+		ManagedPlaceholder::File(f) => (
 			&f.common,
 			libc::S_IFREG,
 			Some((f.mode & 0o7777) as libc::mode_t),
 		),
-		ManagedPlaceholder::PlaceholderSymlink(s) => (&s.common, libc::S_IFLNK, None),
+		ManagedPlaceholder::Symlink(s) => (&s.common, libc::S_IFLNK, None),
 	};
 
 	let mut attempts: u32 = 0;
@@ -1041,10 +1756,10 @@ fn create_or_update_placeholder(
 		let create_err: io::Error;
 		unsafe {
 			let res = match placeholder_data {
-				ManagedPlaceholder::PlaceholderDir(_) => {
+				ManagedPlaceholder::Dir(_) => {
 					libc::mkdirat(dirfd, name.as_ptr(), mode_perms.unwrap())
 				}
-				ManagedPlaceholder::PlaceholderFile(_) => {
+				ManagedPlaceholder::File(_) => {
 					let fd = libc::openat(
 						dirfd,
 						name.as_ptr(),
@@ -1060,7 +1775,7 @@ fn create_or_update_placeholder(
 						0
 					}
 				}
-				ManagedPlaceholder::PlaceholderSymlink(s) => {
+				ManagedPlaceholder::Symlink(s) => {
 					libc::symlinkat(s.target.as_ptr(), dirfd, name.as_ptr())
 				}
 			};
@@ -1078,13 +1793,13 @@ fn create_or_update_placeholder(
 
 		if create_err.kind() != io::ErrorKind::AlreadyExists {
 			return Err(match placeholder_data {
-				ManagedPlaceholder::PlaceholderDir(_) => {
+				ManagedPlaceholder::Dir(_) => {
 					BindMountSandboxError::Mkdir(name.to_owned(), create_err)
 				}
-				ManagedPlaceholder::PlaceholderFile(_) => {
+				ManagedPlaceholder::File(_) => {
 					BindMountSandboxError::Mkfile(name.to_owned(), create_err)
 				}
-				ManagedPlaceholder::PlaceholderSymlink(s) => {
+				ManagedPlaceholder::Symlink(s) => {
 					BindMountSandboxError::Symlinkat(name.to_owned(), s.target.clone(), create_err)
 				}
 			});
@@ -1111,7 +1826,7 @@ fn create_or_update_placeholder(
 		}
 
 		// Right type.  For symlinks, also verify the target.
-		if let ManagedPlaceholder::PlaceholderSymlink(s) = placeholder_data {
+		if let ManagedPlaceholder::Symlink(s) = placeholder_data {
 			let mut buf = vec![0u8; libc::PATH_MAX as usize];
 			let n = unsafe {
 				libc::readlinkat(dirfd, name.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
@@ -1177,6 +1892,53 @@ fn create_or_update_placeholder(
 	Ok(())
 }
 
+/// Stat a host path from the caller's mount namespace.  Symlinks are
+/// not followed.
+fn stat_host(host_path: &CStr) -> Result<libc::stat, BindMountSandboxError> {
+	let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+	let res = unsafe {
+		libc::fstatat(
+			libc::AT_FDCWD,
+			host_path.as_ptr(),
+			&mut stat,
+			libc::AT_SYMLINK_NOFOLLOW,
+		)
+	};
+	if res != 0 {
+		return Err(BindMountSandboxError::StatHostPath(
+			host_path.to_owned(),
+			io::Error::last_os_error(),
+		));
+	}
+	Ok(stat)
+}
+
+/// Compute the host path that a covering mount would expose at a
+/// descendant sandbox path.  Given a covering mount at sandbox path
+/// `par_sb` bound to host `par_host`, the descendant `path` (which must
+/// be `par_sb` plus a `/`-separated suffix) is exposed at
+/// `par_host` + that same suffix.  The result is normalised (no trailing
+/// or doubled slashes), e.g. `("/etc", "/", "/home/x") -> "/etc/home/x"`,
+/// `("/", "/home", "/home/x") -> "/x"`.
+fn join_host_suffix(par_host: &[u8], par_sb: &[u8], path: &[u8]) -> Vec<u8> {
+	let suffix = &path[par_sb.len().min(path.len())..];
+	let mut out: Vec<u8> = par_host.to_vec();
+	while out.len() > 1 && out.last() == Some(&b'/') {
+		out.pop();
+	}
+	if out == b"/" {
+		out.clear();
+	}
+	for comp in suffix.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+		out.push(b'/');
+		out.extend_from_slice(comp);
+	}
+	if out.is_empty() {
+		out.push(b'/');
+	}
+	out
+}
+
 /// Convenience for callers that just need to ensure an entry exists
 /// with sensible default mode and without touching timestamps.
 fn placeholder_default_no_metadata(kind_is_dir: bool) -> ManagedPlaceholder {
@@ -1191,12 +1953,12 @@ fn placeholder_default_no_metadata(kind_is_dir: bool) -> ManagedPlaceholder {
 		},
 	};
 	if kind_is_dir {
-		ManagedPlaceholder::PlaceholderDir(PlaceholderDirData {
+		ManagedPlaceholder::Dir(PlaceholderDirData {
 			common,
 			mode: 0o755,
 		})
 	} else {
-		ManagedPlaceholder::PlaceholderFile(PlaceholderFileData {
+		ManagedPlaceholder::File(PlaceholderFileData {
 			common,
 			mode: 0o644,
 			len: 0,
@@ -1204,8 +1966,179 @@ fn placeholder_default_no_metadata(kind_is_dir: bool) -> ManagedPlaceholder {
 	}
 }
 
+/// Syscall numbers for `chdir` / `fchdir`, resolved once for the native
+/// architecture.  Used by [`ProcPidFd::in_chdir_syscall`] to tell whether
+/// a thread is *currently* executing a directory-change syscall.
+fn chdir_syscall_nrs() -> &'static [i64] {
+	static ONCE: OnceLock<Vec<i64>> = OnceLock::new();
+	ONCE.get_or_init(|| {
+		let mut v = Vec::new();
+		for name in ["chdir", "fchdir"] {
+			if let Ok(nr) = libseccomp::ScmpSyscall::from_name(name) {
+				v.push(i32::from(nr) as i64);
+			}
+		}
+		v
+	})
+}
+
+/// An `O_PATH` handle to `/proc/<tid>` (a *thread*, not a thread group)
+/// used to inspect a sandboxed thread's liveness, current working
+/// directory, and current syscall.  Holding the procfs directory open is
+/// reuse-safe: once the original task exits, the dentry is invalidated and
+/// `openat` / `readlinkat` through this handle fail with `ENOENT` / `ESRCH`
+/// even if the kernel later recycles the tid.
+#[derive(Debug)]
+pub(crate) struct ProcPidFd {
+	tid: libc::pid_t,
+	dirfd: OwnedFd,
+}
+
+impl ProcPidFd {
+	/// Open `/proc/<tid>` (the per-thread procfs directory).
+	pub(crate) fn from_tid(tid: libc::pid_t) -> io::Result<Self> {
+		let path = format!("/proc/{}\0", tid);
+		let fd = unsafe {
+			libc::open(
+				path.as_ptr() as *const libc::c_char,
+				libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+			)
+		};
+		if fd < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(Self {
+			tid,
+			dirfd: unsafe { OwnedFd::from_raw_fd(fd) },
+		})
+	}
+
+	pub(crate) fn tid(&self) -> libc::pid_t {
+		self.tid
+	}
+
+	/// Open a file relative to `/proc/<tid>` (e.g. `status`, `cwd`,
+	/// `syscall`) through the held directory handle.
+	fn open_proc_file(&self, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+		let fd = unsafe { libc::openat(self.dirfd.as_raw_fd(), name.as_ptr(), flags) };
+		if fd < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+	}
+
+	/// Whether the thread is still alive (not reaped / not a zombie).
+	pub(crate) fn is_alive(&self) -> io::Result<bool> {
+		match self.open_proc_file(c"status", libc::O_RDONLY | libc::O_CLOEXEC) {
+			Ok(fd) => {
+				let mut f = std::fs::File::from(fd);
+				let mut s = String::new();
+				f.read_to_string(&mut s)?;
+				Ok(!s.contains("State:\tZ"))
+			}
+			Err(e) => match e.raw_os_error() {
+				// Dentry invalidated: the task exited (and the tid may have
+				// been recycled - this handle still refers to the old one).
+				Some(libc::ENOENT) | Some(libc::ESRCH) => Ok(false),
+				_ => Err(e),
+			},
+		}
+	}
+
+	/// Read the thread's current working directory (as a sandbox-namespace
+	/// path) by `readlinkat`-ing `/proc/<tid>/cwd`.
+	pub(crate) fn cwd(&self) -> io::Result<OsString> {
+		let mut buf = vec![0u8; libc::PATH_MAX as usize];
+		let ret = unsafe {
+			libc::readlinkat(
+				self.dirfd.as_raw_fd(),
+				c"cwd".as_ptr(),
+				buf.as_mut_ptr() as *mut libc::c_char,
+				buf.len(),
+			)
+		};
+		if ret < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		buf.truncate(ret as usize);
+		Ok(OsString::from_vec(buf))
+	}
+
+	/// Whether the thread is *currently* executing a `chdir` / `fchdir`
+	/// syscall, read from the first token of `/proc/<tid>/syscall` (the
+	/// syscall number, or `running` in userspace, or `-1` when not in a
+	/// syscall).
+	///
+	/// Returns `true` on any read / parse failure so callers treat an
+	/// unreadable state conservatively (assume an in-flight chdir and keep
+	/// the mount).  This is the load-bearing in-flight guard that makes the
+	/// cwd-mount cleanup race-free: it must be read *before* [`Self::cwd`].
+	pub(crate) fn in_chdir_syscall(&self) -> bool {
+		let fd = match self.open_proc_file(c"syscall", libc::O_RDONLY | libc::O_CLOEXEC) {
+			Ok(fd) => fd,
+			Err(_) => return true,
+		};
+		let mut f = std::fs::File::from(fd);
+		let mut s = String::new();
+		if f.read_to_string(&mut s).is_err() {
+			return true;
+		}
+		let Some(first) = s.split_whitespace().next() else {
+			return true;
+		};
+		match first.parse::<i64>() {
+			// In a syscall: in-flight iff it's chdir/fchdir.
+			Ok(nr) => chdir_syscall_nrs().contains(&nr),
+			// "running" (userspace) or anything unparseable: not in chdir.
+			Err(_) => false,
+		}
+	}
+}
+
+/// Remove "useless" bind-mount entries from a *policy* tree in place: a
+/// bind mount whose attributes match the nearest covering parent mount and
+/// which exposes exactly the host subtree that parent already exposes
+/// (`host_path == parent_host + suffix`) is redundant, since the parent
+/// bind already makes that subtree visible with the same permissions.
+///
+/// This is applied to the saved policy by the policy-mutating entry points
+/// (`add_/remove_/update_*`) so stray redundant mounts (e.g. a per-request
+/// leaf that a broader grant later subsumed) don't accumulate.  It is
+/// deliberately *not* applied on the `chdir` path, whose temporary cwd
+/// mount is redundant by this very definition yet must be materialised.
+fn prune_useless_mounts(policy: &mut FsTree<ManagedTreeEntry>) {
+	let mut to_remove: Vec<OsString> = Vec::new();
+	policy.fold_top_down_from(
+		|path, entry, covering: Option<(Vec<u8>, Vec<u8>, MountAttributes)>| match entry {
+			ManagedTreeEntry::Placeholder(_) => covering,
+			ManagedTreeEntry::BindMount(mp) => {
+				if let Some((ref par_sb, ref par_host, par_attrs)) = covering {
+					let expected_host = join_host_suffix(par_host, par_sb, path.as_encoded_bytes());
+					if mp.attrs == par_attrs && mp.host_path.to_bytes() == expected_host.as_slice()
+					{
+						// Redundant: drop it, but keep the same covering mount
+						// for descendants (it renders identically).
+						to_remove.push(path.to_owned());
+						return covering;
+					}
+				}
+				Some((
+					path.as_encoded_bytes().to_vec(),
+					mp.host_path.to_bytes().to_vec(),
+					mp.attrs,
+				))
+			}
+		},
+		None,
+		OsStr::new("/"),
+	);
+	for p in to_remove {
+		policy.remove(&p);
+	}
+}
+
 fn placeholder_default_symlink(target: CString) -> ManagedPlaceholder {
-	ManagedPlaceholder::PlaceholderSymlink(PlaceholderSymlinkData {
+	ManagedPlaceholder::Symlink(PlaceholderSymlinkData {
 		common: CommonPlaceholderData {
 			atime: libc::timespec {
 				tv_sec: 0,
@@ -1229,8 +2162,10 @@ impl PlaceholderDirData {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderFileData {
+	#[cfg_attr(feature = "serialize", serde(flatten))]
 	pub common: CommonPlaceholderData,
 	pub mode: u32,
 	pub len: u64,
@@ -1246,9 +2181,18 @@ impl PlaceholderFileData {
 	}
 }
 
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderSymlinkData {
+	#[cfg_attr(feature = "serialize", serde(flatten))]
 	pub common: CommonPlaceholderData,
+	#[cfg_attr(
+		feature = "serialize",
+		serde(
+			serialize_with = "serialize_cstring",
+			deserialize_with = "deserialize_cstring"
+		)
+	)]
 	pub target: CString,
 }
 
@@ -1261,20 +2205,131 @@ impl PlaceholderSymlinkData {
 	}
 }
 
+/// Debug-print an [`FsTree`], one node per line, indented by depth and
+/// using [`FsTree::walk_top_down`].  Each line is `<path>: <Debug of
+/// node>`, e.g.
+///
+/// ```text
+/// /: ...
+///   /usr: ...
+///   /home: ...
+///     /home/mao: ...
+///   /proc: ...
+/// ```
+fn print_tree<T: std::fmt::Debug>(label: &str, tree: &FsTree<T>) {
+	if !log::log_enabled!(log::Level::Debug) {
+		return;
+	}
+	let mut out = format!("{}:", label);
+	tree.walk_top_down(|path, node| {
+		let depth = path
+			.as_encoded_bytes()
+			.split(|&b| b == b'/')
+			.filter(|s| !s.is_empty())
+			.count();
+		out.push_str(&format!(
+			"\n{}{}: {:?}",
+			"  ".repeat(depth),
+			path.to_string_lossy(),
+			node
+		));
+	});
+	debug!("{}", out);
+}
+
 /// Implements a bind-mount based sandbox that automatically mount and
 /// unmounts based on a desired state.
 #[derive(Debug)]
 pub struct ManagedBindMountSandbox {
 	sandbox: BindMountSandbox,
-	current_mount_tree: Mutex<FsTree<ManagedMountPoint>>,
+	/// The desired policy: the source of truth for what *should* be
+	/// mounted.  Mutated by `add_/remove_/update_*` and diffed against the
+	/// live state by `reconcile`.  Kept separate from the live trees below
+	/// (which reflect what is *actually* mounted) so transient mounts that
+	/// are reconciled in but never part of the policy - notably `chdir`
+	/// cwd mounts - are naturally cleaned up on a later reconcile
+	/// instead of lingering forever.
+	current_policy: Mutex<FsTree<ManagedTreeEntry>>,
+	current_placeholder_tree: Mutex<FsTree<ManagedPlaceholder>>,
+	current_mount_tree: Mutex<FsTree<MountInternal>>,
 }
 
 impl ManagedBindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
 		Ok(Self {
 			sandbox: BindMountSandbox::new(disable_userns)?,
+			current_policy: Mutex::new(FsTree::new()),
+			current_placeholder_tree: Mutex::new(FsTree::new()),
 			current_mount_tree: Mutex::new(FsTree::new()),
 		})
+	}
+
+	fn check_path_no_nul(path: &OsStr) -> Result<(), BindMountSandboxError> {
+		if path.as_encoded_bytes().contains(&0) {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"path contains NUL byte",
+				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
+					.expect("debug format should not contain NUL bytes"),
+			));
+		}
+		Ok(())
+	}
+
+	/// Convenience: update a single entry (placeholder or mount) and
+	/// reconcile.
+	///
+	/// Reconciliation may touch other paths (ancestors, shadowed
+	/// sub-mounts, previously-tracked entries).  Only an error related to
+	/// `path` itself is surfaced to the caller; failures on unrelated
+	/// paths are logged by `reconcile` but do not fail this call.
+	pub fn add_or_update_entry(
+		&self,
+		path: &OsStr,
+		entry: ManagedTreeEntry,
+	) -> Result<(), BindMountSandboxError> {
+		debug!("add_or_update_entry: path={:?}, entry={:?}", path, entry);
+		Self::check_path_no_nul(path)?;
+		let (mut policy, mut pt, mut mt) = self.lock_trees();
+		policy.insert(path, entry);
+		prune_useless_mounts(&mut policy);
+		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
+		Self::error_for_path(errors, path)
+	}
+
+	/// Reconcile a *transient* `chdir` cwd mount at `target` for the thread
+	/// `pidfd`, without persisting it to the policy.  The mount is
+	/// force-materialised even though it mirrors its covering parent (and so
+	/// would be pruned as "useless"), and is tagged with `pidfd` so a later
+	/// reconcile keeps it alive only while that thread's cwd still needs it.
+	fn reconcile_chdir(
+		&self,
+		target: &OsStr,
+		mp: ManagedMountPoint,
+		pidfd: Arc<ProcPidFd>,
+	) -> Result<(), BindMountSandboxError> {
+		Self::check_path_no_nul(target)?;
+		let (policy, mut pt, mut mt) = self.lock_trees();
+		let errors = self.reconcile(
+			&mut pt,
+			&mut mt,
+			&policy,
+			Some((target.to_owned(), mp, pidfd)),
+		);
+		Self::error_for_path(errors, target)
+	}
+
+	/// Pick out the reconcile error (if any) that relates to `path`,
+	/// discarding errors on unrelated paths.
+	fn error_for_path(
+		errors: Vec<(OsString, BindMountSandboxError)>,
+		path: &OsStr,
+	) -> Result<(), BindMountSandboxError> {
+		for (p, e) in errors {
+			if p.as_os_str() == path {
+				return Err(e);
+			}
+		}
+		Ok(())
 	}
 
 	pub fn add_or_update_mount(
@@ -1282,132 +2337,552 @@ impl ManagedBindMountSandbox {
 		path: &OsStr,
 		mp: ManagedMountPoint,
 	) -> Result<(), BindMountSandboxError> {
-		if path.as_encoded_bytes().contains(&0) {
-			return Err(BindMountSandboxError::InvalidSandboxPath(
-				"path contains NUL byte",
-				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
-					.expect("debug format should not contain NUL bytes"),
-			));
-		}
-		let mut mt = self
-			.current_mount_tree
-			.lock()
-			.expect("current_mount_tree lock poisoned");
-		let mut new_tree_state = mt.clone();
-		new_tree_state.insert(path, mp);
-		self.update_mounts_from_tree_impl(&mut mt, &new_tree_state)
+		debug!("add_or_update_mount: path={:?}, mp={:?}", path, mp);
+		self.add_or_update_entry(path, ManagedTreeEntry::BindMount(mp))
+	}
+
+	pub fn add_or_update_placeholder(
+		&self,
+		path: &OsStr,
+		ph: ManagedPlaceholder,
+	) -> Result<(), BindMountSandboxError> {
+		debug!("add_or_update_placeholder: path={:?}, ph={:?}", path, ph);
+		self.add_or_update_entry(path, ManagedTreeEntry::Placeholder(ph))
+	}
+
+	/// Remove either the placeholder or mount entry at the given path.
+	pub fn remove_entry(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
+		Self::check_path_no_nul(path)?;
+		let (mut policy, mut pt, mut mt) = self.lock_trees();
+		policy.remove(path);
+		prune_useless_mounts(&mut policy);
+		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
+		Self::error_for_path(errors, path)
 	}
 
 	pub fn remove_mount(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
-		if path.as_encoded_bytes().contains(&0) {
-			return Err(BindMountSandboxError::InvalidSandboxPath(
-				"path contains NUL byte",
-				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
-					.expect("debug format should not contain NUL bytes"),
-			));
+		self.remove_entry(path)
+	}
+
+	pub fn update_from_tree(
+		&self,
+		desired_tree: &FsTree<ManagedTreeEntry>,
+	) -> Result<(), BindMountSandboxError> {
+		let (mut policy, mut pt, mut mt) = self.lock_trees();
+		*policy = desired_tree.clone();
+		prune_useless_mounts(&mut policy);
+		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
+		// A bulk update has no single "target" path, so surface the
+		// first error encountered (all are logged by `reconcile`).
+		match errors.into_iter().next() {
+			Some((_, e)) => Err(e),
+			None => Ok(()),
 		}
-		let mut mt = self
-			.current_mount_tree
-			.lock()
-			.expect("current_mount_tree lock poisoned");
-		let mut new_tree_state = mt.clone();
-		new_tree_state.remove(path);
-		self.update_mounts_from_tree_impl(&mut mt, &new_tree_state)
+	}
+
+	pub fn update_from_list<'a>(
+		&self,
+		desired_entries: impl IntoIterator<Item = (&'a OsStr, ManagedTreeEntry)>,
+	) -> Result<(), BindMountSandboxError> {
+		let mut tree = FsTree::new();
+		for (path, entry) in desired_entries {
+			Self::check_path_no_nul(path)?;
+			tree.insert(path, entry);
+		}
+		self.update_from_tree(&tree)
 	}
 
 	pub fn update_mounts_from_tree(
 		&self,
 		desired_tree: &FsTree<ManagedMountPoint>,
 	) -> Result<(), BindMountSandboxError> {
-		let mut mt = self
-			.current_mount_tree
-			.lock()
-			.expect("current_mount_tree lock poisoned");
-		self.update_mounts_from_tree_impl(&mut mt, desired_tree)
+		let mut converted = FsTree::new();
+		desired_tree.walk_top_down(|path, mp| {
+			converted.insert(path, ManagedTreeEntry::BindMount(mp.clone()));
+		});
+		self.update_from_tree(&converted)
 	}
 
 	pub fn update_mounts_from_list<'a>(
 		&self,
 		desired_mounts: impl IntoIterator<Item = (&'a OsStr, ManagedMountPoint)>,
 	) -> Result<(), BindMountSandboxError> {
-		let mut desired_tree = FsTree::new();
-		for (path, mnt) in desired_mounts {
-			if path.as_encoded_bytes().contains(&0) {
-				return Err(BindMountSandboxError::InvalidSandboxPath(
-					"path contains NUL byte",
-					CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
-						.expect("debug format should not contain NUL byte"),
-				));
-			}
-			desired_tree.insert(path, mnt);
-		}
-		self.update_mounts_from_tree(&desired_tree)
+		self.update_from_list(
+			desired_mounts
+				.into_iter()
+				.map(|(p, m)| (p, ManagedTreeEntry::BindMount(m))),
+		)
 	}
 
-	fn update_mounts_from_tree_impl(
+	fn lock_trees(
 		&self,
-		current_tree: &mut FsTree<ManagedMountPoint>,
-		desired_tree: &FsTree<ManagedMountPoint>,
-	) -> Result<(), BindMountSandboxError> {
-		let mut new_tree_state = current_tree.clone();
-		let mut err: Option<BindMountSandboxError> = None;
-		debug!("Current tree: {:?}", current_tree);
-		debug!("Desired tree: {:?}", desired_tree);
-		current_tree.diff(
-			&desired_tree,
+	) -> (
+		std::sync::MutexGuard<'_, FsTree<ManagedTreeEntry>>,
+		std::sync::MutexGuard<'_, FsTree<ManagedPlaceholder>>,
+		std::sync::MutexGuard<'_, FsTree<MountInternal>>,
+	) {
+		// Always acquire in the same order to avoid deadlocks.
+		let policy = self
+			.current_policy
+			.lock()
+			.expect("current_policy lock poisoned");
+		let pt = self
+			.current_placeholder_tree
+			.lock()
+			.expect("current_placeholder_tree lock poisoned");
+		let mt = self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned");
+		(policy, pt, mt)
+	}
+
+	/// Reconcile current state with `desired_entries`.  Caller locks the
+	/// two internal states.
+	///
+	/// Steps:
+	///   1. Build the desired placeholder tree from `desired_entries`,
+	///      including ancestor directories.  For each bind-mount entry,
+	///      synthesize a default placeholder (file or dir, based on the
+	///      host stat) at the mount point if one isn't already specified
+	///      by the user.
+	///   2. Build the desired mount tree.
+	///   3. Diff current_placeholder_tree -> desired_placeholder_tree
+	///      and create/update placeholders (ignoring removals).
+	///   4. Diff current_mount_tree -> desired_mount_tree and
+	///      apply unmount / mount / set_mount_attr accordingly.
+	///   5. Diff current_placeholder_tree -> desired_placeholder_tree
+	///      again and remove now-unused placeholders (ignoring adds).
+	///
+	/// Reconciliation is best-effort and does not stop at the first
+	/// failure: an error applying one path is recorded (annotated by the
+	/// sandbox path it relates to) and the remaining pending
+	/// modifications are still attempted.  The accumulated errors are
+	/// returned to the caller, which decides which ones are relevant.
+	fn reconcile(
+		&self,
+		current_pt: &mut FsTree<ManagedPlaceholder>,
+		current_mt: &mut FsTree<MountInternal>,
+		desired_entries: &FsTree<ManagedTreeEntry>,
+		chdir_mount: Option<(OsString, ManagedMountPoint, Arc<ProcPidFd>)>,
+	) -> Vec<(OsString, BindMountSandboxError)> {
+		let (desired_pt, mut desired_mt, mut errors) = self.build_desired_trees(desired_entries);
+		if let Some((ref path, ref mp, _)) = chdir_mount {
+			// Force-add the transient cwd mount, bypassing the useless-mount
+			// merge in `build_desired_trees`: a chdir mount mirrors its
+			// covering parent (so it *is* "useless" by that test) yet must be
+			// materialised so a later attribute change can reach the pinned
+			// cwd.  It lives under an existing covering mount, so the
+			// mountpoint dentry comes from that mount's host fs - no extra
+			// placeholder is needed.
+			desired_mt.insert(path.as_os_str(), mp.clone());
+		}
+		print_tree("Current placeholder tree", current_pt);
+		print_tree("Desired placeholder tree", &desired_pt);
+		print_tree("Current mount tree", current_mt);
+		print_tree("Desired mount tree", &desired_mt);
+
+		let mut new_pt = current_pt.clone();
+		let mut new_mt = current_mt.clone();
+
+		// Phase 1: create / update placeholders top-down.
+		current_pt.diff(
+			&desired_pt,
 			|sandbox_path, diff| {
-				if err.is_some() {
-					return;
-				}
-				let ns_path = CString::new(sandbox_path.as_encoded_bytes())
-					.expect("caller should have checked for NUL bytes");
+				let ns_path =
+					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
-					crate::fstree::DiffTree::Removed(_) => {
-						if let Err(e) = self.sandbox.unmount(&ns_path) {
-							err = Some(e);
+					crate::fstree::DiffTree::Added(new) => {
+						if let Err(e) = self.apply_placeholder(&ns_path, new) {
+							errors.push((sandbox_path.to_owned(), e));
 							return;
 						}
-						new_tree_state.remove(sandbox_path);
-						if let Err(e) = self.sandbox.remove_placeholder(&ns_path) {
-							err = Some(e);
+						new_pt.insert(sandbox_path, new.clone());
+					}
+					crate::fstree::DiffTree::Updated(_, new) => {
+						if let Err(e) = self.apply_placeholder(&ns_path, new) {
+							errors.push((sandbox_path.to_owned(), e));
 							return;
+						}
+						*new_pt.get_mut(sandbox_path).expect("must exist") = new.clone();
+					}
+					crate::fstree::DiffTree::Removed(_) => {}
+				}
+			},
+			|_, _, _| false,
+			false,
+		);
+
+		// Phase 2: mounts diff.
+		current_mt.diff(
+			&desired_mt,
+			|sandbox_path, diff| {
+				let ns_path =
+					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
+				match diff {
+					crate::fstree::DiffTree::Removed(old) => {
+						// A `Removed` whose path still exists in the desired
+						// mount tree *with a different host_path* is the
+						// removed half of a host_path-change "split":
+						// the diff emits Removed(P) then Added(P).  That
+						// mount's identity is being discarded and the
+						// following Added re-covers P, so detach the old
+						// bind unconditionally (MNT_DETACH) rather than
+						// running the keep-on-EBUSY dance - keeping it
+						// would leave the new bind shadowing the old one.
+						//
+						// A `Removed` whose path is gone from the desired
+						// tree, or still present with the *same* host_path,
+						// is not a split: it is a genuine removal (e.g. a
+						// dummy `chdir` mount being garbage-collected now
+						// that the caller dropped it from the desired tree;
+						// or a child swept into a split because an
+						// *ancestor's* host_path changed).  Those go through
+						// the gentle keep-on-EBUSY unmount below so a
+						// still-held cwd / fd isn't broken by a MNT_DETACH.
+						if let Some(new) = desired_mt.get(sandbox_path)
+							&& new.host_path != old.user.host_path
+						{
+							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
+								errors.push((sandbox_path.to_owned(), e));
+								return;
+							}
+							new_mt.remove(sandbox_path);
+							return;
+						}
+						// a mount that still backs a live thread's cwd
+						// (notably a transient `chdir` mount) must not be
+						// unmounted yet.  Prune holders that have died or moved
+						// away; if any survive (alive and either mid-`chdir` or
+						// with their cwd still here), keep the mount with the
+						// pruned holder list and defer removal to a later
+						// reconcile.  Ordinary policy mounts have an empty
+						// `cwd_of` and skip straight to the unmount below.
+						if !old.cwd_of.is_empty() {
+							let survivors = self.retained_cwd_holders(&old.cwd_of, sandbox_path);
+							let entry = new_mt.get_mut(sandbox_path).expect("must exist");
+							if !survivors.is_empty() {
+								entry.cwd_of = survivors;
+								return;
+							}
+							entry.cwd_of.clear();
+						}
+						// discover the direct (topmost) sub-mounts
+						// still present under this path in the live tree
+						// and hand them to the unmount routine, which
+						// parks them out of the way, does a non-detach
+						// umount, then restores them - preserving each
+						// child's `struct mount` identity instead of
+						// detaching the whole subtree.
+						let mut children: Vec<CString> = Vec::new();
+						new_mt.walk_subtree_top_down(sandbox_path, true, |child_path, _| {
+							if let Ok(c) = CString::new(child_path.as_encoded_bytes()) {
+								children.push(c);
+							}
+						});
+						match self.sandbox.unmount_covering(&ns_path, &children) {
+							Ok(true) => {
+								new_mt.remove(sandbox_path);
+							}
+							Ok(false) => {
+								// EBUSY: the app itself still holds this
+								// path.  Keep it but lock it down to the
+								// covering attrs;
+								// a later reconcile retries the removal
+								// once the app lets go (eventual
+								// consistency).
+								let covering = self.covering_attrs(&desired_mt, sandbox_path);
+								if covering != old.user.attrs {
+									if let Err(e) = self.sandbox.set_mount_attr(
+										&ns_path,
+										covering,
+										old.user.attrs,
+									) {
+										errors.push((sandbox_path.to_owned(), e));
+										return;
+									}
+								}
+								let entry = new_mt.get_mut(sandbox_path).expect("must exist");
+								entry.user.attrs = covering;
+							}
+							Err(e) => {
+								errors.push((sandbox_path.to_owned(), e));
+								return;
+							}
 						}
 					}
 					crate::fstree::DiffTree::Added(new) => {
-						let mut b = self
-							.sandbox
-							.mount_host_into_sandbox(&new.host_path, &ns_path);
-						b.attributes(new.attrs);
-						if let Err(e) = b.mount() {
-							err = Some(e);
+						// discover the immediate sub-mounts this new
+						// bind would shadow (topmost mounts strictly under
+						// the path in the live tree) and re-expose them.
+						let mut children: Vec<CString> = Vec::new();
+						new_mt.walk_subtree_top_down(sandbox_path, true, |child_path, _| {
+							if let Ok(c) = CString::new(child_path.as_encoded_bytes()) {
+								children.push(c);
+							}
+						});
+						if let Err(e) = self.sandbox.mount_covering(
+							&new.host_path,
+							&ns_path,
+							new.attrs,
+							&children,
+						) {
+							errors.push((sandbox_path.to_owned(), e));
 							return;
 						}
-						new_tree_state.insert(sandbox_path, new.clone());
+						let mnt_id = self.capture_mnt_id(&ns_path);
+						new_mt.insert(
+							sandbox_path,
+							MountInternal {
+								user: (*new).clone(),
+								mnt_id,
+								cwd_of: Vec::new(),
+							},
+						);
 					}
 					crate::fstree::DiffTree::Updated(old, new) => {
-						assert_eq!(old.host_path, new.host_path);
-						if old.attrs != new.attrs {
+						assert_eq!(old.user.host_path, new.host_path);
+						if old.user.attrs != new.attrs {
 							if let Err(e) =
-								self.sandbox.set_mount_attr(&ns_path, new.attrs, old.attrs)
+								self.sandbox
+									.set_mount_attr(&ns_path, new.attrs, old.user.attrs)
 							{
-								err = Some(e);
+								errors.push((sandbox_path.to_owned(), e));
 								return;
 							}
-							*new_tree_state
-								.get_mut(sandbox_path)
-								.expect("we must have it from before") = new.clone();
+							let entry = new_mt.get_mut(sandbox_path).expect("must exist");
+							entry.user = (*new).clone();
 						}
 					}
 				}
 			},
-			|_, old, new| old.host_path != new.host_path,
-			true,
+			|_, old, new| old.user.host_path != new.host_path,
+			false,
 		);
-		*current_tree = new_tree_state;
-		match err {
-			Some(e) => Err(e),
-			None => Ok(()),
+
+		// Tag the (now-materialised) cwd mount with its holding thread so a
+		// later reconcile can tell it still backs a live cwd.  Covers both the
+		// freshly-`Added` case and a repeat/concurrent chdir to a target that
+		// already had a mount (which produces no diff).
+		if let Some((path, _, pidfd)) = chdir_mount {
+			if let Some(entry) = new_mt.get_mut(path.as_os_str()) {
+				if !entry.cwd_of.iter().any(|p| p.tid() == pidfd.tid()) {
+					entry.cwd_of.push(pidfd);
+				}
+			}
 		}
+
+		// Phase 3: remove placeholders no longer desired (bottom-up).
+		current_pt.diff(
+			&desired_pt,
+			|sandbox_path, diff| {
+				if matches!(diff, crate::fstree::DiffTree::Removed(_)) {
+					let ns_path = CString::new(sandbox_path.as_encoded_bytes())
+						.expect("checked for NUL byte");
+					if ns_path.as_c_str() == c"/" {
+						return;
+					}
+					if let Err(e) = self.sandbox.remove_placeholder(&ns_path) {
+						errors.push((sandbox_path.to_owned(), e));
+						return;
+					}
+					new_pt.remove(sandbox_path);
+				}
+			},
+			|_, _, _| false,
+			false,
+		);
+
+		*current_pt = new_pt;
+		*current_mt = new_mt;
+		for (path, err) in &errors {
+			warn!("reconcile: error applying {:?}: {}", path, err);
+		}
+		errors
+	}
+
+	/// Apply (create or update) a placeholder at `ns_path`.  The parent
+	/// directory must already exist in the backing tmpfs.
+	fn apply_placeholder(
+		&self,
+		ns_path: &CStr,
+		placeholder: &ManagedPlaceholder,
+	) -> Result<(), BindMountSandboxError> {
+		if ns_path == c"/" {
+			// Root is the tmpfs itself; no placeholder to manage.
+			return Ok(());
+		}
+		validate_sandbox_path(ns_path)?;
+		let (_, leaf) = split_parent_leaf(ns_path);
+		let parent_fd = self.sandbox.open_sandbox_parent(ns_path)?;
+		create_or_update_placeholder(parent_fd.as_raw_fd(), leaf, placeholder)
+	}
+
+	/// Build (desired_placeholder_tree, desired_mount_tree) from an
+	/// entry tree.  For each bind-mount entry, a default placeholder is
+	/// synthesized at the mount point if the caller didn't supply one;
+	/// missing ancestor directories are then filled in via
+	/// `FsTree::fill_incomplete_parent` so creation order naturally
+	/// flows parent-before-child.
+	fn build_desired_trees(
+		&self,
+		desired_entries: &FsTree<ManagedTreeEntry>,
+	) -> (
+		FsTree<ManagedPlaceholder>,
+		FsTree<ManagedMountPoint>,
+		Vec<(OsString, BindMountSandboxError)>,
+	) {
+		let mut placeholders: FsTree<ManagedPlaceholder> = FsTree::new();
+		let mut mounts: FsTree<ManagedMountPoint> = FsTree::new();
+		let mut errors: Vec<(OsString, BindMountSandboxError)> = Vec::new();
+		desired_entries.walk_top_down(|path, entry| {
+			if path.as_encoded_bytes() == b"/" {
+				// Root: never a placeholder.  May be a mount target.
+				if let ManagedTreeEntry::BindMount(mp) = entry {
+					mounts.insert(path, mp.clone());
+				}
+				return;
+			}
+			match entry {
+				ManagedTreeEntry::Placeholder(p) => {
+					placeholders.insert(path, p.clone());
+				}
+				ManagedTreeEntry::BindMount(mp) => {
+					if placeholders.get(path).is_none() {
+						// Skip (and record) this single entry on a stat
+						// failure rather than aborting the whole
+						// reconcile: an unrelated mount whose host source
+						// has vanished must not block updates to other
+						// paths.
+						let stat = match stat_host(&mp.host_path) {
+							Ok(s) => s,
+							Err(e) => {
+								errors.push((path.to_owned(), e));
+								return;
+							}
+						};
+						let is_dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
+						placeholders.insert(path, placeholder_default_no_metadata(is_dir));
+					}
+					mounts.insert(path, mp.clone());
+				}
+			}
+		});
+		placeholders.fill_incomplete_parent(|_| placeholder_default_no_metadata(true));
+		(placeholders, mounts, errors)
+	}
+
+	/// Capture the kernel `mnt_id` of the mount currently topmost at
+	/// `ns_path`, by opening an `O_PATH` handle to it in m1 and running
+	/// `statx(STATX_MNT_ID)`.  Returns 0 (and logs) if the capture
+	/// fails, since a missing id only degrades the fd-staleness check
+	/// for that one entry rather than breaking the mount.
+	fn capture_mnt_id(&self, ns_path: &CStr) -> u64 {
+		let mut openhow: libc::open_how = unsafe { mem::zeroed() };
+		openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+		openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+		match self.sandbox.open_in_m1(ns_path, &openhow) {
+			Ok(fd) => match fd.mnt_id() {
+				Ok(id) => id,
+				Err(e) => {
+					warn!("Failed to capture mnt_id for {:?}: {}", ns_path, e);
+					0
+				}
+			},
+			Err(e) => {
+				warn!(
+					"Failed to open {:?} in m1 to capture mnt_id: {}",
+					ns_path, e
+				);
+				0
+			}
+		}
+	}
+
+	/// The attributes a path should fall back to when an entry we tried to
+	/// remove is kept (app still holds it).  This is the attrs of the
+	/// deepest desired entry that is a proper prefix of `path`, or the safe
+	/// default `ro,noexec` when none covers it.
+	fn covering_attrs(
+		&self,
+		desired_mt: &FsTree<ManagedMountPoint>,
+		path: &std::ffi::OsStr,
+	) -> MountAttributes {
+		let mut best: Option<MountAttributes> = None;
+		let mut best_len = 0usize;
+		desired_mt.walk_top_down(|p, mp| {
+			let pb = p.as_encoded_bytes();
+			let path_b = path.as_encoded_bytes();
+			// `p` must be a proper ancestor of `path`: either "/" or a
+			// path that `path` continues with a '/' separator.
+			let is_ancestor = if pb == b"/" {
+				path_b != b"/"
+			} else {
+				path_b.len() > pb.len() && path_b.starts_with(pb) && path_b[pb.len()] == b'/'
+			};
+			if is_ancestor && pb.len() >= best_len {
+				best_len = pb.len();
+				best = Some(mp.attrs);
+			}
+		});
+		best.unwrap_or_else(MountAttributes::ro)
+	}
+
+	/// Of the threads recorded as backing the cwd mount at `target`, return
+	/// those that still need it.  A holder is retained iff it is alive and
+	/// either currently mid-`chdir`/`fchdir` (its move onto `target` may not
+	/// have landed yet) or its cwd is still `target`; a dead or moved-away
+	/// holder is dropped.
+	///
+	/// The two reads are ordered `syscall` *before* `cwd` on purpose: if we
+	/// read `cwd != target` first and the chdir then landed before we read
+	/// `syscall`, both checks would say "gone" and we'd unmount the cwd the
+	/// thread just landed on.  Reading `syscall` first means a `not in
+	/// chdir` result guarantees the in-flight chdir has fully returned, so
+	/// the subsequent `cwd` read reflects its final, stable result.
+	fn retained_cwd_holders(
+		&self,
+		holders: &[Arc<ProcPidFd>],
+		target: &OsStr,
+	) -> Vec<Arc<ProcPidFd>> {
+		let target_bytes = target.as_encoded_bytes();
+		let mut out = Vec::new();
+		for h in holders {
+			match h.is_alive() {
+				Ok(false) => continue, // dead -> drop
+				Ok(true) => {}
+				Err(e) => {
+					// Can't determine liveness: keep conservatively.
+					debug!(
+						"retained_cwd_holders: liveness check failed for tid {}: {} - keeping",
+						h.tid(),
+						e
+					);
+					out.push(h.clone());
+					continue;
+				}
+			}
+			// READ ORDER IS LOAD-BEARING: syscall before cwd (see doc above).
+			if h.in_chdir_syscall() {
+				out.push(h.clone());
+				continue;
+			}
+			match h.cwd() {
+				Ok(cwd) if cwd.as_encoded_bytes() == target_bytes => out.push(h.clone()),
+				Ok(_) => { /* moved away -> drop */ }
+				Err(e) => {
+					// cwd unreadable (e.g. a race with exit): keep
+					// conservatively; a later reconcile will catch the death.
+					debug!(
+						"retained_cwd_holders: cwd read failed for tid {}: {} - keeping",
+						h.tid(),
+						e
+					);
+					out.push(h.clone());
+				}
+			}
+		}
+		out
 	}
 
 	pub fn check_covered<'a>(
@@ -1425,15 +2900,42 @@ impl ManagedBindMountSandbox {
 		{
 			None => return Ok((false, None)),
 			Some((_, mnt)) => {
-				if need_write && mnt.attrs.readonly {
-					return Ok((false, Some(mnt.clone())));
+				if need_write && mnt.user.attrs.readonly {
+					return Ok((false, Some(mnt.user.clone())));
 				}
-				if need_exec && mnt.attrs.noexec {
-					return Ok((false, Some(mnt.clone())));
+				if need_exec && mnt.user.attrs.noexec {
+					return Ok((false, Some(mnt.user.clone())));
 				}
-				Ok((true, Some(mnt.clone())))
+				Ok((true, Some(mnt.user.clone())))
 			}
 		}
+	}
+
+	pub fn has_placeholder(&self, path: &CStr) -> Result<bool, BindMountSandboxError> {
+		validate_sandbox_path(path)?;
+		let pt = self
+			.current_placeholder_tree
+			.lock()
+			.expect("current_placeholder_tree lock poisoned");
+		Ok(pt.get(OsStr::from_bytes(path.to_bytes())).is_some())
+	}
+
+	/// Return the sandbox path and current user-facing mount point of
+	/// every mount under `path`, not including `path` itself.
+	pub fn mounts_under(
+		&self,
+		path: &CStr,
+	) -> Result<Vec<(OsString, ManagedMountPoint)>, BindMountSandboxError> {
+		validate_sandbox_path(path)?;
+		let mt = self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned");
+		let mut out = Vec::new();
+		mt.walk_subtree_top_down(OsStr::from_bytes(path.to_bytes()), false, |p, m| {
+			out.push((p.to_os_string(), m.user.clone()));
+		});
+		Ok(out)
 	}
 
 	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
@@ -1449,5 +2951,227 @@ impl ManagedBindMountSandbox {
 
 	pub fn root_in_sandbox(&self) -> Result<ForeignFd, BindMountSandboxError> {
 		self.sandbox.root_in_sandbox()
+	}
+}
+
+#[cfg(test)]
+mod sandbox_integration_tests {
+	use super::*;
+
+	/// Try to create a low-level sandbox.  Nested user namespaces are
+	/// unavailable in many CI/build environments (and may be blocked by
+	/// AppArmor); when setup fails we skip the test rather than fail, so
+	/// these privileged integration tests are a no-op where they can't
+	/// run but still exercise the m1 mount logic where they can.
+	fn try_new_sandbox() -> Option<BindMountSandbox> {
+		match BindMountSandbox::new(false) {
+			Ok(sb) => Some(sb),
+			Err(e) => {
+				eprintln!("skipping privileged sandbox test: setup failed: {e}");
+				None
+			}
+		}
+	}
+
+	fn mountinfo_has_mountpoint(raw: &[u8], mp: &[u8]) -> bool {
+		mountinfo::parse_mountinfo(raw)
+			.iter()
+			.any(|e| e.mount_point.as_encoded_bytes() == mp)
+	}
+
+	/// Return the bind source (`root` field) of the topmost mount at `mp`,
+	/// if any.
+	fn mountinfo_root_for(raw: &[u8], mp: &[u8]) -> Option<Vec<u8>> {
+		mountinfo::parse_mountinfo(raw)
+			.iter()
+			.filter(|e| e.mount_point.as_encoded_bytes() == mp)
+			.last()
+			.map(|e| e.root.as_bytes().to_vec())
+	}
+
+	/// Exercise `read_m1_mountinfo` + `park_to_scratch` +
+	/// `restore_from_scratch`: a mount parked into the hidden scratch
+	/// tmpfs disappears from its original mountpoint, and restoring it
+	/// brings the same mount back to that path.
+	#[test]
+	fn park_and_restore_roundtrip() {
+		let Some(sb) = try_new_sandbox() else {
+			return;
+		};
+		sb.mount_host_into_sandbox_impl(
+			c"/etc",
+			c"/etc",
+			MountAttributes::ro(),
+			false,
+			false,
+			true,
+		)
+		.expect("mount /etc");
+
+		let before = sb.read_m1_mountinfo().expect("read mountinfo");
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/etc"),
+			"/etc should be mounted before parking"
+		);
+
+		sb.park_to_scratch(c"/etc", c"park-test")
+			.expect("park /etc");
+		let parked = sb.read_m1_mountinfo().expect("read mountinfo after park");
+		assert!(
+			!mountinfo_has_mountpoint(&parked, b"/etc"),
+			"/etc must no longer be mounted after parking"
+		);
+
+		sb.restore_from_scratch(c"park-test", c"/etc")
+			.expect("restore /etc");
+		let after = sb
+			.read_m1_mountinfo()
+			.expect("read mountinfo after restore");
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/etc"),
+			"/etc must be mounted again after restore"
+		);
+	}
+
+	/// Exercise `unmount_covering`: a parent mount with a child
+	/// sub-mount is unmounted while the child's `struct mount` identity is
+	/// preserved.  Afterwards the parent is gone but the child
+	/// is restored on the revealed placeholder layer.
+	#[test]
+	fn unmount_covering_preserves_child() {
+		let Some(sb) = try_new_sandbox() else {
+			return;
+		};
+		// Parent bind: /etc at /p (creates the /p placeholder).
+		sb.mount_host_into_sandbox_impl(c"/etc", c"/p", MountAttributes::ro(), false, false, true)
+			.expect("mount parent /p");
+		// Child bind: /etc at /p/ssl (mountpoint /etc/ssl exists through the
+		// /p bind; also creates a /p/ssl placeholder on the revealed layer).
+		sb.mount_host_into_sandbox_impl(
+			c"/etc",
+			c"/p/ssl",
+			MountAttributes::ro(),
+			false,
+			false,
+			true,
+		)
+		.expect("mount child /p/ssl");
+
+		let before = sb.read_m1_mountinfo().expect("read mountinfo");
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p"),
+			"/p should be mounted before unmount_covering"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p/ssl"),
+			"/p/ssl should be mounted before unmount_covering"
+		);
+
+		let unmounted = sb
+			.unmount_covering(c"/p", &[CString::new("/p/ssl").unwrap()])
+			.expect("unmount_covering /p");
+		assert!(
+			unmounted,
+			"/p should have been unmounted (nothing holds it)"
+		);
+
+		let after = sb.read_m1_mountinfo().expect("read mountinfo after");
+		assert!(
+			!mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must be gone after unmount_covering"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p/ssl"),
+			"/p/ssl child mount must be preserved after unmount_covering"
+		);
+	}
+
+	/// End-to-end check through the managed reconcile API: removing a
+	/// parent mount that has a still-desired child preserves the child
+	/// (the `Removed` branch routes through `unmount_covering`).
+	#[test]
+	fn managed_remove_preserves_child_mount() {
+		let msb = match ManagedBindMountSandbox::new(false) {
+			Ok(s) => s,
+			Err(e) => {
+				eprintln!("skipping privileged managed test: setup failed: {e}");
+				return;
+			}
+		};
+		let mp = ManagedMountPoint {
+			host_path: CString::new("/etc").unwrap(),
+			attrs: MountAttributes::ro(),
+		};
+		msb.add_or_update_mount(OsStr::new("/p"), mp.clone())
+			.expect("add /p");
+		msb.add_or_update_mount(OsStr::new("/p/ssl"), mp.clone())
+			.expect("add /p/ssl");
+
+		let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
+		assert!(mountinfo_has_mountpoint(&before, b"/p"), "/p mounted");
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p/ssl"),
+			"/p/ssl mounted"
+		);
+
+		msb.remove_mount(OsStr::new("/p")).expect("remove /p");
+
+		let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
+		assert!(
+			!mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must be removed"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p/ssl"),
+			"/p/ssl child must be preserved through parent removal"
+		);
+	}
+
+	/// A host_path change is handled as a split (Removed then Added).
+	/// The mountpoint must survive and rebind to the new host source.
+	#[test]
+	fn managed_host_path_change_rebinds() {
+		let msb = match ManagedBindMountSandbox::new(false) {
+			Ok(s) => s,
+			Err(e) => {
+				eprintln!("skipping privileged managed test: setup failed: {e}");
+				return;
+			}
+		};
+		msb.add_or_update_mount(
+			OsStr::new("/p"),
+			ManagedMountPoint {
+				host_path: CString::new("/etc").unwrap(),
+				attrs: MountAttributes::ro(),
+			},
+		)
+		.expect("add /p -> /etc");
+		let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
+		assert_eq!(
+			mountinfo_root_for(&before, b"/p").as_deref(),
+			Some(&b"/etc"[..]),
+			"/p should bind /etc initially"
+		);
+
+		// Change the host source for the same sandbox path.
+		msb.add_or_update_mount(
+			OsStr::new("/p"),
+			ManagedMountPoint {
+				host_path: CString::new("/usr").unwrap(),
+				attrs: MountAttributes::ro(),
+			},
+		)
+		.expect("rebind /p -> /usr");
+
+		let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must still be mounted after host_path change"
+		);
+		assert_eq!(
+			mountinfo_root_for(&after, b"/p").as_deref(),
+			Some(&b"/usr"[..]),
+			"/p should bind /usr after the host_path change"
+		);
 	}
 }

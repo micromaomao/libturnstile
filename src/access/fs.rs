@@ -11,11 +11,17 @@ use std::{
 	},
 };
 
+#[cfg(feature = "serialize")]
+use serde::Serialize;
+
+#[cfg(feature = "serialize")]
+use crate::utils::{serialize_cstring, serialize_timespec_pair};
+
 use crate::{AccessRequestError, syscalls::RequestContext};
 
 use smallvec::{SmallVec, smallvec};
 
-use log::{debug, error};
+use log::{debug, error, warn};
 
 /// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
 /// refers to a path in the traced process's filesystem namespace.
@@ -90,7 +96,7 @@ impl ForeignFd {
 
 	/// Call `statx()` on this fd with `AT_EMPTY_PATH | AT_STATX_DONT_SYNC |
 	/// AT_SYMLINK_NOFOLLOW` and the provided `mask`.
-	fn statx(&self, mask: u32) -> Result<libc::statx, io::Error> {
+	pub fn statx(&self, mask: u32) -> Result<libc::statx, io::Error> {
 		let mut stx: libc::statx = unsafe { std::mem::zeroed() };
 		let ret = unsafe {
 			libc::statx(
@@ -244,6 +250,25 @@ fn trim_leading_slashes(path: &CStr) -> &CStr {
 	CStr::from_bytes_with_nul(&bytes[start..]).unwrap()
 }
 
+/// `readlinkat(2)` on a [`ForeignFd`] directory and a relative `name`,
+/// returning the raw (unresolved) symlink target.
+fn readlinkat_foreign(dir_fd: &ForeignFd, name: &CStr) -> Result<OsString, io::Error> {
+	let mut buf = vec![0u8; libc::PATH_MAX as usize];
+	let ret = unsafe {
+		libc::readlinkat(
+			dir_fd.as_raw_fd(),
+			name.as_ptr(),
+			buf.as_mut_ptr() as *mut libc::c_char,
+			buf.len(),
+		)
+	};
+	if ret < 0 {
+		return Err(io::Error::last_os_error());
+	}
+	buf.truncate(ret as usize);
+	Ok(OsString::from_vec(buf))
+}
+
 impl FsTarget {
 	pub(crate) fn from_path(
 		req: &mut RequestContext,
@@ -300,8 +325,9 @@ impl FsTarget {
 		let no_follow = at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
 
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
+		let path_is_null = path_ptr.is_null();
 		let path;
-		if path_ptr.is_null() {
+		if path_is_null {
 			path = CString::default();
 		} else {
 			path = req.cstr_from_target_memory(path_ptr)?;
@@ -319,7 +345,10 @@ impl FsTarget {
 			});
 		}
 
-		if pathb.len() == 0 && !at_empty_path {
+		// For some syscalls (e.g. utimensat), you can pass in a NULL path
+		// to act as an empty path, without requiring AT_EMPTY_PATH.
+		// TODO: only allow this for utime* syscalls
+		if pathb.len() == 0 && !at_empty_path && !path_is_null {
 			return Err(AccessRequestError::InvalidSyscallData(
 				"empty path without AT_EMPTY_PATH",
 			));
@@ -393,13 +422,30 @@ impl FsTarget {
 
 		// This can't change across retries, since a fd points to a
 		// specific inode.
+
 		let original_id = self.dfd.inode_id()?;
 		let mut attempts = 0;
 		loop {
 			let mut dfd_path = self.dfd.readlink()?.into_encoded_bytes();
+			if dfd_path == b"/" {
+				// Don't check inode identity if the dfd is the root.
+				unsafe {
+					let cloned_fd = libc::dup(root);
+					if cloned_fd < 0 {
+						return Err(io::Error::last_os_error());
+					}
+					return Ok(ForeignFd {
+						local_fd: cloned_fd,
+					});
+				}
+			}
 			dfd_path.push(b'\0');
 			if dfd_path.first().copied() != Some(b'/') {
-				error!(
+				// The base fd does not name a path (e.g. it is a pipe or
+				// socket: "pipe:[…]" / "socket:[…]").  This is a benign,
+				// app-caused case — the syscall would fail natively — so log
+				// at debug to avoid spam and report ENOENT to the caller.
+				debug!(
 					"readlink of dfd did not return an absolute path: {:?} returned",
 					OsStr::from_bytes(&dfd_path)
 				);
@@ -426,7 +472,7 @@ impl FsTarget {
 				);
 				attempts += 1;
 				if attempts >= 2 {
-					error!(
+					warn!(
 						"open_target_dfd_in_root: errored on last attempt to open {:?}: {}",
 						dfd_path, e
 					);
@@ -436,9 +482,13 @@ impl FsTarget {
 			}
 			let opened = ForeignFd { local_fd: fd };
 			let new_id = opened.inode_id()?;
-			if new_id == original_id {
-				return Ok(opened);
-			}
+			// if new_id == original_id {
+			// 	return Ok(opened);
+			// }
+			return Ok(opened);
+			// todo: we may get a placeholder fd within the sandbox but
+			// obviously a fd pointing to the real file outside.  In that
+			// case we still want to get t_local.
 			debug!(
 				"open_target_dfd_in_root: attempt {} for {:?} got different inode \
 				 (expected id {:?}, got id {:?})",
@@ -464,8 +514,9 @@ impl FsTarget {
 	///
 	/// This function attempts to re-open the target but under the
 	/// provided root fd.  The target must exist on the same path within
-	/// this new root.  A check with statx() will ensure that the file is
-	/// the same, and if not, ENOENT is returned.
+	/// this new root.  If dfd is not already the root, a check with
+	/// statx() will ensure that the file is the same, and if not, ENOENT
+	/// is returned.
 	pub fn in_root(&self, root: libc::c_int) -> Result<Self, io::Error> {
 		Ok(Self {
 			dfd: self.open_target_dfd_in_root(root)?,
@@ -482,12 +533,12 @@ impl FsTarget {
 	///
 	/// This function tries to be the equivalent of filename_parentat /
 	/// path_parentat in fs/namei.c, except with simplified last component
-	/// cases.  If the path ends with a ".", the returned "parent" will be
-	/// the part without the ".", and the returned "file name" will be "."
-	/// A path ending with a "/" or an empty path will be treated as if it
-	/// ended with "/.".  If the path ends with "/..", the dir after
-	/// resolving the .. will be returned as the "parent", and the file
-	/// name will be ".".
+	/// cases.  If the path ends with (or is) a ".", the returned "parent"
+	/// will be the part without the ".", and the returned "file name" will
+	/// be "."  A path ending with a "/" or an empty path will be treated as
+	/// if it ended with "/.".  If the path ends with (or is) "..", the dir
+	/// after resolving the .. will be returned as the "parent", and the
+	/// file name will be ".".
 	pub fn open_target_dir(&self) -> Result<(ForeignFd, &CStr), io::Error> {
 		let p = self.path.to_bytes();
 		let p_with_nul = self.path.to_bytes_with_nul();
@@ -502,9 +553,9 @@ impl FsTarget {
 			dot = true;
 		} else if p.ends_with(b"/") {
 			dot = true;
-		} else if p.ends_with(b"/.") {
+		} else if p == b"." || p.ends_with(b"/.") {
 			dot = true;
-		} else if p.ends_with(b"/..") {
+		} else if p == b".." || p.ends_with(b"/..") {
 			dotdot = true;
 		}
 
@@ -548,10 +599,24 @@ impl FsTarget {
 		Ok((opened_dfd, filename))
 	}
 
-	/// Return the absolute path of the target.  This requires everything
-	/// except the final component of the path to exist (which is a normal
-	/// requirement of most fs syscalls anyway).
+	/// Return the absolute path of the target.
+	///
+	/// Everything up to the final component is always resolved (and must
+	/// exist).  The final component is resolved too — if it is a symlink
+	/// it is followed to its ultimate target — *unless* the operation
+	/// does not dereference it (see [`no_follow`](Self::no_follow), which
+	/// is set for `AT_SYMLINK_NOFOLLOW` as well as dentry-name operations
+	/// like `mkdir` / `unlink` / `rename`).  The final component need not
+	/// exist.
 	pub fn realpath(&self) -> Result<OsString, io::Error> {
+		self.realpath_impl(0)
+	}
+
+	/// Maximum number of leaf symlinks to follow, matching the kernel's
+	/// `MAXSYMLINKS`, to guard against symlink loops.
+	const MAX_SYMLINK_DEPTH: u32 = 40;
+
+	fn realpath_impl(&self, depth: u32) -> Result<OsString, io::Error> {
 		let path_bytes = self.path.to_bytes();
 
 		// AT_EMPTY_PATH: the target is the dfd itself — read its proc symlink.
@@ -565,12 +630,68 @@ impl FsTarget {
 		if file_name_bytes.is_empty() {
 			return Ok(dir_path);
 		}
+
+		// The resolved path of the leaf, taking it literally (i.e. not
+		// following it).
 		let mut result = dir_path.into_encoded_bytes();
 		if result.last().copied() != Some(b'/') {
 			result.push(b'/');
 		}
 		result.extend_from_slice(file_name_bytes);
-		Ok(OsString::from_vec(result))
+
+		// When the operation does not dereference the final component
+		// (`AT_SYMLINK_NOFOLLOW`, or a dentry-name op like mkdir/unlink),
+		// the leaf itself is the target.
+		if self.no_follow {
+			return Ok(OsString::from_vec(result));
+		}
+
+		if depth >= Self::MAX_SYMLINK_DEPTH {
+			return Err(io::Error::from_raw_os_error(libc::ELOOP));
+		}
+
+		// Read the leaf without following it.  `ENOENT` (does not exist)
+		// or `EINVAL` (not a symlink) both mean `result` is already the
+		// final resolved path.
+		let link_target = match readlinkat_foreign(&dir_fd, file_name) {
+			Ok(t) => t,
+			Err(e) => match e.raw_os_error() {
+				Some(libc::ENOENT) | Some(libc::EINVAL) => {
+					return Ok(OsString::from_vec(result));
+				}
+				_ => return Err(e),
+			},
+		};
+		let target_bytes = link_target.as_bytes();
+
+		// Follow the symlink: resolve its target against the right base
+		// and recurse (its target may itself be / contain symlinks).
+		let next = if let Some(mut rest) = target_bytes.strip_prefix(b"/") {
+			// Absolute target: resolve against the root.
+			while rest.first() == Some(&b'/') {
+				rest = &rest[1..];
+			}
+			// TODO record root in FsTarget
+			let root = ForeignFd::from_path(c"/")?;
+			FsTarget {
+				dfd: root,
+				path: CString::new(rest)
+					.map_err(|_| io::Error::other("symlink target contains NUL byte"))?,
+				no_follow: false,
+				original_handle: OriginalHandle::Root,
+			}
+		} else {
+			// Relative target: resolve against the directory that holds
+			// the symlink.
+			FsTarget {
+				dfd: dir_fd,
+				path: CString::new(target_bytes)
+					.map_err(|_| io::Error::other("symlink target contains NUL byte"))?,
+				no_follow: false,
+				original_handle: self.original_handle,
+			}
+		};
+		next.realpath_impl(depth + 1)
 	}
 
 	/// The base fd of the target, which may be the root of the process
@@ -594,6 +715,14 @@ impl FsTarget {
 
 	pub fn path(&self) -> &CStr {
 		&self.path
+	}
+
+	/// Whether the final path component is *not* followed when it is a
+	/// symlink, i.e. the syscall was invoked with `AT_SYMLINK_NOFOLLOW`
+	/// (or `O_NOFOLLOW`).  Intermediate components are always followed
+	/// regardless.
+	pub fn no_follow(&self) -> bool {
+		self.no_follow
 	}
 }
 
@@ -624,7 +753,72 @@ impl std::fmt::Display for FsTarget {
 	}
 }
 
-#[derive(Debug)]
+#[cfg(feature = "serialize")]
+#[derive(Serialize)]
+struct SerializedFsTarget<'a> {
+	/// The absolute path of the target.  When `valid` is true this is the
+	/// fully resolved path, in which case everything except the last
+	/// component will exist, and the last component will exist for
+	/// non-dentry-modifying operations like opening a file without
+	/// `O_CREAT`.  Otherwise it is a join of the base fd's path and the
+	/// raw provided path, and any component of it may not exist.
+	pub path: &'a str,
+	/// Some bytes in path has been lost due to it being invalid UTF-8.
+	pub path_is_invalid_utf8: bool,
+	pub valid: bool,
+	pub no_follow: bool,
+	/// The original syscall used a relative path against the current
+	/// working directory (`AT_FDCWD` or a path-only syscall).
+	pub base_is_cwd: bool,
+	/// The original syscall used an absolute path.
+	pub base_is_root: bool,
+}
+
+#[cfg(feature = "serialize")]
+impl Serialize for FsTarget {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let (path, valid) = match self.realpath() {
+			Ok(rp) => (rp, true),
+			Err(rp_err) => {
+				debug!(
+					"realpath() on FsTarget failed during serialization: {}",
+					rp_err
+				);
+				// Best-effort: join the base fd's path with the raw path,
+				// mirroring the Display impl's handling of invalid targets.
+				let mut dfd_path_bytes = self
+					.dfd
+					.readlink()
+					.unwrap_or_else(|e| {
+						debug!("unable to readlink() on FsTarget's dfd: {}", e);
+						OsString::from("???")
+					})
+					.into_encoded_bytes();
+				if dfd_path_bytes.last().copied() != Some(b'/') {
+					dfd_path_bytes.push(b'/');
+				}
+				dfd_path_bytes.extend_from_slice(self.path.to_bytes());
+				(OsString::from_vec(dfd_path_bytes), false)
+			}
+		};
+		let path_str = path.to_string_lossy();
+		let obj = SerializedFsTarget {
+			path: path_str.as_ref(),
+			path_is_invalid_utf8: matches!(path_str, std::borrow::Cow::Owned(_)),
+			valid,
+			no_follow: self.no_follow,
+			base_is_cwd: self.original_handle == OriginalHandle::Cwd,
+			base_is_root: self.original_handle == OriginalHandle::Root,
+		};
+		obj.serialize(serializer)
+	}
+}
+
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct AccessOperation {
 	pub target: FsTarget,
 	pub need_read: bool,
@@ -632,7 +826,8 @@ pub struct AccessOperation {
 	pub need_exec: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct OpenOperation {
 	pub target: FsTarget,
 	pub need_read: bool,
@@ -640,19 +835,26 @@ pub struct OpenOperation {
 	pub create_mode: Option<libc::mode_t>,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct CreateOperation {
 	pub target: FsTarget,
 	pub mode: libc::mode_t,
 	pub kind: CreateKind,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub enum CreateKind {
 	File,
 	Directory,
-	Symlink { target: CString },
-	Device { dev: libc::dev_t },
+	Symlink {
+		#[cfg_attr(feature = "serialize", serde(serialize_with = "serialize_cstring"))]
+		target: CString,
+	},
+	Device {
+		dev: libc::dev_t,
+	},
 }
 
 impl CreateKind {
@@ -672,87 +874,136 @@ impl std::fmt::Display for CreateKind {
 	}
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct RenameOperation {
 	pub from: FsTarget,
 	pub to: FsTarget,
 	pub exchange: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct UnlinkOperation {
 	pub target: FsTarget,
 	pub dir: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct LinkOperation {
 	pub from: FsTarget,
 	pub to: FsTarget,
 	pub follow_src_symlink: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct ExecOperation {
 	pub target: FsTarget,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct StatOperation {
 	pub target: FsTarget,
 	pub lstat: bool,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct UnixBindOperation {
 	pub target: FsTarget,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct ChmodOperation {
 	pub target: FsTarget,
 	pub mode: u32,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct ChownOperation {
 	pub target: FsTarget,
 	pub uid: u32,
 	pub gid: u32,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct TruncateOperation {
 	pub target: FsTarget,
 	pub length: i64,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
+pub struct FallocateOperation {
+	pub target: FsTarget,
+	pub mode: i32,
+	pub offset: i64,
+	pub length: i64,
+}
+
+/// `utimensat` / `futimesat` / `utimes`.  `times` is normalised to
+/// the `utimensat` representation.
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
+pub struct UtimensOperation {
+	pub target: FsTarget,
+	/// [last access, last modification]
+	#[cfg_attr(
+		feature = "serialize",
+		serde(serialize_with = "serialize_timespec_pair")
+	)]
+	pub times: [libc::timespec; 2],
+}
+
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
+pub struct MmapOperation {
+	pub target: FsTarget,
+	pub need_read: bool,
+	pub need_write: bool,
+	pub need_exec: bool,
+}
+
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct ListXattrOperation {
 	pub target: FsTarget,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct GetXattrOperation {
 	pub target: FsTarget,
+	#[cfg_attr(feature = "serialize", serde(serialize_with = "serialize_cstring"))]
 	pub name: CString,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct SetXattrOperation {
 	pub target: FsTarget,
+	#[cfg_attr(feature = "serialize", serde(serialize_with = "serialize_cstring"))]
 	pub name: CString,
 	pub value: Vec<u8>,
 	pub flags: i32,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct RemoveXattrOperation {
 	pub target: FsTarget,
+	#[cfg_attr(feature = "serialize", serde(serialize_with = "serialize_cstring"))]
 	pub name: CString,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub enum FsOperation {
 	FsOpen(OpenOperation),
 	FsAccess(AccessOperation),
@@ -767,6 +1018,9 @@ pub enum FsOperation {
 	FsChmod(ChmodOperation),
 	FsChown(ChownOperation),
 	FsTruncate(TruncateOperation),
+	FsFallocate(FallocateOperation),
+	FsUtimens(UtimensOperation),
+	FsMmap(MmapOperation),
 	FsListXattr(ListXattrOperation),
 	FsGetXattr(GetXattrOperation),
 	FsSetXattr(SetXattrOperation),
@@ -776,7 +1030,8 @@ pub enum FsOperation {
 	UnixSendto(FsTarget),
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[derive(Debug, Clone)]
 pub struct RwxPermission {
 	/// Target path.
 	///
@@ -789,9 +1044,9 @@ pub struct RwxPermission {
 	/// permission is in fact required on the directory (i.e. parent of
 	/// [`target`](Self::target)).
 	pub is_dir_op: bool,
-	/// Need read access on either a file, device, symlink (for readlink),
-	/// directory, to connect to a Unix socket (for which write is also
-	/// required), or to create a link from this file.
+	/// Need read access on either a file, device, directory, to connect
+	/// to a Unix socket (for which write is also required), or to create
+	/// a link from this file.
 	pub read: bool,
 	/// Need write access for file or devices, ability to create or delete
 	/// the pointed to directory entry, connect to a Unix socket (for
@@ -804,6 +1059,9 @@ pub struct RwxPermission {
 	/// Need the ability to stat the target path (but not necessarily read
 	/// it)
 	pub metadata_read: bool,
+	/// Whether this is a chdir operation.  Useful for special case
+	/// handling.
+	pub chdir: bool,
 }
 
 macro_rules! make_rwx {
@@ -815,6 +1073,7 @@ macro_rules! make_rwx {
 			write: false,
 			exec: false,
 			metadata_read: false,
+			chdir: false,
 		};
 		// Get rid of unused mut warning
 		perm.read = false;
@@ -915,6 +1174,31 @@ impl std::fmt::Display for FsOperation {
 			Self::FsTruncate(TruncateOperation { target, length }) => {
 				write!(f, "truncate {} {}", length, target)?;
 			}
+			Self::FsFallocate(FallocateOperation {
+				target,
+				mode,
+				offset,
+				length,
+			}) => {
+				write!(
+					f,
+					"fallocate mode={:#x} {}+{} {}",
+					mode, offset, length, target
+				)?;
+			}
+			Self::FsUtimens(UtimensOperation { target, .. }) => {
+				write!(f, "utimens {}", target)?;
+			}
+			Self::FsMmap(MmapOperation {
+				target,
+				need_read,
+				need_write,
+				need_exec,
+			}) => {
+				write!(f, "mmap ")?;
+				write_rwx(f, *need_read, *need_write, *need_exec)?;
+				write!(f, " {}", target)?;
+			}
 			Self::FsListXattr(ListXattrOperation { target }) => {
 				write!(f, "listxattr {}", target)?;
 			}
@@ -1004,13 +1288,31 @@ impl FsOperation {
 				smallvec![make_rwx!(target.clone(), exec)]
 			}
 			Self::FsReadlink(target) => {
-				smallvec![make_rwx!(target.clone(), read)]
+				smallvec![make_rwx!(target.clone(), metadata_read)]
 			}
 			Self::FsChdir(target) => {
-				smallvec![make_rwx!(target.clone(),)]
+				smallvec![make_rwx!(target.clone(), chdir)]
 			}
 			Self::FsStat(StatOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), metadata_read)]
+			}
+			Self::FsMmap(MmapOperation {
+				target,
+				need_read,
+				need_write,
+				need_exec,
+			}) => {
+				let mut p = make_rwx!(target.clone(),);
+				if *need_read {
+					p.read = true;
+				}
+				if *need_write {
+					p.write = true;
+				}
+				if *need_exec {
+					p.exec = true;
+				}
+				smallvec![p]
 			}
 			Self::FsListXattr(ListXattrOperation { target })
 			| Self::FsGetXattr(GetXattrOperation { target, .. }) => {
@@ -1019,6 +1321,8 @@ impl FsOperation {
 			Self::FsChmod(ChmodOperation { target, .. })
 			| Self::FsChown(ChownOperation { target, .. })
 			| Self::FsTruncate(TruncateOperation { target, .. })
+			| Self::FsFallocate(FallocateOperation { target, .. })
+			| Self::FsUtimens(UtimensOperation { target, .. })
 			| Self::FsSetXattr(SetXattrOperation { target, .. })
 			| Self::FsRemoveXattr(RemoveXattrOperation { target, .. }) => {
 				smallvec![make_rwx!(target.clone(), write)]
