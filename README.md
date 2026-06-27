@@ -10,9 +10,9 @@ them.
 
 The tracer may also be used together with other sandboxing mechanisms
 (like Landlock), or used on its own for non-security scenarios to find out
-what files are used by a program.
+what files are used by a program.  Example sandbox demo using this library:
 
-https://github.com/user-attachments/assets/7aa7cb20-e4b2-49d6-98bd-31069f352ebf
+https://github.com/user-attachments/assets/667bd18a-999d-4347-916f-1e99dc3f7f1a
 
 > [!WARNING]
 > **Work in progress**. API and implementation not stable.
