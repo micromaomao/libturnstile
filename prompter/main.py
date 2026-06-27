@@ -24,6 +24,7 @@ config path) and ``reload_config`` is set instead of emitting
 ``add_mounts``.
 """
 
+import html
 import json
 import os
 import signal
@@ -357,6 +358,7 @@ class TreeWidget(QtWidgets.QWidget):
 
         for row, node in enumerate(self.nodes_preorder):
             label = QtWidgets.QLabel(self._row_label_text(node))
+            label.setTextFormat(QtCore.Qt.PlainText)
             label.setContentsMargins(node.depth * INDENT_PX, 0, 0, 0)
             node.label = label
 
@@ -812,7 +814,8 @@ class PrompterDialog(QtWidgets.QDialog):
         layout.addWidget(
             QtWidgets.QLabel(
                 f"is requesting the following access to execute a "
-                f"<b>{op}</b> from <b>{comm}[{pid}]</b>:"
+                f"<b>{html.escape(str(op))}</b> from "
+                f"<b>{html.escape(str(comm))}[{html.escape(str(pid))}]</b>:"
             )
         )
 
@@ -1013,7 +1016,7 @@ class PrompterDialog(QtWidgets.QDialog):
                         self,
                         "Could not persist to config",
                         "Failed to write the config file:\n%s\n\n"
-                        "Granting for this session only." % exc,
+                        "Granting for this session only." % html.escape(str(exc)),
                     )
                     self.response["add_mounts"] = mounts
             else:
