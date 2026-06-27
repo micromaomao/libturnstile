@@ -127,14 +127,15 @@ def escape_config_path(path):
     return path.replace("$", "$$")
 
 
-def persist_mounts_to_config(config_path, mounts):
-    """Write ``mounts`` into the YAML config at ``config_path``.
+def persist_to_config(config_path, mounts, ignores=()):
+    """Write ``mounts`` and ``ignores`` into the YAML config.
 
     The file is parsed, the ``rules`` mapping is updated with one entry
     per mount (a plain permission string when the host path matches the
-    sandbox path, otherwise a ``target``/``permissions`` mapping), then
-    serialized to a sibling temp file and atomically moved onto the
-    config path so a concurrent reader never sees a partial file.
+    sandbox path, otherwise a ``target``/``permissions`` mapping) and one
+    ``ignore: true`` entry per ignored path, then serialized to a sibling
+    temp file and atomically moved onto the config path so a concurrent
+    reader never sees a partial file.
     """
     import yaml
 
@@ -159,6 +160,9 @@ def persist_mounts_to_config(config_path, mounts):
                 "target": escape_config_path(host_path),
                 "permissions": perms,
             }
+
+    for path in ignores:
+        rules[escape_config_path(path)] = {"ignore": True}
 
     directory = os.path.dirname(config_path) or "."
     fd, tmp = tempfile.mkstemp(
@@ -278,9 +282,14 @@ class FsNode:
         # can be restored when the redirect is cleared.
         self.saved_own = None
 
+        # Block state: when true, this node (and everything under it) is
+        # emitted as an ``ignore: true`` config rule instead of a mount.
+        self.block = False
+
         # Row widgets, created by TreeWidget.
         self.label = None
         self.redirect_btn = None
+        self.block_btn = None
         # Every widget making up this node's row, so it can be shown/hidden.
         self.row_widgets = []
 
@@ -307,8 +316,13 @@ class TreeWidget(QtWidgets.QWidget):
         disabled on every descendant (inheritance).
     """
 
-    def __init__(self, grants, parent=None):
+    # Emitted (with whether any row is currently blocked) whenever a
+    # block toggle changes, so the dialog can force "persist to config".
+    blocks_changed = QtCore.Signal(bool)
+
+    def __init__(self, grants, allow_block=True, parent=None):
         super().__init__(parent)
+        self.allow_block = allow_block
         self.root = FsNode("/", "/", 0, None)
         self._build(grants)
 
@@ -320,8 +334,10 @@ class TreeWidget(QtWidgets.QWidget):
         style = self.style()
         self._arrow_icon = style.standardIcon(QtWidgets.QStyle.SP_ArrowRight)
         self._clear_icon = style.standardIcon(QtWidgets.QStyle.SP_LineEditClearButton)
+        # The block ("prohibited") glyph shown by the per-row block toggle.
+        self._block_glyph = "\U0001f6c7"
 
-        # Hover bookkeeping for the redirect button.
+        # Hover bookkeeping for the redirect/block buttons.
         self._hovered = None
         self._node_of_widget = {}
 
@@ -352,12 +368,29 @@ class TreeWidget(QtWidgets.QWidget):
             )
             node.redirect_btn = btn
 
+            # Block toggle: a push-down button that marks this path (and
+            # everything under it) as ignored.  It shows its glyph while the
+            # row is hovered or whenever it is checked.
+            block_btn = QtWidgets.QToolButton()
+            block_btn.setAutoRaise(True)
+            block_btn.setCheckable(True)
+            block_btn.setText(self._block_glyph)
+            block_btn.setEnabled(self.allow_block)
+            block_btn.setToolTip(
+                "Block all further requests for or under this path"
+            )
+            block_btn.toggled.connect(
+                lambda checked, n=node: self._on_block_toggled(n, checked)
+            )
+            node.block_btn = block_btn
+
             name_box = QtWidgets.QWidget()
             name_layout = QtWidgets.QHBoxLayout(name_box)
             name_layout.setContentsMargins(0, 0, 0, 0)
             name_layout.setSpacing(6)
             name_layout.addWidget(label)
             name_layout.addWidget(btn)
+            name_layout.addWidget(block_btn)
             name_layout.addStretch(1)
             grid.addWidget(name_box, row, 0)
 
@@ -369,8 +402,8 @@ class TreeWidget(QtWidgets.QWidget):
             grid.addWidget(node.cb_x, row, 3)
 
             # Track hover over every interactive widget in the row so the
-            # redirect button reveals itself.
-            for w in (name_box, label, btn, node.cb_r, node.cb_w, node.cb_x):
+            # redirect / block buttons reveal themselves.
+            for w in (name_box, label, btn, block_btn, node.cb_r, node.cb_w, node.cb_x):
                 self._node_of_widget[w] = node
                 w.installEventFilter(self)
 
@@ -384,17 +417,21 @@ class TreeWidget(QtWidgets.QWidget):
         self._update_visibility()
 
     def _update_visibility(self):
-        """Hide rows whose ancestor is redirected (they're covered by it)."""
+        """Hide rows whose ancestor is redirected/blocked (covered by it)."""
         for node in self.nodes_preorder:
-            hidden = self._has_redirected_ancestor(node)
+            hidden = self._has_covering_ancestor(node)
             for w in node.row_widgets:
                 w.setVisible(not hidden)
 
-    def _has_redirected_ancestor(self, node):
-        """Whether any ancestor of ``node`` is redirected."""
+    def _has_covering_ancestor(self, node):
+        """Whether any ancestor of ``node`` is redirected or blocked.
+
+        Either makes ``node`` redundant: a redirected ancestor mounts the
+        whole subtree, and a blocked ancestor ignores it entirely.
+        """
         anc = node.parent
         while anc is not None:
-            if anc.redirect is not None:
+            if anc.redirect is not None or anc.block:
                 return True
             anc = anc.parent
         return False
@@ -551,6 +588,23 @@ class TreeWidget(QtWidgets.QWidget):
                 node.own_r = True
         self.refresh()
 
+    def _on_block_toggled(self, node, checked):
+        """Mark/unmark ``node`` as blocked (passed through via ignore)."""
+        node.block = checked
+        # Blocking supersedes a redirect on the same row; drop it and
+        # restore the grant the redirect had overridden.
+        if checked and node.redirect is not None:
+            node.redirect = None
+            if node.saved_own is not None:
+                node.own_r, node.own_w, node.own_x = node.saved_own
+                node.saved_own = None
+            self._update_row_label(node)
+            if node.redirect_btn is not None:
+                self._update_redirect_button(node)
+        self.refresh()
+        self._update_visibility()
+        self.blocks_changed.emit(self.has_blocks())
+
     def refresh(self):
         """Recompute effective state and update every checkbox."""
         for node in self.nodes_preorder:  # parents before children
@@ -565,6 +619,20 @@ class TreeWidget(QtWidgets.QWidget):
             if node.cb_r is None:
                 # Root row (no rwx controls); nothing to update.
                 continue
+
+            # A blocked node grants nothing via a mount: its boxes are
+            # cleared and disabled, and its redirect button is disabled.
+            if node.block:
+                for box in (node.cb_r, node.cb_w, node.cb_x):
+                    box.blockSignals(True)
+                    box.setChecked(False)
+                    box.setEnabled(False)
+                    box.blockSignals(False)
+                if node.redirect_btn is not None:
+                    node.redirect_btn.setEnabled(False)
+                continue
+            if node.redirect_btn is not None:
+                node.redirect_btn.setEnabled(True)
 
             # A redirected node is locked at full rwx until the redirect is
             # cleared, so its boxes are checked and disabled.
@@ -589,10 +657,15 @@ class TreeWidget(QtWidgets.QWidget):
         result = []
         seen = set()
         for node in self.nodes_preorder:
-            # Anything under a redirected ancestor is already provided by
-            # that ancestor's mount, so never emit a mount for it (even if
-            # the user configured access or a redirect on it earlier).
-            if self._has_redirected_ancestor(node):
+            # Anything under a redirected or blocked ancestor is already
+            # handled by that ancestor (its mount, or its ignore rule), so
+            # never emit a mount for it.
+            if self._has_covering_ancestor(node):
+                continue
+
+            # A blocked node is passed through via an ignore rule, not a
+            # mount.
+            if node.block:
                 continue
 
             # A redirected node is always mounted, from its user-specified
@@ -633,6 +706,29 @@ class TreeWidget(QtWidgets.QWidget):
                 }
             )
         return result
+
+    def ignored_paths(self):
+        """Paths to persist as ``ignore: true`` rules (blocked rows).
+
+        A blocked node under another blocked/redirected ancestor is
+        redundant and omitted, mirroring :meth:`mounts`.
+        """
+        result = []
+        seen = set()
+        for node in self.nodes_preorder:
+            if node.depth == 0 or not node.block:
+                continue
+            if self._has_covering_ancestor(node):
+                continue
+            if node.path in seen:
+                continue
+            seen.add(node.path)
+            result.append(node.path)
+        return result
+
+    def has_blocks(self):
+        """Whether any row is currently blocked."""
+        return any(node.block for node in self.nodes_preorder)
 
 
 class PrompterDialog(QtWidgets.QDialog):
@@ -680,7 +776,8 @@ class PrompterDialog(QtWidgets.QDialog):
         self.allow_box.toggled.connect(self._on_allow_toggled)
         layout.addWidget(self.allow_box)
 
-        self.tree = TreeWidget(grants)
+        self.tree = TreeWidget(grants, allow_block=bool(self.config_path))
+        self.tree.blocks_changed.connect(self._on_blocks_changed)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(self.tree)
         scroll.setWidgetResizable(True)
@@ -769,6 +866,22 @@ class PrompterDialog(QtWidgets.QDialog):
     def _on_allow_toggled(self, checked):
         self.tree.setEnabled(checked)
 
+    def _on_blocks_changed(self, has_blocks):
+        """Force "persist to config" on while any path is blocked.
+
+        A block is only expressible as a persisted ``ignore: true`` rule
+        (there is no transient form), so persisting is mandatory then.
+        """
+        if has_blocks:
+            self.persist_box.setChecked(True)
+            self.persist_box.setEnabled(False)
+            self.persist_box.setToolTip(
+                "Blocking a path requires writing the config"
+            )
+        else:
+            self.persist_box.setEnabled(bool(self.config_path))
+            self.persist_box.setToolTip("")
+
     def _apply_scale(self):
         """Apply the current scale and re-fit scale-dependent widgets."""
         if self.scale_mgr is not None:
@@ -796,19 +909,22 @@ class PrompterDialog(QtWidgets.QDialog):
     def _on_continue(self):
         if self.allow_box.isChecked():
             mounts = self.tree.mounts()
+            ignores = self.tree.ignored_paths()
             self.response = {
                 "action": {"continue": True},
                 "add_placeholders": self.placeholders,
                 "auto_add_symlinks": True,
                 "auto_widen_descendant_permissions": True,
             }
-            # When persisting, write the mounts into the config and ask
-            # turnstile-sandbox to reload it instead of applying transient
-            # mounts; the reload reproduces exactly these mounts.  Fall back
-            # to transient mounts if writing the config fails.
+            # When persisting, write the mounts/ignores into the config and
+            # ask turnstile-sandbox to reload it instead of applying
+            # transient mounts; the reload reproduces exactly these rules.
+            # Blocked paths can only be expressed as persisted ignore rules,
+            # so a block forces persistence.  Fall back to transient mounts
+            # if writing the config fails.
             if self.persist_box.isChecked() and self.config_path:
                 try:
-                    persist_mounts_to_config(self.config_path, mounts)
+                    persist_to_config(self.config_path, mounts, ignores)
                     self.response["reload_config"] = True
                 except Exception as exc:
                     QtWidgets.QMessageBox.warning(

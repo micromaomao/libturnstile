@@ -98,6 +98,11 @@ struct Context {
 	/// Path to the config file, forwarded to the prompter and used when
 	/// it requests a config reload.
 	config_path: PathBuf,
+	/// Expanded sandbox paths marked `ignore: true` in the config.  Any
+	/// request whose resolved path equals or sits under one of these is
+	/// passed through unmediated (no mount, prompt, or denial).  Replaced
+	/// on every config (re)load.
+	ignore_paths: Mutex<Vec<Vec<u8>>>,
 	/// The command (program and arguments) being run inside the sandbox,
 	/// forwarded to the prompter for display.
 	sandbox_cmd: Vec<String>,
@@ -401,6 +406,22 @@ fn inherit_attrs_to_descendants(
 	}
 }
 
+/// Whether `abspath` is equal to, or nested under, one of the
+/// `ignore_paths` (each an absolute, expanded byte path with no trailing
+/// slash).  Used to pass `ignore: true` requests through unmediated.
+fn path_is_ignored(ignore_paths: &[Vec<u8>], abspath: &[u8]) -> bool {
+	ignore_paths.iter().any(|prefix| {
+		if prefix.as_slice() == b"/" {
+			// Ignoring "/" ignores the whole tree.
+			return true;
+		}
+		abspath == prefix.as_slice()
+			|| (abspath.len() > prefix.len()
+				&& abspath.starts_with(prefix)
+				&& abspath[prefix.len()] == b'/')
+	})
+}
+
 /// (Re)load the user config file referenced by `context.config_path` and
 /// apply it to the sandbox, replacing the current mount/placeholder set.
 /// Used both at startup and when a prompter requests a config reload.
@@ -414,7 +435,16 @@ fn load_config_into_sandbox(context: &Context) -> Result<(), Box<dyn std::error:
 		);
 	}
 	let mut entries: Vec<(&OsStr, ManagedTreeEntry)> = Vec::with_capacity(resolved_entries.len());
+	let mut ignore_paths: Vec<Vec<u8>> = Vec::new();
 	for e in &resolved_entries {
+		// Ignore entries carry no mount or placeholder; they only record a
+		// path to pass through unmediated.
+		if e.mount.is_none() && e.placeholder_host_path.is_none() {
+			if e.ignore {
+				ignore_paths.push(e.sandbox_path.as_bytes().to_vec());
+			}
+			continue;
+		}
 		let entry = match e.mount {
 			Some(ref m) => ManagedTreeEntry::BindMount(m.clone()),
 			None => {
@@ -429,6 +459,7 @@ fn load_config_into_sandbox(context: &Context) -> Result<(), Box<dyn std::error:
 		entries.push((e.sandbox_path.as_os_str(), entry));
 	}
 	context.sandbox.update_from_list(entries)?;
+	*context.ignore_paths.lock().unwrap() = ignore_paths;
 	Ok(())
 }
 
@@ -783,6 +814,18 @@ fn tracing_thread(context: &'static Context) {
 							if abspath.as_bytes() == b"/" {
 								debug!("skipping /");
 								continue;
+							}
+							// If the resolved path is, or sits under, a path
+							// configured with `ignore: true`, pass the whole
+							// syscall through unmediated: no mount, prompt, or
+							// denial, even if it isn't otherwise covered.
+							if path_is_ignored(
+								&context.ignore_paths.lock().unwrap(),
+								abspath.as_bytes(),
+							) {
+								debug!("{} is under an ignored path; passing through", rwxp);
+								force_continue = true;
+								break;
 							}
 							let mut add_symlinks = false;
 							let mut add_placeholder = false;
@@ -1163,6 +1206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		permissive: cli.permissive,
 		prompter: cli.prompter.clone(),
 		config_path: cli.config.clone(),
+		ignore_paths: Mutex::new(Vec::new()),
 		sandbox_cmd: cli
 			.command
 			.iter()
@@ -1226,4 +1270,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.store(true, std::sync::atomic::Ordering::Relaxed);
 	tracing_thread.join().unwrap();
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::path_is_ignored;
+
+	#[test]
+	fn ignore_exact_and_descendants() {
+		let ignored = vec![b"/proc".to_vec(), b"/run/user/1000".to_vec()];
+		assert!(path_is_ignored(&ignored, b"/proc"));
+		assert!(path_is_ignored(&ignored, b"/proc/self/status"));
+		assert!(path_is_ignored(&ignored, b"/run/user/1000/bus"));
+		// A sibling sharing a name prefix is not under the ignored path.
+		assert!(!path_is_ignored(&ignored, b"/proc2"));
+		assert!(!path_is_ignored(&ignored, b"/procfoo"));
+		assert!(!path_is_ignored(&ignored, b"/run/user/10001"));
+		assert!(!path_is_ignored(&ignored, b"/etc"));
+	}
+
+	#[test]
+	fn ignore_root_matches_everything() {
+		let ignored = vec![b"/".to_vec()];
+		assert!(path_is_ignored(&ignored, b"/"));
+		assert!(path_is_ignored(&ignored, b"/anything/at/all"));
+	}
+
+	#[test]
+	fn ignore_empty_list_matches_nothing() {
+		assert!(!path_is_ignored(&[], b"/proc"));
+	}
 }

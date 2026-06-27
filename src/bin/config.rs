@@ -24,15 +24,21 @@ use serde::Deserialize;
 ///     $XDG_RUNTIME_DIR:
 ///         target: $XDG_RUNTIME_DIR/my-app
 ///         permissions: rw
+///     /proc:
+///         ignore: true
 /// ```
+///
+/// An `ignore: true` rule marks a path (and everything under it) as one
+/// turnstile-sandbox leaves alone: matching requests are passed through
+/// unmediated instead of being mounted, prompted for, or denied.
 #[derive(Debug, Deserialize)]
 pub struct Config {
 	#[serde(default)]
 	pub rules: BTreeMap<String, Rule>,
 }
 
-/// A single rule value, which is either a permission string or a mapping with
-/// `target` (host path) and `permissions`.
+/// A single rule value, which is either a permission string, a mapping with
+/// `target` (host path) and `permissions`, or an `ignore: true` marker.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Rule {
@@ -44,6 +50,13 @@ pub enum Rule {
 		#[serde(default)]
 		target: Option<String>,
 		permissions: String,
+	},
+	/// `ignore: true` marks the path (and everything under it) as one
+	/// that turnstile-sandbox should leave entirely alone: matching
+	/// requests are let through unmediated, without mounting, prompting,
+	/// or denying.
+	Ignore {
+		ignore: bool,
 	},
 }
 
@@ -168,11 +181,15 @@ pub struct ConfigEntry {
 	/// Path inside the sandbox.
 	pub sandbox_path: OsString,
 	/// Mount point describing the host source and attributes.  If None,
-	/// this is a placeholder only (aka. resolve-only) entry.
+	/// this is a placeholder only (aka. resolve-only) entry, or an ignore
+	/// entry (when `ignore` is set).
 	pub mount: Option<ManagedMountPoint>,
 	/// If self.mount is None, this is the host path that should be used
-	/// to create a placeholder.
+	/// to create a placeholder.  None for ignore entries.
 	pub placeholder_host_path: Option<CString>,
+	/// Whether this is an `ignore: true` entry (no mount or placeholder;
+	/// the path and its descendants are passed through unmediated).
+	pub ignore: bool,
 }
 
 impl Config {
@@ -195,6 +212,26 @@ impl Config {
 	pub fn parse_entries(&self) -> Result<Vec<ConfigEntry>, ConfigError> {
 		let mut out = Vec::with_capacity(self.rules.len());
 		for (sandbox_path_raw, rule) in &self.rules {
+			let sandbox_bytes = expand_path(sandbox_path_raw)?;
+			if sandbox_bytes.is_empty() {
+				return Err(ConfigError::EmptyPath(sandbox_path_raw.clone()));
+			}
+			if sandbox_bytes.contains(&0) {
+				return Err(ConfigError::NulInPath(sandbox_path_raw.clone()));
+			}
+
+			// An ignore entry carries neither a mount nor a placeholder; it
+			// only records the path so requests under it are passed through.
+			if let Rule::Ignore { ignore } = rule {
+				out.push(ConfigEntry {
+					sandbox_path: OsString::from_vec(sandbox_bytes),
+					mount: None,
+					placeholder_host_path: None,
+					ignore: *ignore,
+				});
+				continue;
+			}
+
 			let (host_path_raw, permissions) = match rule {
 				Rule::Simple(p) => (sandbox_path_raw.as_str(), p.as_str()),
 				Rule::Detailed {
@@ -204,14 +241,8 @@ impl Config {
 					target.as_deref().unwrap_or(sandbox_path_raw.as_str()),
 					permissions.as_str(),
 				),
+				Rule::Ignore { .. } => unreachable!("handled above"),
 			};
-			let sandbox_bytes = expand_path(sandbox_path_raw)?;
-			if sandbox_bytes.is_empty() {
-				return Err(ConfigError::EmptyPath(sandbox_path_raw.clone()));
-			}
-			if sandbox_bytes.contains(&0) {
-				return Err(ConfigError::NulInPath(sandbox_path_raw.clone()));
-			}
 			let host_bytes = expand_path(host_path_raw)?;
 			if host_bytes.is_empty() {
 				return Err(ConfigError::EmptyPath(host_path_raw.to_string()));
@@ -236,6 +267,7 @@ impl Config {
 					None
 				},
 				mount,
+				ignore: false,
 			});
 		}
 		Ok(out)
@@ -359,6 +391,30 @@ rules:
 		assert_eq!(rt_mount.host_path.to_bytes(), b"/run/user/1000/my-app");
 		assert_eq!(rt_mount.attrs.readonly, false);
 		assert_eq!(rt_mount.attrs.noexec, true);
+	}
+
+	#[test]
+	fn parse_ignore_rule() {
+		let yaml = r#"
+rules:
+    /etc: r
+    /proc:
+        ignore: true
+"#;
+		let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
+		let entries = cfg.parse_entries().unwrap();
+		assert_eq!(entries.len(), 2);
+		let by_path: std::collections::HashMap<_, _> = entries
+			.iter()
+			.map(|e| (e.sandbox_path.as_bytes().to_vec(), e))
+			.collect();
+		let etc = by_path.get(&b"/etc"[..]).unwrap();
+		assert!(!etc.ignore);
+		assert!(etc.mount.is_some());
+		let proc = by_path.get(&b"/proc"[..]).unwrap();
+		assert!(proc.ignore);
+		assert!(proc.mount.is_none());
+		assert!(proc.placeholder_host_path.is_none());
 	}
 
 	#[test]
