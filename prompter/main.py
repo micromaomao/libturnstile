@@ -16,12 +16,18 @@ Simplifications (left as TODO for now):
   * Resolve-only requests (no r/w/x needed, just path resolution) are
     always allowed by emitting ``match_host`` placeholders; they are not
     shown in the tree.
-  * "Persist these rules in the config" does not yet write the config.
+
+When "Persist these rules in the config" is checked, the granted mounts
+are written into the YAML config file named in the request (parsed,
+modified, written to a sibling temp file, then atomically moved onto the
+config path) and ``reload_config`` is set instead of emitting
+``add_mounts``.
 """
 
 import json
 import os
 import sys
+import tempfile
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -99,6 +105,75 @@ class ScaleManager:
         self.scale = new
         save_scale(self.scale)
         return True
+
+
+def perm_string(attrs):
+    """Build a config permission string ("r"/"rw"/"rx"/"rwx") from attrs."""
+    s = "r"
+    if not attrs.get("readonly", True):
+        s += "w"
+    if not attrs.get("noexec", True):
+        s += "x"
+    return s
+
+
+def escape_config_path(path):
+    """Escape a literal path for the config's ``$``-expansion syntax.
+
+    turnstile-sandbox expands ``$$`` to ``$`` and ``$VAR`` to an
+    environment variable when loading rule keys/targets, so a literal
+    ``$`` in a host path must be doubled to round-trip unchanged.
+    """
+    return path.replace("$", "$$")
+
+
+def persist_mounts_to_config(config_path, mounts):
+    """Write ``mounts`` into the YAML config at ``config_path``.
+
+    The file is parsed, the ``rules`` mapping is updated with one entry
+    per mount (a plain permission string when the host path matches the
+    sandbox path, otherwise a ``target``/``permissions`` mapping), then
+    serialized to a sibling temp file and atomically moved onto the
+    config path so a concurrent reader never sees a partial file.
+    """
+    import yaml
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        cfg = {}
+    rules = cfg.get("rules")
+    if not isinstance(rules, dict):
+        rules = {}
+        cfg["rules"] = rules
+
+    for mount in mounts:
+        sandbox_path = mount["mount_point"]
+        host_path = mount["host_path"]
+        perms = perm_string(mount.get("attrs", {}))
+        key = escape_config_path(sandbox_path)
+        if host_path == sandbox_path:
+            rules[key] = perms
+        else:
+            rules[key] = {
+                "target": escape_config_path(host_path),
+                "permissions": perms,
+            }
+
+    directory = os.path.dirname(config_path) or "."
+    fd, tmp = tempfile.mkstemp(
+        prefix=".turnstile-config-", suffix=".yaml", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp, config_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def needed_perms(perm):
@@ -564,6 +639,7 @@ class PrompterDialog(QtWidgets.QDialog):
     def __init__(self, request, grants, placeholders):
         super().__init__()
         self.placeholders = placeholders
+        self.config_path = request.get("config_path")
         self.response = deny_response()  # default if the window is closed
         self.scale_mgr = None  # set by main() before exec()
 
@@ -613,8 +689,7 @@ class PrompterDialog(QtWidgets.QDialog):
 
         self.persist_box = QtWidgets.QCheckBox("Persist these rules in the config")
         self.persist_box.setChecked(True)
-        # TODO: actually write the granted rules back to the config file
-        # (and set reload_config) when this is checked.
+        self.persist_box.setEnabled(bool(self.config_path))
         layout.addWidget(self.persist_box)
 
         buttons = QtWidgets.QHBoxLayout()
@@ -720,13 +795,31 @@ class PrompterDialog(QtWidgets.QDialog):
 
     def _on_continue(self):
         if self.allow_box.isChecked():
+            mounts = self.tree.mounts()
             self.response = {
                 "action": {"continue": True},
-                "add_mounts": self.tree.mounts(),
                 "add_placeholders": self.placeholders,
                 "auto_add_symlinks": True,
                 "auto_widen_descendant_permissions": True,
             }
+            # When persisting, write the mounts into the config and ask
+            # turnstile-sandbox to reload it instead of applying transient
+            # mounts; the reload reproduces exactly these mounts.  Fall back
+            # to transient mounts if writing the config fails.
+            if self.persist_box.isChecked() and self.config_path:
+                try:
+                    persist_mounts_to_config(self.config_path, mounts)
+                    self.response["reload_config"] = True
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Could not persist to config",
+                        "Failed to write the config file:\n%s\n\n"
+                        "Granting for this session only." % exc,
+                    )
+                    self.response["add_mounts"] = mounts
+            else:
+                self.response["add_mounts"] = mounts
         else:
             # Don't grant anything, but still let the syscall proceed
             # against the current sandbox view rather than forcing EPERM.
