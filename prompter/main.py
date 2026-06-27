@@ -327,8 +327,13 @@ class TreeWidget(QtWidgets.QWidget):
         style = self.style()
         self._arrow_icon = style.standardIcon(QtWidgets.QStyle.SP_ArrowRight)
         self._clear_icon = style.standardIcon(QtWidgets.QStyle.SP_LineEditClearButton)
-        # The block ("prohibited") glyph shown by the per-row block toggle.
-        self._block_glyph = "\U0001f6c7"
+        # Size used for every per-row button icon so the redirect and block
+        # buttons are exactly the same size.
+        px = style.pixelMetric(QtWidgets.QStyle.PM_SmallIconSize)
+        self._icon_size = QtCore.QSize(px, px)
+        # The block ("prohibited") glyph, rendered as an icon (rather than
+        # button text) so it matches the redirect icon's size.
+        self._block_icon = self._render_glyph_icon("\U0001f6c7", px)
 
         # Hover bookkeeping for the redirect/block buttons.
         self._hovered = None
@@ -355,6 +360,7 @@ class TreeWidget(QtWidgets.QWidget):
             # but only shows its icon while the row is hovered.
             btn = QtWidgets.QToolButton()
             btn.setAutoRaise(True)
+            btn.setIconSize(self._icon_size)
             btn.setToolTip("Redirect this path to another host location")
             btn.clicked.connect(
                 lambda _checked, n=node: self._on_redirect_clicked(n)
@@ -362,12 +368,12 @@ class TreeWidget(QtWidgets.QWidget):
             node.redirect_btn = btn
 
             # Block toggle: a push-down button that marks this path (and
-            # everything under it) as ignored.  It shows its glyph while the
-            # row is hovered or whenever it is checked.
+            # everything under it) as ignored.
             block_btn = QtWidgets.QToolButton()
             block_btn.setAutoRaise(True)
             block_btn.setCheckable(True)
-            block_btn.setText(self._block_glyph)
+            block_btn.setIcon(self._block_icon)
+            block_btn.setIconSize(self._icon_size)
             block_btn.setEnabled(self.allow_block)
             block_btn.setToolTip(
                 "Block all further requests for or under this path"
@@ -435,6 +441,25 @@ class TreeWidget(QtWidgets.QWidget):
             lambda checked, n=node, p=perm: self._on_toggle(n, p, checked)
         )
         return box
+
+    def _render_glyph_icon(self, glyph, px):
+        """Render a text ``glyph`` into a ``px``-sized monochrome QIcon.
+
+        Used so a Unicode glyph (e.g. the block symbol) can be shown on a
+        QToolButton at the same icon size as the style's standard icons.
+        """
+        dpr = self.devicePixelRatioF()
+        pix = QtGui.QPixmap(round(px * dpr), round(px * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(pix)
+        font = QtGui.QFont(self.font())
+        font.setPixelSize(px)
+        painter.setFont(font)
+        painter.setPen(self.palette().color(QtGui.QPalette.WindowText))
+        painter.drawText(QtCore.QRectF(0, 0, px, px), QtCore.Qt.AlignCenter, glyph)
+        painter.end()
+        return QtGui.QIcon(pix)
 
     def _build(self, grants):
         """Insert every grant path into the trie and seed required perms."""
