@@ -26,19 +26,30 @@ use serde::Deserialize;
 ///         permissions: rw
 ///     /proc:
 ///         ignore: true
+///     /home/mao:
+///         permissions: r
+///         ignore: true
 /// ```
 ///
 /// An `ignore: true` rule marks a path (and everything under it) as one
-/// turnstile-sandbox leaves alone: matching requests are passed through
-/// unmediated instead of being mounted, prompted for, or denied.
+/// turnstile-sandbox passes through unmediated instead of prompting for
+/// or denying.  On its own it leaves the path entirely alone; combined
+/// with `permissions` it grants that access and only passes through what
+/// the grant does not already cover (e.g. `permissions: r` + `ignore:
+/// true` serves reads from the mount but lets writes/execs through).
 #[derive(Debug, Deserialize)]
 pub struct Config {
 	#[serde(default)]
 	pub rules: BTreeMap<String, Rule>,
 }
 
-/// A single rule value, which is either a permission string, a mapping with
-/// `target` (host path) and `permissions`, or an `ignore: true` marker.
+/// A single rule value, which is either a permission string or a mapping.
+///
+/// The mapping form carries an optional `target` (host path), optional
+/// `permissions`, and an optional `ignore` flag.  `ignore: true` may
+/// stand alone (leave the path entirely alone) or accompany
+/// `permissions` (grant that access, but pass through anything it does
+/// not cover instead of prompting/denying).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Rule {
@@ -49,13 +60,14 @@ pub enum Rule {
 		/// (the sandbox path) when not specified.
 		#[serde(default)]
 		target: Option<String>,
-		permissions: String,
-	},
-	/// `ignore: true` marks the path (and everything under it) as one
-	/// that turnstile-sandbox should leave entirely alone: matching
-	/// requests are let through unmediated, without mounting, prompting,
-	/// or denying.
-	Ignore {
+		/// Access to grant, e.g. `rx`.  An empty string is a resolve-only
+		/// placeholder.  Absent means no mount/placeholder (only valid
+		/// together with `ignore: true`).
+		#[serde(default)]
+		permissions: Option<String>,
+		/// Pass requests this rule does not otherwise grant through
+		/// unmediated, without mounting, prompting, or denying.
+		#[serde(default)]
 		ignore: bool,
 	},
 }
@@ -86,6 +98,8 @@ pub enum ConfigError {
 	EmptyPath(String),
 	#[error("path {0:?} contains a NUL byte after expansion")]
 	NulInPath(String),
+	#[error("rule {0:?} must specify 'permissions' and/or 'ignore: true'")]
+	EmptyRule(String),
 }
 
 /// Parse a permission string like `"r"`, `"rx"`, `"rw"`, `"rwx"` into
@@ -189,14 +203,14 @@ pub struct ConfigEntry {
 	/// Path inside the sandbox.
 	pub sandbox_path: OsString,
 	/// Mount point describing the host source and attributes.  If None,
-	/// this is a placeholder only (aka. resolve-only) entry, or an ignore
-	/// entry (when `ignore` is set).
+	/// this is a placeholder-only (resolve-only) entry, or carries no
+	/// mount at all (an ignore-only rule).
 	pub mount: Option<ManagedMountPoint>,
 	/// If self.mount is None, this is the host path that should be used
-	/// to create a placeholder.  None for ignore entries.
+	/// to create a placeholder.  None for ignore-only entries.
 	pub placeholder_host_path: Option<CString>,
-	/// Whether this is an `ignore: true` entry (no mount or placeholder;
-	/// the path and its descendants are passed through unmediated).
+	/// Whether this rule passes through requests it does not otherwise
+	/// grant (`ignore: true`).  May be set together with a mount.
 	pub ignore: bool,
 }
 
@@ -237,54 +251,52 @@ impl Config {
 				));
 			}
 
-			// An ignore entry carries neither a mount nor a placeholder; it
-			// only records the path so requests under it are passed through.
-			if let Rule::Ignore { ignore } = rule {
-				out.push(ConfigEntry {
-					sandbox_path: OsString::from_vec(sandbox_bytes),
-					mount: None,
-					placeholder_host_path: None,
-					ignore: *ignore,
-				});
-				continue;
-			}
-
-			let (host_path_raw, permissions) = match rule {
-				Rule::Simple(p) => (sandbox_path_raw.as_str(), p.as_str()),
+			let (target, permissions, ignore) = match rule {
+				Rule::Simple(p) => (None, Some(p.as_str()), false),
 				Rule::Detailed {
 					target,
 					permissions,
-				} => (
-					target.as_deref().unwrap_or(sandbox_path_raw.as_str()),
-					permissions.as_str(),
-				),
-				Rule::Ignore { .. } => unreachable!("handled above"),
+					ignore,
+				} => (target.as_deref(), permissions.as_deref(), *ignore),
 			};
-			let host_bytes = expand_path(host_path_raw)?;
-			if host_bytes.is_empty() {
-				return Err(ConfigError::EmptyPath(host_path_raw.to_string()));
+
+			// Build the mount or placeholder from the permissions, if any.
+			// A non-empty permission string is a mount, an empty string is
+			// a resolve-only placeholder, and an absent one means neither
+			// (only valid alongside `ignore: true`).
+			let (mount, placeholder_host_path) = match permissions {
+				Some(perms) => {
+					let host_path_raw = target.unwrap_or(sandbox_path_raw.as_str());
+					let host_bytes = expand_path(host_path_raw)?;
+					if host_bytes.is_empty() {
+						return Err(ConfigError::EmptyPath(host_path_raw.to_string()));
+					}
+					let host_path = CString::new(host_bytes)
+						.map_err(|_| ConfigError::NulInPath(host_path_raw.to_string()))?;
+					if perms.is_empty() {
+						(None, Some(host_path))
+					} else {
+						(
+							Some(ManagedMountPoint {
+								host_path,
+								attrs: parse_permissions(perms)?,
+							}),
+							None,
+						)
+					}
+				}
+				None => (None, None),
+			};
+
+			if mount.is_none() && placeholder_host_path.is_none() && !ignore {
+				return Err(ConfigError::EmptyRule(sandbox_path_raw.clone()));
 			}
-			let mut host_path = Some(
-				CString::new(host_bytes)
-					.map_err(|_| ConfigError::NulInPath(host_path_raw.to_string()))?,
-			);
-			let mount = if permissions.is_empty() {
-				None
-			} else {
-				Some(ManagedMountPoint {
-					host_path: host_path.take().unwrap(),
-					attrs: parse_permissions(permissions)?,
-				})
-			};
+
 			out.push(ConfigEntry {
 				sandbox_path: OsString::from_vec(sandbox_bytes),
-				placeholder_host_path: if mount.is_none() {
-					Some(host_path.take().unwrap())
-				} else {
-					None
-				},
 				mount,
-				ignore: false,
+				placeholder_host_path,
+				ignore,
 			});
 		}
 		Ok(out)
@@ -432,6 +444,35 @@ rules:
 		assert!(proc.ignore);
 		assert!(proc.mount.is_none());
 		assert!(proc.placeholder_host_path.is_none());
+	}
+
+	#[test]
+	fn parse_grant_plus_ignore() {
+		let yaml = r#"
+rules:
+    /home/mao:
+        permissions: r
+        ignore: true
+"#;
+		let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
+		let entries = cfg.parse_entries().unwrap();
+		assert_eq!(entries.len(), 1);
+		let e = &entries[0];
+		assert!(e.ignore);
+		let mount = e.mount.as_ref().unwrap();
+		assert_eq!(mount.host_path.to_bytes(), b"/home/mao");
+		assert_eq!(mount.attrs.readonly, true);
+		assert_eq!(mount.attrs.noexec, true);
+	}
+
+	#[test]
+	fn reject_empty_rule() {
+		let yaml = "rules:\n    /foo: {}\n";
+		let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
+		assert!(matches!(
+			cfg.parse_entries(),
+			Err(ConfigError::EmptyRule(_))
+		));
 	}
 
 	#[test]

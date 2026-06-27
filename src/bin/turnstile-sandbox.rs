@@ -437,24 +437,16 @@ fn load_config_into_sandbox(context: &Context) -> Result<(), Box<dyn std::error:
 	let mut entries: Vec<(&OsStr, ManagedTreeEntry)> = Vec::with_capacity(resolved_entries.len());
 	let mut ignore_paths: Vec<Vec<u8>> = Vec::new();
 	for e in &resolved_entries {
-		// Ignore entries carry no mount or placeholder; they only record a
-		// path to pass through unmediated.
-		if e.mount.is_none() && e.placeholder_host_path.is_none() {
-			if e.ignore {
-				ignore_paths.push(e.sandbox_path.as_bytes().to_vec());
-			}
-			continue;
+		// An ignore flag is independent of any mount/placeholder: a rule
+		// can both grant access and pass through what it does not cover.
+		if e.ignore {
+			ignore_paths.push(e.sandbox_path.as_bytes().to_vec());
 		}
-		let entry = match e.mount {
-			Some(ref m) => ManagedTreeEntry::BindMount(m.clone()),
-			None => {
-				let p = build_resolve_placeholder(
-					e.placeholder_host_path
-						.as_deref()
-						.expect("placeholder_host_path must be non-empty when mount is None"),
-				)?;
-				ManagedTreeEntry::Placeholder(p)
-			}
+		let entry = match (&e.mount, &e.placeholder_host_path) {
+			(Some(m), _) => ManagedTreeEntry::BindMount(m.clone()),
+			(None, Some(ph)) => ManagedTreeEntry::Placeholder(build_resolve_placeholder(ph)?),
+			// Ignore-only rule: nothing to add to the mount tree.
+			(None, None) => continue,
 		};
 		entries.push((e.sandbox_path.as_os_str(), entry));
 	}
@@ -815,18 +807,6 @@ fn tracing_thread(context: &'static Context) {
 								debug!("skipping /");
 								continue;
 							}
-							// If the resolved path is, or sits under, a path
-							// configured with `ignore: true`, pass the whole
-							// syscall through unmediated: no mount, prompt, or
-							// denial, even if it isn't otherwise covered.
-							if path_is_ignored(
-								&context.ignore_paths.lock().unwrap(),
-								abspath.as_bytes(),
-							) {
-								debug!("{} is under an ignored path; passing through", rwxp);
-								force_continue = true;
-								break;
-							}
 							let mut add_symlinks = false;
 							let mut add_placeholder = false;
 							let mut add_mount = false;
@@ -861,6 +841,35 @@ fn tracing_thread(context: &'static Context) {
 								}
 								Ok(false) => {
 									check_req_valid!();
+									// If the target is, or sits under, a path
+									// configured with `ignore: true`, pass the
+									// whole syscall through unmediated rather
+									// than prompting or denying.  We match on the
+									// full target path (its leaf), not the parent
+									// that dir-ops like mkdir / unlink resolve
+									// `abspath` to, so an ignore rule on the entry
+									// being created/removed also matches.
+									// Coverage was checked first, so a mount on an
+									// ignored path still serves the access it
+									// grants; only what it does not cover is
+									// passed through.
+									let ignore_paths = context.ignore_paths.lock().unwrap();
+									let ignored = !ignore_paths.is_empty() && {
+										let target = t_local.realpath().unwrap_or_else(|_| {
+											OsStr::from_bytes(abspath.as_bytes()).to_owned()
+										});
+										path_is_ignored(&ignore_paths, target.as_bytes())
+									};
+									drop(ignore_paths);
+									if ignored {
+										debug!(
+											"{} not covered but under an ignored path; \
+											 passing through",
+											rwxp
+										);
+										force_continue = true;
+										break;
+									}
 									info!(
 										"{}[{}] need fs permission {}{}{} on {}",
 										req_ctx

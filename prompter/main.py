@@ -162,7 +162,17 @@ def persist_to_config(config_path, mounts, ignores=()):
             }
 
     for path in ignores:
-        rules[escape_config_path(path)] = {"ignore": True}
+        key = escape_config_path(path)
+        existing = rules.get(key)
+        if isinstance(existing, str):
+            # An existing plain permission string is kept as a grant and
+            # ignore is merged in (grant that access, pass through the rest).
+            rules[key] = {"permissions": existing, "ignore": True}
+        elif isinstance(existing, dict):
+            # Preserve any existing target/permissions and just add ignore.
+            existing["ignore"] = True
+        else:
+            rules[key] = {"ignore": True}
 
     directory = os.path.dirname(config_path) or "."
     fd, tmp = tempfile.mkstemp(
