@@ -242,6 +242,11 @@ class TreeWidget(QtWidgets.QWidget):
             label.setContentsMargins(node.depth * INDENT_PX, 0, 0, 0)
             grid.addWidget(label, row, 0)
 
+            # Mounts on "/" are unsupported, so the root gets no rwx
+            # controls - only its descendants are grantable.
+            if node.depth == 0:
+                continue
+
             node.cb_r = self._make_box(node, "r")
             node.cb_w = self._make_box(node, "w")
             node.cb_x = self._make_box(node, "x")
@@ -306,6 +311,10 @@ class TreeWidget(QtWidgets.QWidget):
             node.eff_r = node.own_r or pr
             node.eff_w = node.own_w or pw
             node.eff_x = node.own_x or px
+
+            if node.cb_r is None:
+                # Root row (no rwx controls); nothing to update.
+                continue
 
             for box, checked, enabled in (
                 (node.cb_r, node.eff_r, not pr),
@@ -583,7 +592,15 @@ def main():
         sys.stdout.write("\n")
         return
 
+    # Silence the harmless "Could not register app ID" portal warning that
+    # Qt emits when no matching .desktop file exists for our app id.
+    QtCore.QLoggingCategory.setFilterRules("qt.qpa.services.warning=false")
     app = QtWidgets.QApplication([])
+    # Give the window a specific app-id / WM_CLASS (instead of the generic
+    # "python3") so window-manager rules can target it.  On Wayland the
+    # app-id is taken from the desktop file name.
+    app.setApplicationName("turnstile-example-prompter")
+    app.setDesktopFileName("turnstile-example-prompter")
     scale_mgr = ScaleManager(app)
     dialog = PrompterDialog(request, grant_list, placeholders)
     dialog.scale_mgr = scale_mgr

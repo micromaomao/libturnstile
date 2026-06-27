@@ -696,6 +696,52 @@ fn tracing_thread(context: &'static Context) {
 										break;
 									}
 								};
+							// For a create-like directory operation, if the
+							// target entry itself already exists and is already
+							// covered, the continued syscall will just open the
+							// existing entry or fail with EEXIST - neither needs
+							// access on the parent directory.  Short-circuit so we
+							// don't spuriously prompt for (or deny on) the parent,
+							// e.g. creating /dev/null when /dev/null is mounted
+							// but /dev is not.  Only open(O_CREAT) / mkdir /
+							// symlink / mknod qualify (a dir-op on FsOpen /
+							// FsCreate); ops that genuinely mutate the parent
+							// (unlink / rename / link) are excluded.
+							if rwxp.is_dir_op
+								&& matches!(fsop, FsOperation::FsOpen(_) | FsOperation::FsCreate(_))
+								&& let Ok(leaf_fd) = t_local.open_target()
+								&& let Ok(leaf_path) = leaf_fd.readlink()
+							{
+								let mut bytes = leaf_path.into_encoded_bytes();
+								bytes.push(b'\0');
+								let leaf_abspath = CString::from_vec_with_nul(bytes).unwrap();
+								if leaf_abspath.as_bytes() != b"/"
+									&& matches!(
+										check_covered_or_placeholder(
+											&context.sandbox,
+											&leaf_abspath,
+											rwxp.write,
+											rwxp.exec,
+											false,
+										),
+										Ok((true, _))
+									) {
+									debug!(
+										"{} target {:?} already exists and is covered; \
+										 not requiring parent access",
+										rwxp, leaf_abspath
+									);
+									if let Err(e) = create_symlinks_for_user_path(
+										&context.sandbox,
+										t_local.dfd(),
+										t_local.path(),
+										!t_local.no_follow(),
+									) {
+										debug!("could not mirror symlinks for {}: {}", rwxp, e);
+									}
+									continue;
+								}
+							}
 							let target_fd = if rwxp.is_dir_op {
 								t_local.open_target_dir().map(|x| x.0)
 							} else {
