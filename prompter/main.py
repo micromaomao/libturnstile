@@ -196,21 +196,14 @@ def rwx_string(need_read, need_write, need_exec):
     )
 
 
-def trim_trailing_dot(path):
-    """Trim a trailing ``/.`` from a path.
-
-    This is the only non-canonical form a realpath-derived path can take
-    (produced when the syscall's path ended in ``/``, ``/.`` or ``/..``).
-    Keeps ``/`` if trimming would empty the path.
-    """
-    if path.endswith("/."):
-        return path[:-2] or "/"
-    return path
-
-
 def target_path(perm):
-    """The displayed/host path of a rwx_permission, normalised."""
-    return trim_trailing_dot(perm["target"]["path"])
+    """The displayed/host path of a rwx_permission, normalised.
+
+    rwx_permission targets are already symlink-free due to realpath,
+    so collapsing ``.`` / ``..`` and redundant slashes lexically yields
+    the real path.
+    """
+    return os.path.normpath(perm["target"]["path"])
 
 
 def grant_path_for(perm, create_like=False):

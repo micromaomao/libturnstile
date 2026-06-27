@@ -175,6 +175,14 @@ fn is_var_char(b: u8) -> bool {
 	b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Whether any `/`-separated component of `path` is `.` or `..`.  Such
+/// paths are not canonical and cannot be represented by the sandbox
+/// mount tree, which walks components and forbids dots.
+fn path_has_dot_component(path: &[u8]) -> bool {
+	path.split(|&b| b == b'/')
+		.any(|comp| comp == b"." || comp == b"..")
+}
+
 /// A single parsed config entry, ready to be passed to
 /// [`libturnstile::ManagedBindMountSandbox::update_from_list`].
 pub struct ConfigEntry {
@@ -218,6 +226,15 @@ impl Config {
 			}
 			if sandbox_bytes.contains(&0) {
 				return Err(ConfigError::NulInPath(sandbox_path_raw.clone()));
+			}
+			// The sandbox mount tree walks path components and rejects "."
+			// / ".." (it would otherwise panic), so reject such paths here
+			// with a clean error instead of crashing on insertion.
+			if path_has_dot_component(&sandbox_bytes) {
+				return Err(ConfigError::InvalidPath(
+					sandbox_path_raw.clone(),
+					"'.' and '..' path components are not allowed in sandbox paths",
+				));
 			}
 
 			// An ignore entry carries neither a mount nor a placeholder; it
@@ -415,6 +432,18 @@ rules:
 		assert!(proc.ignore);
 		assert!(proc.mount.is_none());
 		assert!(proc.placeholder_host_path.is_none());
+	}
+
+	#[test]
+	fn reject_dot_components() {
+		for p in ["/a/..", "/a/../b", "/a/.", "/./a", ".."] {
+			let yaml = format!("rules:\n    \"{p}\": r\n");
+			let cfg: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+			assert!(
+				matches!(cfg.parse_entries(), Err(ConfigError::InvalidPath(_, _))),
+				"expected {p:?} to be rejected"
+			);
+		}
 	}
 
 	#[test]
