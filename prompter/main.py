@@ -17,7 +17,6 @@ Simplifications (left as TODO for now):
     always allowed by emitting ``match_host`` placeholders; they are not
     shown in the tree.
   * "Persist these rules in the config" does not yet write the config.
-  * There is no directory "redirect" (->) support yet.
 """
 
 import json
@@ -197,6 +196,19 @@ class FsNode:
         self.cb_w = None
         self.cb_x = None
 
+        # Redirect state: when set, this node is mounted from a
+        # user-specified host path (with full rwx) instead of its own path.
+        self.redirect = None
+        # own_r/w/x captured before a redirect forced them all on, so they
+        # can be restored when the redirect is cleared.
+        self.saved_own = None
+
+        # Row widgets, created by TreeWidget.
+        self.label = None
+        self.redirect_btn = None
+        # Every widget making up this node's row, so it can be shown/hidden.
+        self.row_widgets = []
+
     def child(self, name):
         node = self.children.get(name)
         if node is None:
@@ -228,24 +240,51 @@ class TreeWidget(QtWidgets.QWidget):
         self.nodes_preorder = []
         self._flatten(self.root)
 
+        # Icons shown (only while a row is hovered) by the per-row redirect
+        # button: an arrow to set a redirect, an "x" to clear one.
+        style = self.style()
+        self._arrow_icon = style.standardIcon(QtWidgets.QStyle.SP_ArrowRight)
+        self._clear_icon = style.standardIcon(QtWidgets.QStyle.SP_LineEditClearButton)
+
+        # Hover bookkeeping for the redirect button.
+        self._hovered = None
+        self._node_of_widget = {}
+
         grid = QtWidgets.QGridLayout(self)
         grid.setContentsMargins(8, 8, 8, 8)
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(2)
 
         for row, node in enumerate(self.nodes_preorder):
-            if node.depth == 0 or node.children:
-                text = node.name if node.depth == 0 else node.name + "/"
-            else:
-                text = node.name
-            label = QtWidgets.QLabel(text)
+            label = QtWidgets.QLabel(self._row_label_text(node))
             label.setContentsMargins(node.depth * INDENT_PX, 0, 0, 0)
-            grid.addWidget(label, row, 0)
+            node.label = label
 
             # Mounts on "/" are unsupported, so the root gets no rwx
-            # controls - only its descendants are grantable.
+            # controls and no redirect - only its descendants are grantable.
             if node.depth == 0:
+                grid.addWidget(label, row, 0)
+                node.row_widgets = [label]
                 continue
+
+            # Redirect button: always present (so the column never reflows)
+            # but only shows its icon while the row is hovered.
+            btn = QtWidgets.QToolButton()
+            btn.setAutoRaise(True)
+            btn.setToolTip("Redirect this path to another host location")
+            btn.clicked.connect(
+                lambda _checked, n=node: self._on_redirect_clicked(n)
+            )
+            node.redirect_btn = btn
+
+            name_box = QtWidgets.QWidget()
+            name_layout = QtWidgets.QHBoxLayout(name_box)
+            name_layout.setContentsMargins(0, 0, 0, 0)
+            name_layout.setSpacing(6)
+            name_layout.addWidget(label)
+            name_layout.addWidget(btn)
+            name_layout.addStretch(1)
+            grid.addWidget(name_box, row, 0)
 
             node.cb_r = self._make_box(node, "r")
             node.cb_w = self._make_box(node, "w")
@@ -254,11 +293,36 @@ class TreeWidget(QtWidgets.QWidget):
             grid.addWidget(node.cb_w, row, 2)
             grid.addWidget(node.cb_x, row, 3)
 
+            # Track hover over every interactive widget in the row so the
+            # redirect button reveals itself.
+            for w in (name_box, label, btn, node.cb_r, node.cb_w, node.cb_x):
+                self._node_of_widget[w] = node
+                w.installEventFilter(self)
+
+            node.row_widgets = [name_box, node.cb_r, node.cb_w, node.cb_x]
+
         grid.setColumnStretch(0, 1)
         # Absorb extra vertical space below the rows so they stay compact
         # at the top instead of spreading out when the window is tall.
         grid.setRowStretch(len(self.nodes_preorder), 1)
         self.refresh()
+        self._update_visibility()
+
+    def _update_visibility(self):
+        """Hide rows whose ancestor is redirected (they're covered by it)."""
+        for node in self.nodes_preorder:
+            hidden = self._has_redirected_ancestor(node)
+            for w in node.row_widgets:
+                w.setVisible(not hidden)
+
+    def _has_redirected_ancestor(self, node):
+        """Whether any ancestor of ``node`` is redirected."""
+        anc = node.parent
+        while anc is not None:
+            if anc.redirect is not None:
+                return True
+            anc = anc.parent
+        return False
 
     def _make_box(self, node, perm):
         box = QtWidgets.QCheckBox(perm)
@@ -284,6 +348,117 @@ class TreeWidget(QtWidgets.QWidget):
         self.nodes_preorder.append(node)
         for _name, child in sorted(node.children.items()):
             self._flatten(child)
+
+    def _row_label_text(self, node):
+        """Display text for a node's row, including any redirect target."""
+        if node.depth == 0 or node.children:
+            text = node.name if node.depth == 0 else node.name + "/"
+        else:
+            text = node.name
+        if node.redirect is not None:
+            text += "  \u2192  " + node.redirect
+        return text
+
+    def _update_row_label(self, node):
+        if node.label is not None:
+            node.label.setText(self._row_label_text(node))
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.Enter:
+            node = self._node_of_widget.get(obj)
+            if node is not None:
+                self._set_hovered(node)
+        return super().eventFilter(obj, event)
+
+    def leaveEvent(self, event):
+        self._set_hovered(None)
+        super().leaveEvent(event)
+
+    def _set_hovered(self, node):
+        """Reveal the redirect button on ``node``'s row, hide it elsewhere."""
+        # When the whole tree is disabled (the request isn't being
+        # granted), don't reveal any redirect button.
+        if not self.isEnabled():
+            node = None
+        if node is self._hovered:
+            return
+        if self._hovered is not None and self._hovered.redirect_btn is not None:
+            self._hovered.redirect_btn.setIcon(QtGui.QIcon())
+        self._hovered = node
+        if node is not None and node.redirect_btn is not None:
+            self._update_redirect_button(node)
+
+    def _update_redirect_button(self, node):
+        """Set the redirect button's icon and tooltip for its current state."""
+        btn = node.redirect_btn
+        if btn is None:
+            return
+        if node.redirect is not None:
+            btn.setIcon(self._clear_icon)
+            btn.setToolTip("Clear redirection")
+        else:
+            btn.setIcon(self._arrow_icon)
+            btn.setToolTip("Redirect this path to another host location")
+
+    def _on_redirect_clicked(self, node):
+        if node.redirect is not None:
+            self._clear_redirect(node)
+        else:
+            self._set_redirect(node)
+
+    def _node_is_dir(self, node):
+        """Whether ``node`` denotes a directory (so we pick a dir chooser).
+
+        Nodes with children are directories by construction; otherwise we
+        fall back to inspecting the host path.
+        """
+        if node.children:
+            return True
+        try:
+            return os.path.isdir(node.path)
+        except OSError:
+            return False
+
+    def _set_redirect(self, node):
+        """Ask for a host path and redirect ``node``'s mount there."""
+        start = node.redirect or node.path
+        if self._node_is_dir(node):
+            path = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Redirect %s to host directory" % node.path, start
+            )
+        else:
+            path, _filter = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Redirect %s to host file" % node.path,
+                os.path.dirname(start) or "/",
+            )
+        if not path:
+            return
+        path = path.strip()
+        if not path:
+            return
+        # A redirect grants full rwx; remember the prior selection so it can
+        # be restored if the redirect is later cleared.
+        node.saved_own = (node.own_r, node.own_w, node.own_x)
+        node.redirect = path
+        node.own_r = node.own_w = node.own_x = True
+        self._update_row_label(node)
+        if node.redirect_btn is not None:
+            self._update_redirect_button(node)
+        self.refresh()
+        self._update_visibility()
+
+    def _clear_redirect(self, node):
+        """Remove ``node``'s redirect and restore its original access."""
+        node.redirect = None
+        if node.saved_own is not None:
+            node.own_r, node.own_w, node.own_x = node.saved_own
+            node.saved_own = None
+        self._update_row_label(node)
+        if node.redirect_btn is not None:
+            self._update_redirect_button(node)
+        self.refresh()
+        self._update_visibility()
 
     def _on_toggle(self, node, perm, checked):
         if perm == "r":
@@ -316,10 +491,13 @@ class TreeWidget(QtWidgets.QWidget):
                 # Root row (no rwx controls); nothing to update.
                 continue
 
+            # A redirected node is locked at full rwx until the redirect is
+            # cleared, so its boxes are checked and disabled.
+            locked = node.redirect is not None
             for box, checked, enabled in (
-                (node.cb_r, node.eff_r, not pr),
-                (node.cb_w, node.eff_w, not pw),
-                (node.cb_x, node.eff_x, not px),
+                (node.cb_r, node.eff_r, not pr and not locked),
+                (node.cb_w, node.eff_w, not pw and not locked),
+                (node.cb_x, node.eff_x, not px and not locked),
             ):
                 box.blockSignals(True)
                 box.setChecked(checked)
@@ -336,6 +514,26 @@ class TreeWidget(QtWidgets.QWidget):
         result = []
         seen = set()
         for node in self.nodes_preorder:
+            # Anything under a redirected ancestor is already provided by
+            # that ancestor's mount, so never emit a mount for it (even if
+            # the user configured access or a redirect on it earlier).
+            if self._has_redirected_ancestor(node):
+                continue
+
+            # A redirected node is always mounted, from its user-specified
+            # host path, with full rwx.
+            if node.redirect is not None:
+                if node.path not in seen:
+                    seen.add(node.path)
+                    result.append(
+                        {
+                            "mount_point": node.path,
+                            "host_path": node.redirect,
+                            "attrs": {"readonly": False, "noexec": False},
+                        }
+                    )
+                continue
+
             pr = node.parent.eff_r if node.parent else False
             pw = node.parent.eff_w if node.parent else False
             px = node.parent.eff_x if node.parent else False
