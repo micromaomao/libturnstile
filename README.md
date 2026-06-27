@@ -162,5 +162,7 @@ Executed in    4.40 secs    fish           external
 ## TODO
 
 - Improve API for performance and ergonomics
+- Implement a safe way to proxy rename, unlink and link operations that
+  are unnecessarily prevented by the existant of ephemeral or policy mounts
 - sendmm?msg, recvmm?sg handling (hard to do without deadlocking at the start)
 - Landlock support to restrict fstrace itself
