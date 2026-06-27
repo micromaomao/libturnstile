@@ -857,6 +857,12 @@ fn tracing_thread(context: &'static Context) {
 									break;
 								}
 							};
+							if !abspath.as_bytes().starts_with(b"/") {
+								check_req_valid!();
+								// might be sockets etc
+								debug!("{} resolved to non-absolute path {:?}", rwxp, abspath);
+								break;
+							}
 							if abspath.as_bytes() == b"/" {
 								debug!("skipping /");
 								continue;
