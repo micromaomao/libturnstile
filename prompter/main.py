@@ -367,23 +367,21 @@ class TreeWidget(QtWidgets.QWidget):
                 node.row_widgets = [label]
                 continue
 
-            # Redirect button: always present (so the column never reflows)
-            # but only shows its icon while the row is hovered.
-            btn = QtWidgets.QToolButton()
-            btn.setAutoRaise(True)
-            btn.setIconSize(self._icon_size)
-            btn.setToolTip("Redirect this path to another host location")
-            btn.clicked.connect(
+            # Redirect and block buttons are always present to prevent
+            # reflow, but the icon is hidden unless hovered or, in the
+            # case of the block button, pressed.
+            redirect_btn = QtWidgets.QToolButton()
+            redirect_btn.setAutoRaise(True)
+            redirect_btn.setIconSize(self._icon_size)
+            redirect_btn.setToolTip("Redirect this path to another host location")
+            redirect_btn.clicked.connect(
                 lambda _checked, n=node: self._on_redirect_clicked(n)
             )
-            node.redirect_btn = btn
+            node.redirect_btn = redirect_btn
 
-            # Block toggle: a push-down button that marks this path (and
-            # everything under it) as ignored.
             block_btn = QtWidgets.QToolButton()
             block_btn.setAutoRaise(True)
             block_btn.setCheckable(True)
-            block_btn.setIcon(self._block_icon)
             block_btn.setIconSize(self._icon_size)
             block_btn.setEnabled(self.allow_block)
             block_btn.setToolTip(
@@ -399,7 +397,7 @@ class TreeWidget(QtWidgets.QWidget):
             name_layout.setContentsMargins(0, 0, 0, 0)
             name_layout.setSpacing(6)
             name_layout.addWidget(label)
-            name_layout.addWidget(btn)
+            name_layout.addWidget(redirect_btn)
             name_layout.addWidget(block_btn)
             name_layout.addStretch(1)
             grid.addWidget(name_box, row, 0)
@@ -413,7 +411,7 @@ class TreeWidget(QtWidgets.QWidget):
 
             # Track hover over every interactive widget in the row so the
             # redirect / block buttons reveal themselves.
-            for w in (name_box, label, btn, block_btn, node.cb_r, node.cb_w, node.cb_x):
+            for w in (name_box, label, redirect_btn, block_btn, node.cb_r, node.cb_w, node.cb_x):
                 self._node_of_widget[w] = node
                 w.installEventFilter(self)
 
@@ -516,23 +514,33 @@ class TreeWidget(QtWidgets.QWidget):
         super().leaveEvent(event)
 
     def _set_hovered(self, node):
-        """Reveal the redirect button on ``node``'s row, hide it elsewhere."""
+        """Show the redirect and block buttons on ``node``'s row.
+
+        Both are hidden on every other row, except that a checked
+        (pressed) block button stays visible on its own row.
+        """
         # When the whole tree is disabled (the request isn't being
-        # granted), don't reveal any redirect button.
+        # granted), don't reveal buttons on any row.
         if not self.isEnabled():
             node = None
         if node is self._hovered:
             return
-        if self._hovered is not None and self._hovered.redirect_btn is not None:
-            self._hovered.redirect_btn.setIcon(QtGui.QIcon())
+        previous = self._hovered
         self._hovered = node
-        if node is not None and node.redirect_btn is not None:
+        if previous is not None:
+            self._update_redirect_button(previous)
+            self._update_block_button(previous)
+        if node is not None:
             self._update_redirect_button(node)
+            self._update_block_button(node)
 
     def _update_redirect_button(self, node):
-        """Set the redirect button's icon and tooltip for its current state."""
+        """Set the redirect button's icon/tooltip; hide it when not hovered."""
         btn = node.redirect_btn
         if btn is None:
+            return
+        if self._hovered is not node:
+            btn.setIcon(QtGui.QIcon())
             return
         if node.redirect is not None:
             btn.setIcon(self._clear_icon)
@@ -540,6 +548,16 @@ class TreeWidget(QtWidgets.QWidget):
         else:
             btn.setIcon(self._arrow_icon)
             btn.setToolTip("Redirect this path to another host location")
+
+    def _update_block_button(self, node):
+        """Show the block icon while the row is hovered or the block is set."""
+        btn = node.block_btn
+        if btn is None:
+            return
+        if node.block or self._hovered is node:
+            btn.setIcon(self._block_icon)
+        else:
+            btn.setIcon(QtGui.QIcon())
 
     def _on_redirect_clicked(self, node):
         if node.redirect is not None:
@@ -584,8 +602,8 @@ class TreeWidget(QtWidgets.QWidget):
         node.redirect = path
         node.own_r = node.own_w = node.own_x = True
         self._update_row_label(node)
-        if node.redirect_btn is not None:
-            self._update_redirect_button(node)
+        self._update_redirect_button(node)
+        self._update_block_button(node)
         self.refresh()
         self._update_visibility()
 
@@ -596,8 +614,8 @@ class TreeWidget(QtWidgets.QWidget):
             node.own_r, node.own_w, node.own_x = node.saved_own
             node.saved_own = None
         self._update_row_label(node)
-        if node.redirect_btn is not None:
-            self._update_redirect_button(node)
+        self._update_redirect_button(node)
+        self._update_block_button(node)
         self.refresh()
         self._update_visibility()
 
@@ -628,8 +646,8 @@ class TreeWidget(QtWidgets.QWidget):
                 node.own_r, node.own_w, node.own_x = node.saved_own
                 node.saved_own = None
             self._update_row_label(node)
-            if node.redirect_btn is not None:
-                self._update_redirect_button(node)
+            self._update_redirect_button(node)
+        self._update_block_button(node)
         self.refresh()
         self._update_visibility()
         self.blocks_changed.emit(self.has_blocks())
