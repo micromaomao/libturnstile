@@ -1,6 +1,11 @@
 rules:
+  $PWD: rwx
   /usr: rx
+  /etc: rx
   /bin: rx
   /lib: rx
   /lib64: rx
+  /dev/null: rw
+  /dev/zero: rw
+  /dev/urandom: rw
   /proc: rx
