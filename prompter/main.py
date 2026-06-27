@@ -26,6 +26,7 @@ config path) and ``reload_config`` is set instead of emitting
 
 import json
 import os
+import signal
 import sys
 import tempfile
 
@@ -773,6 +774,9 @@ class PrompterDialog(QtWidgets.QDialog):
         pid = request.get("request_pid", "?")
         cmd = " ".join(request.get("sandbox_cmd", [])) or "(unknown)"
 
+        # pidfd of the requesting process, used by the SIGINT button.
+        self.request_pidfd = request.get("pidfd")
+
         self.setWindowTitle("Turnstile-sandbox access request")
         # Mark the window as a dialog so tiling window managers (i3, sway,
         # ...) float it instead of tiling/maximizing it.
@@ -831,6 +835,20 @@ class PrompterDialog(QtWidgets.QDialog):
         cont.setDefault(True)
         cont.clicked.connect(self._on_continue)
         buttons.addWidget(cancel)
+        # Only offer SIGINT when we have a usable pidfd.  Signalling by pid
+        # would be racy: seccomp-unotify lets the target continue (and
+        # possibly exit, with the pid reused) if it is interrupted, so a
+        # pid could end up naming an unrelated process.
+        if self.request_pidfd is not None and hasattr(signal, "pidfd_send_signal"):
+            sigint = QtWidgets.QPushButton(
+                style.standardIcon(QtWidgets.QStyle.SP_DialogCancelButton),
+                "Cancel and SIGINT %s" % comm,
+            )
+            sigint.setToolTip(
+                "Deny this request and send SIGINT to the requesting process"
+            )
+            sigint.clicked.connect(self._on_cancel_sigint)
+            buttons.addWidget(sigint)
         buttons.addStretch(1)
         buttons.addWidget(cont)
         layout.addLayout(buttons)
@@ -931,6 +949,24 @@ class PrompterDialog(QtWidgets.QDialog):
         return super().eventFilter(obj, event)
 
     def _on_cancel(self):
+        self.response = deny_response()
+        self.reject()
+
+    def _send_sigint(self):
+        """Send SIGINT to the requesting process via its pidfd.
+
+        Using the pidfd is race-free: it refers to the specific task, so
+        the signal fails (rather than hitting a pid-reused process) if the
+        target has already exited.  The button is only shown when a usable
+        pidfd is available.
+        """
+        try:
+            signal.pidfd_send_signal(int(self.request_pidfd), signal.SIGINT)
+        except OSError:
+            pass
+
+    def _on_cancel_sigint(self):
+        self._send_sigint()
         self.response = deny_response()
         self.reject()
 
