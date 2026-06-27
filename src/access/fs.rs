@@ -21,7 +21,7 @@ use crate::{AccessRequestError, syscalls::RequestContext};
 
 use smallvec::{SmallVec, smallvec};
 
-use log::{debug, error};
+use log::{debug, error, warn};
 
 /// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
 /// refers to a path in the traced process's filesystem namespace.
@@ -472,7 +472,7 @@ impl FsTarget {
 				);
 				attempts += 1;
 				if attempts >= 2 {
-					error!(
+					warn!(
 						"open_target_dfd_in_root: errored on last attempt to open {:?}: {}",
 						dfd_path, e
 					);

@@ -1288,6 +1288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// previously hard-coded default initial mount list.
 	load_config_into_sandbox(context)?;
 
+	// TODO: also load config into this
 	context.path_res_sandbox.update_mounts_from_list([(
 		OsStr::new("/"),
 		ManagedMountPoint {
