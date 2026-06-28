@@ -129,6 +129,76 @@ def escape_config_path(path):
     return path.replace("$", "$$")
 
 
+def _is_descendant(child, parent):
+    """True if sandbox path ``child`` is strictly under directory ``parent``."""
+    if child == parent:
+        return False
+    return child.startswith(parent.rstrip("/") + "/")
+
+
+def _union_perms(*perms):
+    """Union of permission strings, returned in canonical ``rwx`` order."""
+    chars = set().union(*(set(p) for p in perms))
+    return "".join(c for c in "rwx" if c in chars)
+
+
+def _nearest_ancestor_perms(rules, child_key):
+    """Permissions of the most-specific plain-string ancestor rule, or None.
+
+    Only plain permission strings count as grants here; rules with a
+    custom ``target`` or ``ignore`` are governed by different semantics and
+    are ignored when deciding redundancy.
+    """
+    best = None
+    best_len = -1
+    for key, value in rules.items():
+        if (
+            isinstance(value, str)
+            and _is_descendant(child_key, key)
+            and len(key) > best_len
+        ):
+            best_len = len(key)
+            best = value
+    return best
+
+
+def reconcile_descendants(rules, parents):
+    """Merge widened parent grants down onto more-specific descendant rules.
+
+    turnstile-sandbox resolves access using the single most-specific
+    matching rule, so a more-specific child that grants *less* than a
+    freshly-widened parent silently becomes a deny rule.  For every
+    ``parent`` key just granted ``perms``, lift each plain-string
+    descendant rule to at least the parent's access, then drop any
+    descendant that is now fully covered by its nearest ancestor grant.
+
+    Rules with a custom ``target`` or ``ignore`` are left untouched.
+    """
+    for parent_key, parent_perms in parents.items():
+        for child_key in list(rules):
+            if not _is_descendant(child_key, parent_key):
+                continue
+            value = rules[child_key]
+            if not isinstance(value, str):
+                continue
+            rules[child_key] = _union_perms(value, parent_perms)
+
+    for parent_key in parents:
+        # Shallowest first so removing a redundant rule never hides a
+        # deeper one's nearest ancestor.
+        children = sorted(
+            (k for k in rules if _is_descendant(k, parent_key)),
+            key=lambda k: k.count("/"),
+        )
+        for child_key in children:
+            value = rules.get(child_key)
+            if not isinstance(value, str):
+                continue
+            nearest = _nearest_ancestor_perms(rules, child_key)
+            if nearest is not None and set(value) == set(nearest):
+                del rules[child_key]
+
+
 def persist_to_config(config_path, mounts, ignores=()):
     """Write ``mounts`` and ``ignores`` into the YAML config.
 
@@ -150,6 +220,8 @@ def persist_to_config(config_path, mounts, ignores=()):
         rules = {}
         cfg["rules"] = rules
 
+    granted_parents = {}
+
     for mount in mounts:
         sandbox_path = mount["mount_point"]
         host_path = mount["host_path"]
@@ -157,11 +229,16 @@ def persist_to_config(config_path, mounts, ignores=()):
         key = escape_config_path(sandbox_path)
         if host_path == sandbox_path:
             rules[key] = perms
+            granted_parents[key] = perms
         else:
             rules[key] = {
                 "target": escape_config_path(host_path),
                 "permissions": perms,
             }
+
+    # A widened parent grant must propagate down so existing more-specific
+    # child rules do not become accidental deny rules (see issue #26).
+    reconcile_descendants(rules, granted_parents)
 
     for path in ignores:
         key = escape_config_path(path)
