@@ -53,8 +53,8 @@ use crate::{
 		AccessRequest, Operation,
 		fs::{
 			ChmodOperation, ChownOperation, FallocateOperation, ForeignFd, FsOperation, FsTarget,
-			InodeId, OriginalHandle, RemoveXattrOperation, SetXattrOperation, TruncateOperation,
-			UtimensOperation,
+			InodeId, LinkOperation, OriginalHandle, RemoveXattrOperation, RenameOperation,
+			SetXattrOperation, TruncateOperation, UtimensOperation,
 		},
 	},
 	syscalls::fs as syscalls_fs,
@@ -491,6 +491,23 @@ impl ManagedBindMountSandbox {
 			return self.handle_modifying_f_ops(fsop, target, ctx);
 		}
 
+		// unlink / rmdir / rename / link blocked by an "ephemeral"
+		// mountpoint (e.g. a leftover `chdir` cwd mount) - one that the
+		// policy never asked for - fail natively with EBUSY (the path is
+		// itself a mountpoint) or EXDEV (the operands straddle a mount
+		// boundary).  Force a reconcile first to drop any such mount that
+		// is no longer needed, so the kernel then sees a single
+		// filesystem and the operation can proceed.  This does not
+		// short-circuit: the `*at` dirfd upgrade below still applies.
+		match fsop {
+			FsOperation::FsUnlink(op) => self.reconcile_if_ephemeral_unlink(&op.target),
+			FsOperation::FsRename(RenameOperation { from, to, .. })
+			| FsOperation::FsLink(LinkOperation { from, to, .. }) => {
+				self.reconcile_if_ephemeral_cross_mount(from, to)
+			}
+			_ => {}
+		}
+
 		// *at with one or more dirfd: upgrade the fds if they are shadowed.
 		let fd_indices = syscalls_fs::dfd_arg_indices(syscall);
 		if !fd_indices.is_empty() {
@@ -802,6 +819,87 @@ impl ManagedBindMountSandbox {
 			}
 		}
 		ctx.send_continue()
+	}
+
+	/// `unlink` / `rmdir` (`unlinkat`) of a directory or file that is
+	/// itself an *ephemeral* live mountpoint (one with no explicit policy
+	/// entry, e.g. a leftover `chdir` cwd mount) fails natively with
+	/// EBUSY.  Force a reconcile against the policy so that mount - if no
+	/// longer needed - is dropped, after which the kernel sees a plain
+	/// directory / file and can remove it.  Best-effort: failures are
+	/// logged, never surfaced to the app (the unlink simply continues
+	/// natively and may still fail with EBUSY).
+	fn reconcile_if_ephemeral_unlink(&self, target: &FsTarget) {
+		let abspath = match target.realpath() {
+			Ok(p) => p,
+			Err(e) => {
+				warn_unless_benign!(
+					&e,
+					"unlink: cannot resolve abspath for {}: {} - not reconciling",
+					target,
+					e
+				);
+				return;
+			}
+		};
+		if self.is_ephemeral_mountpoint(&abspath) {
+			debug!(
+				"unlink target {:?} is an ephemeral mountpoint - forcing reconcile",
+				abspath
+			);
+			self.force_reconcile_for("unlink", &abspath);
+		}
+	}
+
+	/// `rename` / `link` (`renameat` / `linkat`) whose two operands sit
+	/// under *different* live mounts but the *same* policy entry are
+	/// straddling an ephemeral mount boundary and would fail natively
+	/// with EXDEV.  Force a reconcile so the ephemeral mount(s) causing
+	/// the split are dropped (when no longer needed), after which both
+	/// operands resolve onto a single filesystem.  Best-effort.
+	fn reconcile_if_ephemeral_cross_mount(&self, from: &FsTarget, to: &FsTarget) {
+		let from_path = match from.realpath() {
+			Ok(p) => p,
+			Err(e) => {
+				warn_unless_benign!(
+					&e,
+					"rename/link: cannot resolve abspath for source {}: {} - not reconciling",
+					from,
+					e
+				);
+				return;
+			}
+		};
+		let to_path = match to.realpath() {
+			Ok(p) => p,
+			Err(e) => {
+				warn_unless_benign!(
+					&e,
+					"rename/link: cannot resolve abspath for destination {}: {} - not reconciling",
+					to,
+					e
+				);
+				return;
+			}
+		};
+		if self.straddles_ephemeral_mount_boundary(&from_path, &to_path) {
+			debug!(
+				"rename/link operands {:?} and {:?} straddle an ephemeral mount boundary - forcing reconcile",
+				from_path, to_path
+			);
+			self.force_reconcile_for("rename/link", &from_path);
+		}
+	}
+
+	/// Force a reconcile and log any per-path errors it surfaced, tagging
+	/// the log with the `op` and `path` that prompted it.
+	fn force_reconcile_for(&self, op: &str, path: &OsStr) {
+		for (p, e) in self.force_reconcile() {
+			warn!(
+				"{}: reconcile for ephemeral mountpoint {:?} failed on {:?}: {}",
+				op, path, p, e
+			);
+		}
 	}
 
 	/// For an *at request with a proper dfd, we have a chance to inspect

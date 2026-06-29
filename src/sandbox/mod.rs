@@ -2414,6 +2414,55 @@ impl ManagedBindMountSandbox {
 		)
 	}
 
+	/// Force a reconcile against the *current* policy without changing
+	/// it.  Because transient mounts (notably `chdir` cwd mounts) are
+	/// never part of the policy, a reconcile drops any of them that are
+	/// no longer needed - i.e. an "ephemeral" mountpoint with no live cwd
+	/// holder.  This lets an `unlink` / `rmdir` / `rename` / `link` that
+	/// is blocked by such a mountpoint (EBUSY / EXDEV) proceed once the
+	/// mount is gone.
+	///
+	/// Best-effort: per-path errors are logged by `reconcile` and
+	/// returned.
+	pub(crate) fn force_reconcile(&self) -> Vec<(OsString, BindMountSandboxError)> {
+		let (policy, mut pt, mut mt) = self.lock_trees();
+		self.reconcile(&mut pt, &mut mt, &policy, None)
+	}
+
+	/// Whether the exact `sandbox_path` is a live mountpoint that is not
+	/// backed by an explicit policy entry (mount or placeholder) at the
+	/// same path - i.e. an *ephemeral* mount (such as a `chdir` cwd
+	/// mount) that a [`force_reconcile`](Self::force_reconcile) could
+	/// drop.  Used to decide whether `unlink` / `rmdir` on `sandbox_path`
+	/// should first force a reconcile so it isn't blocked by EBUSY.
+	pub(crate) fn is_ephemeral_mountpoint(&self, sandbox_path: &OsStr) -> bool {
+		let (policy, _pt, mt) = self.lock_trees();
+		mt.get(sandbox_path).is_some() && policy.get(sandbox_path).is_none()
+	}
+
+	/// Whether `from` and `to` are covered by *different* mounts in the
+	/// live mount tree, but by the *same* covering entry in the policy -
+	/// i.e. an ephemeral mount (such as a `chdir` cwd mount) makes them
+	/// straddle a mount boundary that a
+	/// [`force_reconcile`](Self::force_reconcile) would remove.  Used to
+	/// decide whether a `rename` / `link` whose operands would otherwise
+	/// fail with EXDEV should first force a reconcile.
+	pub(crate) fn straddles_ephemeral_mount_boundary(&self, from: &OsStr, to: &OsStr) -> bool {
+		let (policy, _pt, mt) = self.lock_trees();
+		let cur_from = mt.find(from, |_, _| true).map(|(p, _)| p);
+		let cur_to = mt.find(to, |_, _| true).map(|(p, _)| p);
+		if cur_from == cur_to {
+			// Already on the same live mount: nothing for a reconcile to
+			// fix (or both uncovered).
+			return false;
+		}
+		let pol_from = policy.find(from, |_, _| true).map(|(p, _)| p);
+		let pol_to = policy.find(to, |_, _| true).map(|(p, _)| p);
+		// The split is caused purely by ephemeral mounts iff the policy
+		// puts both operands under the same covering entry.
+		pol_from == pol_to
+	}
+
 	fn lock_trees(
 		&self,
 	) -> (
