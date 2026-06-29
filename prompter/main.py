@@ -142,16 +142,10 @@ def _union_perms(*perms):
     return "".join(c for c in "rwx" if c in chars)
 
 
-def _grant_perms(value):
-    """The plain-grant permission string of a rule, or ``None``.
-
-    A plain grant is either a permission string or a mapping carrying
-    ``permissions`` without a custom ``target`` or ``ignore`` (both of
-    which have distinct semantics and are never merged or pruned).
-    """
+def _rule_perms_no_redirect(value):
     if isinstance(value, str):
         return value
-    if isinstance(value, dict) and "target" not in value and "ignore" not in value:
+    if isinstance(value, dict) and "target" not in value:
         perms = value.get("permissions")
         if isinstance(perms, str):
             return perms
@@ -177,7 +171,7 @@ def _nearest_ancestor_perms(rules, child_key):
     best = None
     best_len = -1
     for key, value in rules.items():
-        perms = _grant_perms(value)
+        perms = _rule_perms_no_redirect(value)
         if perms is not None and _is_descendant(child_key, key) and len(key) > best_len:
             best_len = len(key)
             best = perms
@@ -195,12 +189,14 @@ def reconcile_descendants(rules, parents):
     descendant that is now fully covered by its nearest ancestor grant.
 
     Rules with a custom ``target`` or ``ignore`` are left untouched.
+    Rules not parented by any of the keys in ``parents`` are also left
+    untouched.
     """
     for parent_key, parent_perms in parents.items():
         for child_key in list(rules):
             if not _is_descendant(child_key, parent_key):
                 continue
-            perms = _grant_perms(rules[child_key])
+            perms = _rule_perms_no_redirect(rules[child_key])
             if perms is None:
                 continue
             _set_grant_perms(rules, child_key, _union_perms(perms, parent_perms))
@@ -208,14 +204,12 @@ def reconcile_descendants(rules, parents):
     # Remove useless rules: a descendant whose access now equals its
     # nearest ancestor grant is fully covered and can be dropped.
     for parent_key in parents:
-        # Shallowest first so removing a redundant rule never hides a
-        # deeper one's nearest ancestor.
         children = sorted(
             (k for k in rules if _is_descendant(k, parent_key)),
             key=lambda k: k.count("/"),
         )
         for child_key in children:
-            perms = _grant_perms(rules.get(child_key))
+            perms = _rule_perms_no_redirect(rules.get(child_key))
             if perms is None:
                 continue
             nearest = _nearest_ancestor_perms(rules, child_key)
