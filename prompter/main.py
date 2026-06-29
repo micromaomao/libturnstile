@@ -142,23 +142,45 @@ def _union_perms(*perms):
     return "".join(c for c in "rwx" if c in chars)
 
 
-def _nearest_ancestor_perms(rules, child_key):
-    """Permissions of the most-specific plain-string ancestor rule, or None.
+def _grant_perms(value):
+    """The plain-grant permission string of a rule, or ``None``.
 
-    Only plain permission strings count as grants here; rules with a
-    custom ``target`` or ``ignore`` are governed by different semantics and
-    are ignored when deciding redundancy.
+    A plain grant is either a permission string or a mapping carrying
+    ``permissions`` without a custom ``target`` or ``ignore`` (both of
+    which have distinct semantics and are never merged or pruned).
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and "target" not in value and "ignore" not in value:
+        perms = value.get("permissions")
+        if isinstance(perms, str):
+            return perms
+    return None
+
+
+def _set_grant_perms(rules, key, perms):
+    """Update the permission string of a plain-grant rule in place."""
+    value = rules[key]
+    if isinstance(value, dict):
+        value["permissions"] = perms
+    else:
+        rules[key] = perms
+
+
+def _nearest_ancestor_perms(rules, child_key):
+    """Permissions of the most-specific plain-grant ancestor rule, or None.
+
+    Only plain grants count here; rules with a custom ``target`` or
+    ``ignore`` are governed by different semantics and are ignored when
+    deciding redundancy.
     """
     best = None
     best_len = -1
     for key, value in rules.items():
-        if (
-            isinstance(value, str)
-            and _is_descendant(child_key, key)
-            and len(key) > best_len
-        ):
+        perms = _grant_perms(value)
+        if perms is not None and _is_descendant(child_key, key) and len(key) > best_len:
             best_len = len(key)
-            best = value
+            best = perms
     return best
 
 
@@ -168,7 +190,7 @@ def reconcile_descendants(rules, parents):
     turnstile-sandbox resolves access using the single most-specific
     matching rule, so a more-specific child that grants *less* than a
     freshly-widened parent silently becomes a deny rule.  For every
-    ``parent`` key just granted ``perms``, lift each plain-string
+    ``parent`` key just granted ``perms``, lift each plain-grant
     descendant rule to at least the parent's access, then drop any
     descendant that is now fully covered by its nearest ancestor grant.
 
@@ -178,11 +200,13 @@ def reconcile_descendants(rules, parents):
         for child_key in list(rules):
             if not _is_descendant(child_key, parent_key):
                 continue
-            value = rules[child_key]
-            if not isinstance(value, str):
+            perms = _grant_perms(rules[child_key])
+            if perms is None:
                 continue
-            rules[child_key] = _union_perms(value, parent_perms)
+            _set_grant_perms(rules, child_key, _union_perms(perms, parent_perms))
 
+    # Remove useless rules: a descendant whose access now equals its
+    # nearest ancestor grant is fully covered and can be dropped.
     for parent_key in parents:
         # Shallowest first so removing a redundant rule never hides a
         # deeper one's nearest ancestor.
@@ -191,11 +215,11 @@ def reconcile_descendants(rules, parents):
             key=lambda k: k.count("/"),
         )
         for child_key in children:
-            value = rules.get(child_key)
-            if not isinstance(value, str):
+            perms = _grant_perms(rules.get(child_key))
+            if perms is None:
                 continue
             nearest = _nearest_ancestor_perms(rules, child_key)
-            if nearest is not None and set(value) == set(nearest):
+            if nearest is not None and set(perms) == set(nearest):
                 del rules[child_key]
 
 
