@@ -2137,6 +2137,164 @@ fn prune_useless_mounts(policy: &mut FsTree<ManagedTreeEntry>) {
 	}
 }
 
+/// Whether the exact `sandbox_path` is a live mountpoint (`mt`) that is
+/// not backed by an explicit policy entry (`policy`) at the same path -
+/// i.e. an *ephemeral* mount (such as a `chdir` cwd mount).  Pure helper
+/// behind [`ManagedBindMountSandbox::is_ephemeral_mountpoint`].
+fn is_ephemeral_mountpoint_in(
+	policy: &FsTree<ManagedTreeEntry>,
+	mt: &FsTree<MountInternal>,
+	sandbox_path: &OsStr,
+) -> bool {
+	mt.get(sandbox_path).is_some() && policy.get(sandbox_path).is_none()
+}
+
+/// Whether `from` and `to` are covered by *different* mounts in the live
+/// tree (`mt`) but by the *same* covering entry in the `policy` - i.e.
+/// an ephemeral mount makes them straddle a mount boundary.  Pure helper
+/// behind [`ManagedBindMountSandbox::straddles_ephemeral_mount_boundary`].
+fn straddles_ephemeral_mount_boundary_in(
+	policy: &FsTree<ManagedTreeEntry>,
+	mt: &FsTree<MountInternal>,
+	from: &OsStr,
+	to: &OsStr,
+) -> bool {
+	let cur_from = mt.find(from, |_, _| true).map(|(p, _)| p);
+	let cur_to = mt.find(to, |_, _| true).map(|(p, _)| p);
+	if cur_from == cur_to {
+		// Already on the same live mount (or both uncovered): nothing for
+		// a reconcile to fix.
+		return false;
+	}
+	let pol_from = policy.find(from, |_, _| true).map(|(p, _)| p);
+	let pol_to = policy.find(to, |_, _| true).map(|(p, _)| p);
+	// The split is caused purely by ephemeral mounts iff the policy puts
+	// both operands under the same covering entry.
+	pol_from == pol_to
+}
+
+#[cfg(test)]
+mod ephemeral_mountpoint_tests {
+	use super::*;
+
+	fn mount(host: &str) -> MountInternal {
+		MountInternal {
+			user: ManagedMountPoint {
+				host_path: CString::new(host).unwrap(),
+				attrs: MountAttributes::ro(),
+			},
+			mnt_id: 0,
+			cwd_of: Vec::new(),
+		}
+	}
+
+	fn placeholder() -> ManagedTreeEntry {
+		ManagedTreeEntry::Placeholder(placeholder_default_symlink(CString::new("/x").unwrap()))
+	}
+
+	fn bind(host: &str) -> ManagedTreeEntry {
+		ManagedTreeEntry::BindMount(ManagedMountPoint {
+			host_path: CString::new(host).unwrap(),
+			attrs: MountAttributes::ro(),
+		})
+	}
+
+	#[test]
+	fn ephemeral_mountpoint_detected_only_without_policy_entry() {
+		let mut mt = FsTree::new();
+		mt.insert(OsStr::new("/a"), mount("/host/a"));
+		mt.insert(OsStr::new("/b"), mount("/host/b"));
+
+		let mut policy = FsTree::new();
+		// /a is an explicit policy mount; /b is only a live (ephemeral) mount.
+		policy.insert(OsStr::new("/a"), bind("/host/a"));
+
+		assert!(
+			!is_ephemeral_mountpoint_in(&policy, &mt, OsStr::new("/a")),
+			"a path that is an explicit policy mount is not ephemeral"
+		);
+		assert!(
+			is_ephemeral_mountpoint_in(&policy, &mt, OsStr::new("/b")),
+			"a live mount with no policy entry is ephemeral"
+		);
+		assert!(
+			!is_ephemeral_mountpoint_in(&policy, &mt, OsStr::new("/c")),
+			"a path that is not a live mount is not ephemeral"
+		);
+	}
+
+	#[test]
+	fn explicit_placeholder_entry_blocks_ephemeral_classification() {
+		let mut mt = FsTree::new();
+		mt.insert(OsStr::new("/p"), mount("/host/p"));
+		let mut policy = FsTree::new();
+		// An explicit placeholder (not a mount) still counts as a policy
+		// entry, so the path is not considered ephemeral.
+		policy.insert(OsStr::new("/p"), placeholder());
+		assert!(!is_ephemeral_mountpoint_in(&policy, &mt, OsStr::new("/p")));
+	}
+
+	#[test]
+	fn cross_boundary_detected_when_split_is_only_ephemeral() {
+		// Live tree: an ephemeral mount at /dir/sub splits /dir/sub/x from
+		// /dir/y.  Policy has only a single mount at /dir covering both.
+		let mut mt = FsTree::new();
+		mt.insert(OsStr::new("/dir"), mount("/host/dir"));
+		mt.insert(OsStr::new("/dir/sub"), mount("/host/dir/sub"));
+		let mut policy = FsTree::new();
+		policy.insert(OsStr::new("/dir"), bind("/host/dir"));
+
+		assert!(
+			straddles_ephemeral_mount_boundary_in(
+				&policy,
+				&mt,
+				OsStr::new("/dir/sub/x"),
+				OsStr::new("/dir/y"),
+			),
+			"operands under different live mounts but the same policy mount straddle an ephemeral boundary"
+		);
+	}
+
+	#[test]
+	fn no_cross_boundary_when_same_live_mount() {
+		let mut mt = FsTree::new();
+		mt.insert(OsStr::new("/dir"), mount("/host/dir"));
+		let policy = FsTree::<ManagedTreeEntry>::new();
+		assert!(
+			!straddles_ephemeral_mount_boundary_in(
+				&policy,
+				&mt,
+				OsStr::new("/dir/x"),
+				OsStr::new("/dir/y"),
+			),
+			"operands already under the same live mount do not straddle a boundary"
+		);
+	}
+
+	#[test]
+	fn no_cross_boundary_when_policy_also_splits() {
+		// Both the live tree and the policy split the operands across two
+		// mounts: the split is not caused by an ephemeral mount, so a
+		// reconcile would not help.
+		let mut mt = FsTree::new();
+		mt.insert(OsStr::new("/dir"), mount("/host/dir"));
+		mt.insert(OsStr::new("/dir/sub"), mount("/host/other"));
+		let mut policy = FsTree::new();
+		policy.insert(OsStr::new("/dir"), bind("/host/dir"));
+		policy.insert(OsStr::new("/dir/sub"), bind("/host/other"));
+
+		assert!(
+			!straddles_ephemeral_mount_boundary_in(
+				&policy,
+				&mt,
+				OsStr::new("/dir/sub/x"),
+				OsStr::new("/dir/y"),
+			),
+			"a split that also exists in the policy is not an ephemeral boundary"
+		);
+	}
+}
+
 fn placeholder_default_symlink(target: CString) -> ManagedPlaceholder {
 	ManagedPlaceholder::Symlink(PlaceholderSymlinkData {
 		common: CommonPlaceholderData {
@@ -2437,7 +2595,7 @@ impl ManagedBindMountSandbox {
 	/// should first force a reconcile so it isn't blocked by EBUSY.
 	pub(crate) fn is_ephemeral_mountpoint(&self, sandbox_path: &OsStr) -> bool {
 		let (policy, _pt, mt) = self.lock_trees();
-		mt.get(sandbox_path).is_some() && policy.get(sandbox_path).is_none()
+		is_ephemeral_mountpoint_in(&policy, &mt, sandbox_path)
 	}
 
 	/// Whether `from` and `to` are covered by *different* mounts in the
@@ -2449,18 +2607,7 @@ impl ManagedBindMountSandbox {
 	/// fail with EXDEV should first force a reconcile.
 	pub(crate) fn straddles_ephemeral_mount_boundary(&self, from: &OsStr, to: &OsStr) -> bool {
 		let (policy, _pt, mt) = self.lock_trees();
-		let cur_from = mt.find(from, |_, _| true).map(|(p, _)| p);
-		let cur_to = mt.find(to, |_, _| true).map(|(p, _)| p);
-		if cur_from == cur_to {
-			// Already on the same live mount: nothing for a reconcile to
-			// fix (or both uncovered).
-			return false;
-		}
-		let pol_from = policy.find(from, |_, _| true).map(|(p, _)| p);
-		let pol_to = policy.find(to, |_, _| true).map(|(p, _)| p);
-		// The split is caused purely by ephemeral mounts iff the policy
-		// puts both operands under the same covering entry.
-		pol_from == pol_to
+		straddles_ephemeral_mount_boundary_in(&policy, &mt, from, to)
 	}
 
 	fn lock_trees(
