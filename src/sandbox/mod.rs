@@ -1044,7 +1044,7 @@ impl BindMountSandbox {
 
 	/// Open the absolute `path` inside m1, resolving through the
 	/// sandbox's mount layout.
-	pub fn open_in_m1(
+	pub(self) fn open_in_m1(
 		&self,
 		path: &CStr,
 		openhow: &libc::open_how,
@@ -1076,7 +1076,8 @@ impl BindMountSandbox {
 	/// raw bytes.  A short-lived helper forks, `setns`es into m1, reads
 	/// its own mountinfo (now m1's view) and streams it back.  Used by the
 	/// integration tests to introspect the live mount layout.
-	pub fn read_m1_mountinfo(&self) -> Result<Vec<u8>, BindMountSandboxError> {
+	#[cfg(test)]
+	pub(self) fn read_m1_mountinfo(&self) -> Result<Vec<u8>, BindMountSandboxError> {
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, false, true, false) };
 		unsafe {
 			thread::scope(|s| {
@@ -1212,7 +1213,7 @@ impl BindMountSandbox {
 	/// parent's descendants) out of the way during reconcile so a
 	/// non-`MNT_DETACH` umount of its old location can proceed.  The
 	/// `name` must be a single path component (no slashes).
-	pub fn park_to_scratch(
+	pub(self) fn park_to_scratch(
 		&self,
 		ns_path: &CStr,
 		name: &CStr,
@@ -1272,7 +1273,7 @@ impl BindMountSandbox {
 	/// `dest` (an absolute m1 path whose mountpoint dentry must exist),
 	/// then remove the now-empty `scratch/<name>` directory.  The inverse
 	/// of [`Self::park_to_scratch`].
-	pub fn restore_from_scratch(
+	pub(self) fn restore_from_scratch(
 		&self,
 		name: &CStr,
 		dest: &CStr,
