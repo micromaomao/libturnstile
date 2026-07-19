@@ -33,16 +33,13 @@ use crate::utils::{
 /// builds.
 const ENABLE_LOG_IN_FORK: bool = cfg!(debug_assertions);
 
-/// Generate a process-unique scratch directory name for parking a mount
-/// into the hidden scratch tmpfs (see [`BindMountSandbox::park_to_scratch`]).
-/// The name need only be unique among concurrently-parked mounts within
-/// this process; a monotonic counter combined with the pid suffices.
+/// Generate a unique scratch directory name for parking a mount into the
+/// hidden scratch tmpfs (see [`BindMountSandbox::park_to_scratch`]).
 fn next_scratch_name() -> CString {
 	use std::sync::atomic::{AtomicU64, Ordering};
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-	let pid = unsafe { libc::getpid() };
-	CString::new(format!("park-{pid}-{n}")).expect("no NUL in generated name")
+	CString::new(format!("scratch-{n}")).expect("no NUL in generated name")
 }
 
 /// Call umount("/proc/self/fd/<fd>", MNT_DETACH) in a async-signal-safe
