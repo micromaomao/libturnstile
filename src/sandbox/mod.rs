@@ -184,15 +184,15 @@ pub struct BindMountSandbox {
 	/// A fd to the placeholder tmpfs opened inside m0 (the outer mount
 	/// namespace).
 	root_tmpfs: MountObj,
-	/// O_PATH fd to the actual, outside-sandbox "/" opened inside m0.  Used as
-	/// the dirfd when resolving caller-provided host paths so that the
-	/// resulting fd is associated with m0's mount namespace and is therefore
+	/// O_PATH fd to the host "/" opened inside m0.  Used as the dirfd
+	/// when resolving caller-provided host paths so that the resulting fd
+	/// is associated with m0's mount namespace and is therefore
 	/// acceptable to `open_tree()` once the helper process enters m0.
 	host_root_fd: ForeignFd,
 	/// O_PATH fd to the scratch tmpfs root inside m1.  The scratch is a
 	/// separate tmpfs (distinct from `root_tmpfs`) that is first mounted
-	/// into m1, and then by mounting root_tmpfs on top, it eventually is
-	/// shadowed, so the sandboxed app never sees it.  It is used by
+	/// into m1, and then shadowed by mounting root_tmpfs on top, so the
+	/// sandboxed app never sees it.  It is used by
 	/// [`Self::park_to_scratch`] to temporarily park a mount, in order to
 	/// unmount a parent, before moving it back.
 	m1_scratch_fd: ForeignFd,
@@ -910,14 +910,9 @@ impl BindMountSandbox {
 	/// The path must have been previously bind-mounted with
 	/// [`Self::mount_host_into_sandbox`].
 	///
-	/// When `forcibly` is false (the default for steady-state
-	/// reconcile), a plain `umount2` is used: it fails with `EBUSY` if
-	/// the app still holds the mount (an open fd or cwd), which the
-	/// caller uses as the source of truth for "still in use".  When
-	/// `forcibly` is true, `MNT_DETACH` is added so the unmount always
-	/// succeeds, detaching the subtree lazily (held references keep it
-	/// alive until they close).
-	pub fn unmount(&self, ns_path: &CStr, forcibly: bool) -> Result<(), BindMountSandboxError> {
+	/// If `mnt_detach` is true, umount is called with `MNT_DETACH`.  This
+	/// will break ".." on any existing handles to within the mount.
+	pub fn unmount(&self, ns_path: &CStr, mnt_detach: bool) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(ns_path)?;
 		if ns_path.to_bytes() == b"/" {
 			return Err(BindMountSandboxError::InvalidSandboxPath(
@@ -928,8 +923,8 @@ impl BindMountSandbox {
 		let (parent_path, leaf) = split_parent_leaf(ns_path);
 
 		debug!(
-			"Umounting {:?} from sandbox (forcibly = {})",
-			ns_path, forcibly
+			"Umounting {:?} from sandbox (mnt_detach = {})",
+			ns_path, mnt_detach
 		);
 
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
@@ -963,7 +958,7 @@ impl BindMountSandbox {
 					return perror!("fchdir");
 				}
 				let mut flags = libc::UMOUNT_NOFOLLOW;
-				if forcibly {
+				if mnt_detach {
 					flags |= libc::MNT_DETACH;
 				}
 				let res = libc::umount2(leaf.as_ptr(), flags);
@@ -1208,11 +1203,9 @@ impl BindMountSandbox {
 	}
 
 	/// Move the mount currently at `ns_path` into the hidden scratch
-	/// tmpfs at `scratch/<name>`, preserving its `struct mount` identity.
-	/// Used to temporarily "park" a child (or a soon-to-be-rebuilt
-	/// parent's descendants) out of the way during reconcile so a
-	/// non-`MNT_DETACH` umount of its old location can proceed.  The
-	/// `name` must be a single path component (no slashes).
+	/// tmpfs at `scratch/<name>`.  This is used to temporarily "park" a
+	/// child mount out of the way when we want to unmount the parent
+	/// while preserving the child.
 	pub(self) fn park_to_scratch(
 		&self,
 		ns_path: &CStr,
@@ -1477,11 +1470,11 @@ pub(crate) struct MountInternal {
 	/// Kernel `mnt_id` captured at creation via `statx(STATX_MNT_ID)`
 	/// from the m1 helper; 0 if the capture failed.
 	pub mnt_id: u64,
-	/// Threads (`/proc/<tid>` handles) whose cwd this mount was created
-	/// to back (via `chdir`/`fchdir`).  Empty for ordinary policy
-	/// mounts.  A `Removed` reconcile defers unmounting while any holder
-	/// is still alive and either mid-`chdir` or with its cwd still here,
-	/// so a still-pinned cwd is never yanked out from under the app.
+	/// For ephemeral mounts created on a chdir request, this tracks the
+	/// threads that resulted in the creation of this ephemeral mount.
+	/// This is used to prevent us from removing such an ephemeral mount
+	/// when the thread is still executing its `chdir`, which will result in its
+	/// cwd not actually being on an ephemeral mount.
 	pub cwd_of: Vec<Arc<ProcPidFd>>,
 }
 
