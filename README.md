@@ -166,3 +166,4 @@ Executed in    4.40 secs    fish           external
   are unnecessarily prevented by the existant of ephemeral or policy mounts
 - sendmm?msg, recvmm?sg handling (hard to do without deadlocking at the start)
 - Landlock support to restrict fstrace itself
+- Make the turnstile-sandbox binary actually secure against other vectors like signals, tty escapes, etc.
