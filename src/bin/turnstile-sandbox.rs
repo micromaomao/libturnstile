@@ -15,6 +15,7 @@ use std::{
 };
 
 use clap::Parser;
+use inotify::{EventMask, Inotify, WatchMask};
 use libturnstile::{
 	AccessRequestError, BindMountSandbox, BindMountSandboxError, CommonPlaceholderData,
 	ManagedBindMountSandbox, ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry,
@@ -46,8 +47,8 @@ struct Cli {
 	#[arg(long = "block-nested-userns")]
 	block_nested_userns: bool,
 
-	/// Configuration for this sandbox.  Changes to this file will be
-	/// live-reloaded. TODO implement live reload
+	/// Configuration for this sandbox. Changes to this file will be
+	/// live-reloaded.
 	#[arg(required = true)]
 	config: PathBuf,
 
@@ -121,6 +122,81 @@ fn random_sandbox_id() -> u64 {
 		panic!("getrandom failed: {}", io::Error::last_os_error());
 	}
 	u64::from_ne_bytes(buf)
+}
+
+struct ConfigWatcher {
+	inotify: Inotify,
+	file_name: OsString,
+}
+
+fn watch_config_file(path: &Path) -> io::Result<ConfigWatcher> {
+	let parent = path
+		.parent()
+		.filter(|parent| !parent.as_os_str().is_empty())
+		.unwrap_or_else(|| Path::new("."));
+	let file_name = path
+		.file_name()
+		.ok_or_else(|| io::Error::from_raw_os_error(libc::EISDIR))?
+		.to_owned();
+	let inotify = Inotify::init()?;
+	inotify
+		.watches()
+		.add(parent, WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO)?;
+	Ok(ConfigWatcher { inotify, file_name })
+}
+
+fn config_reload_thread(context: &'static Context, mut watcher: ConfigWatcher) {
+	let mut buf = [0u8; 4096];
+	while !context
+		.should_exit
+		.load(std::sync::atomic::Ordering::Relaxed)
+	{
+		let events = match watcher.inotify.read_events(&mut buf) {
+			Ok(events) => events,
+			Err(err) => {
+				match err.kind() {
+					io::ErrorKind::WouldBlock => sleep(Duration::from_millis(50)),
+					io::ErrorKind::Interrupted => continue,
+					_ => {
+						error!(
+							"error watching config file {:?}: {}",
+							context.config_path, err
+						);
+						break;
+					}
+				}
+				continue;
+			}
+		};
+		let mut should_reload = false;
+		for event in events {
+			if event
+				.mask
+				.intersects(EventMask::CLOSE_WRITE | EventMask::MOVED_TO)
+			{
+				let name = event.name.expect(
+					"CLOSE_WRITE and MOVED_TO are both only triggered for contents of the watched dir",
+				);
+				if name == &watcher.file_name {
+					should_reload = true;
+					break;
+				}
+			}
+			if event.mask.contains(EventMask::Q_OVERFLOW) {
+				should_reload = true;
+				break;
+			}
+		}
+		if should_reload {
+			info!("reloading config {:?} due to changes", context.config_path);
+			if let Err(e) = load_config_into_sandbox(context) {
+				error!(
+					"error reloading config from {:?}: {}",
+					context.config_path, e
+				);
+			}
+		}
+	}
 }
 
 /// Stat `host_path` (no symlink following) and build a ManagedPlaceholder
@@ -504,8 +580,9 @@ fn load_config_into_sandbox(context: &Context) -> Result<(), Box<dyn std::error:
 		};
 		entries.push((e.sandbox_path.as_os_str(), entry));
 	}
+	let mut ignore_paths_lock = context.ignore_paths.lock().unwrap();
 	context.sandbox.update_from_list(entries)?;
-	*context.ignore_paths.lock().unwrap() = ignore_paths;
+	*ignore_paths_lock = ignore_paths;
 	Ok(())
 }
 
@@ -1266,7 +1343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns)?;
 	let path_res_sandbox = ManagedBindMountSandbox::new(true)?;
 
-	let context = Box::leak(Box::new(Context {
+	let context: &'static Context = Box::leak(Box::new(Context {
 		sandbox,
 		path_res_sandbox,
 		tracer: TurnstileTracer::new(TracerOptions::default())?,
@@ -1284,9 +1361,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		sandbox_id: random_sandbox_id(),
 	}));
 
-	// Load mounts from the user-provided config file, replacing the
-	// previously hard-coded default initial mount list.
+	let config_watcher = watch_config_file(&context.config_path)?;
 	load_config_into_sandbox(context)?;
+	let config_reload_thread = thread::spawn(move || config_reload_thread(context, config_watcher));
 
 	// TODO: also load config into this
 	context.path_res_sandbox.update_mounts_from_list([(
@@ -1312,7 +1389,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				.map_err(|e| io::ErrorKind::Other.into())
 		});
 	}
-	let tracing_thread = thread::spawn(|| tracing_thread(context));
+	let tracing_thread = thread::spawn(move || tracing_thread(context));
 	let res = context.sandbox.run_command(&mut cmd);
 	context.tracer.close_child_sock();
 	let mut res = match res {
@@ -1323,6 +1400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				.should_exit
 				.store(true, std::sync::atomic::Ordering::Relaxed);
 			tracing_thread.join().unwrap();
+			config_reload_thread.join().unwrap();
 			std::process::exit(1);
 		}
 	};
@@ -1339,6 +1417,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.should_exit
 		.store(true, std::sync::atomic::Ordering::Relaxed);
 	tracing_thread.join().unwrap();
+	config_reload_thread.join().unwrap();
 	Ok(())
 }
 
