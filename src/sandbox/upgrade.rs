@@ -47,6 +47,7 @@ use log::{debug, error, warn};
 
 use crate::access::fs::OpenOperation;
 use crate::errors::BindMountSandboxError;
+use crate::fstree::FsTree;
 use crate::{
 	AccessRequestError, RequestContext,
 	access::{
@@ -59,6 +60,7 @@ use crate::{
 	},
 	syscalls::fs as syscalls_fs,
 };
+use crate::{ManagedTreeEntry, MountInternal};
 
 use super::{ManagedBindMountSandbox, ManagedMountPoint, MountAttributes, ProcPidFd};
 
@@ -489,19 +491,23 @@ impl ManagedBindMountSandbox {
 			return self.handle_modifying_f_ops(fsop, target, ctx);
 		}
 
-		// unlink / rmdir / rename / link blocked by an "ephemeral"
-		// mountpoint (e.g. a leftover `chdir` cwd mount) - one that the
-		// policy never asked for - fail natively with EBUSY (the path is
-		// itself a mountpoint) or EXDEV (the operands straddle a mount
-		// boundary).  Force a reconcile first to drop any such mount that
-		// is no longer needed, so the kernel then sees a single
-		// filesystem and the operation can proceed.  This does not
-		// short-circuit: the `*at` dirfd upgrade below still applies.
+		// Check for unlink / rmdir / rename / link that will fail with
+		// EBUSY or EXDEV only due to ephemeral mounts that are not
+		// otherwise present in the policy.  In such cases, we can force a
+		// reconcile first to make them succeed if the ephemeral mounts
+		// are no longer necessary.
 		match fsop {
-			FsOperation::FsUnlink(op) => self.reconcile_if_ephemeral_unlink(&op.target),
-			FsOperation::FsRename(RenameOperation { from, to, .. })
-			| FsOperation::FsLink(LinkOperation { from, to, .. }) => {
-				self.reconcile_if_ephemeral_cross_mount(from, to)
+			FsOperation::FsUnlink(op) => {
+				// unlink doesn't work if the directory is not empty
+				// anyway, so we don't care about any child mounts of the
+				// target.
+				self.try_remove_ephemeral_mounts_on(&op.target)
+			}
+			FsOperation::FsRename(RenameOperation { from, to, exchange }) => {
+				self.try_remove_ephemeral_mounts_on_2(from, to, *exchange)
+			}
+			FsOperation::FsLink(LinkOperation { from, to, .. }) => {
+				self.try_remove_ephemeral_mounts_on_2(from, to, false)
 			}
 			_ => {}
 		}
@@ -835,49 +841,39 @@ impl ManagedBindMountSandbox {
 		ctx.send_continue()
 	}
 
-	/// `unlink` / `rmdir` (`unlinkat`) of a directory or file that is
-	/// itself an *ephemeral* live mountpoint (one with no explicit policy
-	/// entry, e.g. a leftover `chdir` cwd mount) fails natively with
-	/// EBUSY.  Force a reconcile against the policy so that mount - if no
-	/// longer needed - is dropped, after which the kernel sees a plain
-	/// directory / file and can remove it.  Best-effort: failures are
-	/// logged, never surfaced to the app (the unlink simply continues
-	/// natively and may still fail with EBUSY).
-	fn reconcile_if_ephemeral_unlink(&self, target: &FsTarget) {
+	/// Force a reconcile to remove no-longer-needed ephemeral mounts if
+	/// the target sits on an ephemeral mount.
+	fn try_remove_ephemeral_mounts_on(&self, target: &FsTarget) {
 		let abspath = match target.realpath() {
 			Ok(p) => p,
 			Err(e) => {
-				warn_unless_benign!(
-					&e,
-					"unlink: cannot resolve abspath for {}: {} - not reconciling",
-					target,
-					e
-				);
+				warn_unless_benign!(&e, "unlink: cannot resolve abspath for {}: {}", target, e);
 				return;
 			}
 		};
-		if self.is_ephemeral_mountpoint(&abspath) {
+		let (policy, mut pt, mut mt) = self.lock_trees();
+		let on_ephemeral_mount = mt.get(&abspath).is_some() && policy.get(&abspath).is_none();
+		if on_ephemeral_mount {
 			debug!(
 				"unlink target {:?} is an ephemeral mountpoint - forcing reconcile",
 				abspath
 			);
-			self.force_reconcile_for("unlink", &abspath);
+			self.reconcile(&mut pt, &mut mt, &policy, None);
 		}
 	}
 
-	/// `rename` / `link` (`renameat` / `linkat`) whose two operands sit
-	/// under *different* live mounts but the *same* policy entry are
-	/// straddling an ephemeral mount boundary and would fail natively
-	/// with EXDEV.  Force a reconcile so the ephemeral mount(s) causing
-	/// the split are dropped (when no longer needed), after which both
-	/// operands resolve onto a single filesystem.  Best-effort.
-	fn reconcile_if_ephemeral_cross_mount(&self, from: &FsTarget, to: &FsTarget) {
+	/// Force a reconcile to remove no-longer-needed ephemeral mounts if
+	/// the two targets are on different live (ephemeral) mounts but the
+	/// same policy mount, or if the source (or destination, in case of
+	/// RENAME_EXCHANGE) contains mounts but only ephemeral mounts as
+	/// their children.
+	fn try_remove_ephemeral_mounts_on_2(&self, from: &FsTarget, to: &FsTarget, is_exchange: bool) {
 		let from_path = match from.realpath() {
 			Ok(p) => p,
 			Err(e) => {
 				warn_unless_benign!(
 					&e,
-					"rename/link: cannot resolve abspath for source {}: {} - not reconciling",
+					"rename/link: cannot resolve abspath for source {}: {}",
 					from,
 					e
 				);
@@ -889,31 +885,75 @@ impl ManagedBindMountSandbox {
 			Err(e) => {
 				warn_unless_benign!(
 					&e,
-					"rename/link: cannot resolve abspath for destination {}: {} - not reconciling",
+					"rename/link: cannot resolve abspath for destination {}: {}",
 					to,
 					e
 				);
 				return;
 			}
 		};
-		if self.straddles_ephemeral_mount_boundary(&from_path, &to_path) {
+		let mut need_reconcile = false;
+		let (policy, mut pt, mut mt) = self.lock_trees();
+		let cur_from = mt.find(&from_path, |_, _| true).map(|(p, _)| p);
+		let cur_to = mt.find(&to_path, |_, _| true).map(|(p, _)| p);
+		if cur_from == cur_to {
+			// then pol_from == pol_to is implied.  In this case we don't
+			// need to reconcile to resolve EXDEV, but we still check if
+			// we can get rid of EBUSY
+			let (n_ephemeral, n_policy) =
+				self.count_mount_kinds_under_path(&from_path, &policy, &mut mt);
+			if n_policy > 0 {
+				// it will fail anyway, don't bother.
+				return;
+			}
+			if n_ephemeral > 0 {
+				need_reconcile = true;
+			}
+			let (n_ephemeral, n_policy) =
+				self.count_mount_kinds_under_path(&to_path, &policy, &mut mt);
+			if n_policy > 0 || (!is_exchange && n_ephemeral > 0) {
+				// it will fail anyway, don't bother.
+				return;
+			}
+			if n_ephemeral > 0 {
+				need_reconcile = true;
+			}
+			if !need_reconcile {
+				return;
+			}
+		} else {
+			let pol_from = policy.find(&from_path, |_, _| true).map(|(p, _)| p);
+			let pol_to = policy.find(&to_path, |_, _| true).map(|(p, _)| p);
+			if pol_from != pol_to {
+				return;
+			}
+			need_reconcile = true;
+		}
+		if need_reconcile {
 			debug!(
-				"rename/link operands {:?} and {:?} straddle an ephemeral mount boundary - forcing reconcile",
+				"rename/link {:?} -> {:?} may fail due to ephemeral mounts - forcing reconcile",
 				from_path, to_path
 			);
-			self.force_reconcile_for("rename/link", &from_path);
+			self.reconcile(&mut pt, &mut mt, &policy, None);
 		}
 	}
 
-	/// Force a reconcile and log any per-path errors it surfaced, tagging
-	/// the log with the `op` and `path` that prompted it.
-	fn force_reconcile_for(&self, op: &str, path: &OsStr) {
-		for (p, e) in self.force_reconcile() {
-			warn!(
-				"{}: reconcile for ephemeral mountpoint {:?} failed on {:?}: {}",
-				op, path, p, e
-			);
-		}
+	fn count_mount_kinds_under_path(
+		&self,
+		path: &OsStr,
+		policy: &FsTree<ManagedTreeEntry>,
+		current_mt: &mut FsTree<MountInternal>,
+	) -> (usize, usize) {
+		let mut n_ephemeral = 0;
+		let mut n_policy = 0;
+		current_mt.walk_subtree_top_down(path, true, |path, _data| {
+			if policy.get(path).is_none() {
+				n_ephemeral += 1;
+			} else {
+				n_policy += 1;
+			}
+		});
+		(n_ephemeral, n_policy)
 	}
 
 	/// For an *at request with a proper dfd, we have a chance to inspect
