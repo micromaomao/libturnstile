@@ -1037,7 +1037,7 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// Open the absolute `path` inside m1, resolving through the
+	/// Open the absolute `path` inside m1 and u1, resolving through the
 	/// sandbox's mount layout.
 	pub(self) fn open_in_m1(
 		&self,
