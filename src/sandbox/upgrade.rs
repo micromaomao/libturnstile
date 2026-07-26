@@ -127,9 +127,7 @@ struct ReopenParams {
 }
 
 /// If the request's syscall is an `open`-family syscall, return the
-/// parameters needed to faithfully re-open the target in m1.  Reuses the
-/// same argument layout the request-parsing handlers use, rather than
-/// re-parsing.
+/// parameters needed to faithfully re-open the target in m1.
 fn open_reopen_params(
 	req: &mut RequestContext,
 ) -> Result<Option<ReopenParams>, AccessRequestError> {
@@ -660,11 +658,16 @@ impl ManagedBindMountSandbox {
 			return ctx.send_continue();
 		};
 
-		// For a fresh open the identity reference is what the app's own
-		// path resolves to right now (post-grant); skip it when creating
-		// (the leaf may not exist yet).
 		let creating = params.flags & libc::O_CREAT as u64 != 0;
+		// Here we get an expected "identity reference" by opening the
+		// file using the originally passed in target, which might be
+		// relative to some other potentially moving fd.  This is used to
+		// compare with the inode we actually get when opening using
+		// absolute path later, and prevents us from somehow opening a
+		// different file than the one the app intended.
 		let expected = if creating {
+			// ...but we can't do this for files which we will create as
+			// part of the open.
 			None
 		} else {
 			op.target
@@ -677,15 +680,16 @@ impl ManagedBindMountSandbox {
 		let fd = match self.m1_open_checked(&abspath_c, &how, expected) {
 			Ok(fd) => fd,
 			Err(M1OpenError::OpenFailed(errno)) => {
-				// The open failed in m1 too.  We can't safely CONTINUE
-				// (the app's cwd is shadowed, so a native re-resolution
-				// could land elsewhere), so reproduce the errno the app
-				// would have seen.
+				// The open failed in m1 too, either because the policy
+				// did not actually allow the file to be opened with the
+				// requested access despite the caller calling
+				// allow_request, or because of some other reason.  In any
+				// case, pass the error back to the app.
 				return ctx.send_error(-errno);
 			}
 			Err(M1OpenError::IdentityMismatch) => {
-				// The abspath now resolves to a different inode than the
-				// app's own resolution (a TOCTOU race); fail closed.
+				// Can probably retry here but will just return -ESTALE to
+				// avoid complex logic.
 				return ctx.send_error(-libc::ESTALE);
 			}
 		};
@@ -736,64 +740,74 @@ impl ManagedBindMountSandbox {
 			return ctx.send_continue();
 		}
 		let target_os = OsStr::from_bytes(abspath_bytes);
-		// The deepest tracked mount covering the target (the target itself
-		// or an ancestor).  No covering mount means the policy does not
-		// grant this chdir at all, so there is nothing to preempt — CONTINUE
-		// and let the syscall fail / be handled by the caller.
 		let Some((cov_path, cov_host, cov_attrs)) = self.covering_mount(target_os) else {
+			// No covering mount means the policy does not in fact grant
+			// this chdir at all, even though it called allow_request.
+			// Let's just do nothing.
 			return ctx.send_continue();
 		};
-		// If we're already full permission, don't bother setting up dummy mounts
+		// If we're already full permission, don't bother setting up
+		// ephemeral mounts.  This is an optimization to avoid the cost of
+		// creating lots of mount points under paths which the sandboxed
+		// app has full access, at the expense of not being able to take
+		// away access in arbitrarily fine-grained ways in the future.
 		if !cov_attrs.readonly && !cov_attrs.noexec {
 			return ctx.send_continue();
 		}
-		// A mount already exists *exactly* at the target: cwd is pinned to
-		// a tracked mount whose identity reconcile preserves, so there is
-		// nothing to do.
+		// A mount already exists at the target: in this case we don't
+		// need to create any ephemeral mounts as we can always change the
+		// attribute of this existing mount or move it after the fact if
+		// we want to change permission on either this dir or any of its
+		// parent.
 		if cov_path.as_os_str() == target_os {
+			// TODO: this is not technically correct - if we don't tie the
+			// pid here with the mount, we may try to unmount it in the
+			// future without realizing that it's supposed to eventually
+			// be backing the cwd of a process.  Normally the umount would
+			// fail due to EBUSY, but if by the time we try to unmount it,
+			// the chdir has not been executed by the kernel yet, we will
+			// race.
 			return ctx.send_continue();
 		}
-		// Covered only by an ancestor: add a dummy mount *exactly* at the
-		// target so a later attribute change can affect the existing cwd
-		// handle (cwd can't be upgraded after the fact).  Inherit the
-		// covering mount's attrs and host subtree so the cwd keeps seeing
-		// the same files and is not over-restricted.  `cov_path` is a strict
-		// ancestor here, so the relative suffix is a component-boundary slice
-		// that already starts with `/` (non-root ancestor) or is the whole
-		// abspath (root mount).
+		// Covered only by an ancestor: add an ephemeral mount at the
+		// target to allow us maximum flexibility later to change the
+		// attributes of, or move this cwd's mount around.  Inherit the
+		// covering mount's attrs and host subtree so the cwd's view is
+		// not changed.
 		let suffix: &[u8] = if cov_path.as_os_str() == OsStr::new("/") {
 			abspath_bytes
 		} else {
 			&abspath_bytes[cov_path.as_os_str().as_bytes().len()..]
 		};
-		let host_path_bytes = join_under_mount(cov_host.as_bytes(), suffix);
+		let host_path_bytes = join_suffix_onto_abs_path(cov_host.as_bytes(), suffix);
 		if let Some(host_path) = to_cstring(&host_path_bytes) {
-			// Capture a reuse-safe handle to the *thread* issuing the chdir
-			// (cwd is per-thread).  The transient mount is tracked against it
-			// so a later reconcile keeps it only while this thread's cwd
-			// still needs it, then reclaims it.
+			// Capture a pidfd to the thread issuing the chdir (cwd is
+			// per-thread), then tie it together with the ephemeral mount
+			// so a future reclaim of this mount does not race with the
+			// chdir still executing.
 			match ProcPidFd::from_tid(ctx.pid()) {
 				Ok(pidfd) => {
 					let mp = ManagedMountPoint {
 						host_path,
 						attrs: cov_attrs,
 					};
-					if let Err(e) = self.reconcile_chdir(target_os, mp, std::sync::Arc::new(pidfd))
+					if let Err(e) =
+						self.make_ephemeral_mount_for_cwd(target_os, mp, std::sync::Arc::new(pidfd))
 					{
 						warn!(
-							"chdir: failed to add preemptive mount on {:?}: {}",
+							"chdir: failed to add ephemeral mount on {:?}: {}",
 							abspath, e
 						);
 					} else {
 						debug!(
-							"chdir: added preemptive {} mount on {:?}",
+							"chdir: added ephemeral {} mount on {:?}",
 							cov_attrs, abspath
 						);
 					}
 				}
 				Err(e) => {
 					warn!(
-						"chdir: cannot open pidfd for tid {} ({:?}): {} - skipping preemptive mount",
+						"chdir: cannot open pidfd for tid {} ({:?}): {} - skipping ephemeral mount",
 						ctx.pid(),
 						abspath,
 						e
@@ -913,12 +927,10 @@ impl ManagedBindMountSandbox {
 	}
 }
 
-/// Join a covering mount's `host` path with a `suffix` — the part of the
-/// sandbox abspath below the covering mount, always starting with `/` —
-/// yielding the host path the covered sandbox location actually maps to.
-/// One trailing slash is dropped from `host` first so a root host (`/`)
-/// joins cleanly.
-fn join_under_mount(host: &[u8], suffix: &[u8]) -> Vec<u8> {
+/// Produce the path `host`+`suffix`. `suffix` must have a leading `/`,
+/// `host` can either have or not have a trailing `/` but must be an
+/// absolute path.  Result will be an absolute path.
+fn join_suffix_onto_abs_path(host: &[u8], suffix: &[u8]) -> Vec<u8> {
 	let host = host.strip_suffix(b"/").unwrap_or(host);
 	let mut out = host.to_vec();
 	out.extend_from_slice(suffix);
@@ -931,16 +943,17 @@ fn join_under_mount(host: &[u8], suffix: &[u8]) -> Vec<u8> {
 /// Build an `open_how` for faithfully re-opening an `openat`-family
 /// target in m1.  Resolution is confined to m1's root.
 ///
-/// TODO: RESOLVE_NO_SYMLINKS is not faithfully honored yet.  We pass the
-/// flag through to the m1 `openat2` below, but the `abspath` we open was
-/// itself produced by `FsTarget::realpath()`, which resolves the path by
-/// *following* symlinks.  So a path the app submitted with
-/// RESOLVE_NO_SYMLINKS that contained a symlink component (which should
-/// have failed with ELOOP in the original call) gets resolved here, and
-/// re-opening the already-resolved abspath finds no symlinks left and
-/// succeeds.  Reproducing the original semantics requires resolving the
-/// abspath without following symlinks (and failing the same way) — left
-/// as future work.
+/// TODO: RESOLVE_NO_SYMLINKS is not faithfully honored yet.  We will pass
+/// the flag through to the m1 `openat2`, but the `abspath` we open will
+/// itself be produced by `FsTarget::realpath()`, which does not honor
+/// RESOLVE_NO_SYMLINKS (because FsTarget currently does not track
+/// resolve_no_symlinks, only no_follow).  So a path the app submitted
+/// with RESOLVE_NO_SYMLINKS that contained a symlink component (which
+/// should have failed with ELOOP in the original call) gets resolved
+/// here, and re-opening the already-resolved abspath finds no symlinks
+/// left and succeeds.  Reproducing the original semantics requires the
+/// caller to resolve the original abspath without following symlinks, and
+/// ELOOP if any are found.
 fn build_open_how(params: &ReopenParams) -> open_how {
 	let mut how: open_how = unsafe { std::mem::zeroed() };
 	how.flags = params.flags;

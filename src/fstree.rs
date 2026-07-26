@@ -353,12 +353,11 @@ impl<T> FsTree<T> {
 	/// Remove the path from the tree, returning the existing data, if
 	/// any.  Any paths under the removed path are not removed.
 	///
-	/// After removing the data, if the target node has no children, it
-	/// is removed from its parent's children map, and this cleanup is
+	/// After removing the data, if the target node has no children, it is
+	/// removed from its parent's children map, and this cleanup is
 	/// repeated up the chain for any ancestor that ends up with no data
-	/// and no children.  This preserves the "no useless subtree"
-	/// invariant: a non-root node exists in the tree only if it (or
-	/// something under it) carries data.
+	/// and no children.  This means that we do not get "useless
+	/// subtrees".
 	///
 	/// ## Example
 	///
@@ -527,11 +526,7 @@ impl<T> FsTree<T> {
 	/// `constructor` is called with the absolute path of that node and
 	/// the returned value is stored as the node's data.
 	///
-	/// Because we maintain the "no useless subtree" invariant (see
-	/// [`Self::remove`]), every data-less non-root node is by
-	/// definition an incomplete parent: it would not exist otherwise.
-	/// This therefore runs in O(N) where N is the number of nodes in
-	/// the tree.
+	/// This runs in O(N) where N is the number of nodes in the tree.
 	///
 	/// The root is also filled if it currently has no data and the
 	/// tree is non-empty.
@@ -568,10 +563,11 @@ impl<T> FsTree<T> {
 		is_root: bool,
 		nb_entries: &mut usize,
 	) {
-		// Skip filling an empty root (i.e. an empty tree).  Otherwise
-		// any node we visit must, by the no-useless-subtree invariant,
-		// be either the root, carry data, or have descendants with
-		// data; in the latter two cases we fill if data is missing.
+		// Skip filling an empty root (i.e. an empty tree).  Otherwise,
+		// because we maintain the "no useless subtree" invariant, any
+		// node we visit must be either the root, carry data, or have
+		// descendants with data; in the latter two cases we fill if data
+		// is missing.
 		if node.data.is_none() && !(is_root && node.children.is_empty()) {
 			node.data = Some(constructor(OsStr::from_bytes(path)));
 			*nb_entries += 1;
