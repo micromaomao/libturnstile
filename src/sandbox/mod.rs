@@ -1334,20 +1334,12 @@ impl BindMountSandbox {
 
 	/// Unmount `ns_path` while preserving its sub-mounts: park every
 	/// direct sub-mount under `ns_path` to the hidden scratch tmpfs,
-	/// attempt a non-detach
-	/// `umount2(ns_path)`, then restore the parked sub-mounts onto their
-	/// original paths.  Returns `Ok(true)` if the parent mount was
-	/// successfully unmounted, or `Ok(false)` if it was kept because the
-	/// app still holds it (the umount returned `EBUSY`).  In both cases
-	/// the children keep their `struct mount` identity (and thus any app
-	/// fds / cwd resolving through them remain valid).
-	///
-	/// `child_ns_paths` must list the *direct* (topmost) sub-mounts of
-	/// `ns_path` in the live mount tree - parking all present children
-	/// (not just still-desired ones) is required so that none of them
-	/// pins the parent and causes a spurious `EBUSY`.  Their
-	/// mountpoint dentries must exist on the layer revealed by the umount
-	/// (the placeholder hierarchy), which the caller is responsible for.
+	/// attempt a non-detach `umount2(ns_path)`, then restore the parked
+	/// sub-mounts onto their original paths.  Returns `Ok(true)` if the
+	/// parent mount was successfully unmounted, or `Ok(false)` if it was
+	/// kept because the app still holds it (i.e. the umount returned
+	/// `EBUSY`).  In both cases the children should be kept intact (and
+	/// thus any app fds / cwd resolving through them remain valid).
 	pub(self) fn unmount_covering(
 		&self,
 		ns_path: &CStr,
@@ -2055,33 +2047,20 @@ impl ProcPidFd {
 		Ok(OsString::from_vec(buf))
 	}
 
-	/// Whether the thread is *currently* executing a `chdir` / `fchdir`
-	/// syscall, read from the first token of `/proc/<tid>/syscall` (the
-	/// syscall number, or `running` in userspace, or `-1` when not in a
-	/// syscall).
-	///
-	/// Returns `true` on any read / parse failure so callers treat an
-	/// unreadable state conservatively (assume an in-flight chdir and keep
-	/// the mount).  This is the load-bearing in-flight guard that makes the
-	/// cwd-mount cleanup race-free: it must be read *before* [`Self::cwd`].
-	pub(crate) fn in_chdir_syscall(&self) -> bool {
-		let fd = match self.open_proc_file(c"syscall", libc::O_RDONLY | libc::O_CLOEXEC) {
-			Ok(fd) => fd,
-			Err(_) => return true,
-		};
+	/// Determine whether the thread is currently executing a `chdir` /
+	/// `fchdir` syscall using /proc/.../syscall.
+	pub(crate) fn in_chdir_syscall(&self) -> Result<bool, io::Error> {
+		let fd = self.open_proc_file(c"syscall", libc::O_RDONLY | libc::O_CLOEXEC)?;
 		let mut f = std::fs::File::from(fd);
 		let mut s = String::new();
-		if f.read_to_string(&mut s).is_err() {
-			return true;
-		}
+		f.read_to_string(&mut s)?;
 		let Some(first) = s.split_whitespace().next() else {
-			return true;
+			return Ok(false);
 		};
 		match first.parse::<i64>() {
-			// In a syscall: in-flight iff it's chdir/fchdir.
-			Ok(nr) => chdir_syscall_nrs().contains(&nr),
-			// "running" (userspace) or anything unparseable: not in chdir.
-			Err(_) => false,
+			Ok(nr) => Ok(chdir_syscall_nrs().contains(&nr)),
+			// not a number
+			Err(_) => Ok(false),
 		}
 	}
 }
@@ -2509,29 +2488,13 @@ impl ManagedBindMountSandbox {
 					CString::new(sandbox_path.as_encoded_bytes()).expect("checked for NUL byte");
 				match diff {
 					crate::fstree::DiffTree::Removed(old) => {
-						// A `Removed` whose path still exists in the desired
-						// mount tree *with a different host_path* is the
-						// removed half of a host_path-change "split":
-						// the diff emits Removed(P) then Added(P).  That
-						// mount's identity is being discarded and the
-						// following Added re-covers P, so detach the old
-						// bind unconditionally (MNT_DETACH) rather than
-						// running the keep-on-EBUSY dance - keeping it
-						// would leave the new bind shadowing the old one.
-						//
-						// A `Removed` whose path is gone from the desired
-						// tree, or still present with the *same* host_path,
-						// is not a split: it is a genuine removal (e.g. a
-						// ephemeral `chdir` mount being garbage-collected
-						// now that the caller dropped it from the desired
-						// tree; or a child swept into a split because an
-						// *ancestor's* host_path changed).  Those go
-						// through the gentle keep-on-EBUSY unmount below
-						// so a still-held cwd / fd isn't broken by a
-						// MNT_DETACH.
 						if let Some(new) = desired_mt.get(sandbox_path)
 							&& new.host_path != old.user.host_path
 						{
+							// Don't bother with keeping the mount, we
+							// have been explicitly asked to change this
+							// mount to point to something else, so just
+							// MNT_DETACH
 							if let Err(e) = self.sandbox.unmount(&ns_path, true) {
 								errors.push((sandbox_path.to_owned(), e));
 								return;
@@ -2539,14 +2502,10 @@ impl ManagedBindMountSandbox {
 							new_mt.remove(sandbox_path);
 							return;
 						}
-						// a mount that still backs a live thread's cwd
-						// (notably a transient `chdir` mount) must not be
-						// unmounted yet.  Prune holders that have died or moved
-						// away; if any survive (alive and either mid-`chdir` or
-						// with their cwd still here), keep the mount with the
-						// pruned holder list and defer removal to a later
-						// reconcile.  Ordinary policy mounts have an empty
-						// `cwd_of` and skip straight to the unmount below.
+						// A mount that might back a live thread's cwd
+						// (notably an ephemeral `chdir` mount) either
+						// right now or after the completion of a parallel
+						// chdir must not be unmounted yet.
 						if !old.cwd_of.is_empty() {
 							let survivors = self.retained_cwd_holders(&old.cwd_of, sandbox_path);
 							let entry = new_mt.get_mut(sandbox_path).expect("must exist");
@@ -2560,9 +2519,7 @@ impl ManagedBindMountSandbox {
 						// still present under this path in the live tree
 						// and hand them to the unmount routine, which
 						// parks them out of the way, does a non-detach
-						// umount, then restores them - preserving each
-						// child's `struct mount` identity instead of
-						// detaching the whole subtree.
+						// umount, then restores them.
 						let mut children: Vec<CString> = Vec::new();
 						new_mt.walk_subtree_top_down(sandbox_path, true, |child_path, _| {
 							if let Ok(c) = CString::new(child_path.as_encoded_bytes()) {
@@ -2574,12 +2531,10 @@ impl ManagedBindMountSandbox {
 								new_mt.remove(sandbox_path);
 							}
 							Ok(false) => {
-								// EBUSY: the app itself still holds this
-								// path.  Keep it but lock it down to the
-								// covering attrs;
-								// a later reconcile retries the removal
-								// once the app lets go (eventual
-								// consistency).
+								// The app itself still holds this path.
+								// Keep it but lock it down to the new
+								// covering attrs; a later reconcile will
+								// retry the removal again.
 								let covering = self.covering_attrs(&desired_mt, sandbox_path);
 								if covering != old.user.attrs {
 									if let Err(e) = self.sandbox.set_mount_attr(
@@ -2817,18 +2772,12 @@ impl ManagedBindMountSandbox {
 		best.unwrap_or_else(MountAttributes::ro)
 	}
 
-	/// Of the threads recorded as backing the cwd mount at `target`, return
-	/// those that still need it.  A holder is retained iff it is alive and
-	/// either currently mid-`chdir`/`fchdir` (its move onto `target` may not
-	/// have landed yet) or its cwd is still `target`; a dead or moved-away
-	/// holder is dropped.
-	///
-	/// The two reads are ordered `syscall` *before* `cwd` on purpose: if we
-	/// read `cwd != target` first and the chdir then landed before we read
-	/// `syscall`, both checks would say "gone" and we'd unmount the cwd the
-	/// thread just landed on.  Reading `syscall` first means a `not in
-	/// chdir` result guarantees the in-flight chdir has fully returned, so
-	/// the subsequent `cwd` read reflects its final, stable result.
+	/// Of the threads recorded as backing the cwd mount at `target`,
+	/// return those that still need it.  A holder is retained iff it is
+	/// alive and either currently mid-`chdir`/`fchdir` (in which case the
+	/// syscall might not have been processed by the kernel yet) or its
+	/// cwd is still `target`; a dead or moved-away holder is removed from
+	/// the list.
 	fn retained_cwd_holders(
 		&self,
 		holders: &[Arc<ProcPidFd>],
@@ -2841,9 +2790,8 @@ impl ManagedBindMountSandbox {
 				Ok(false) => continue, // dead -> drop
 				Ok(true) => {}
 				Err(e) => {
-					// Can't determine liveness: keep conservatively.
 					debug!(
-						"retained_cwd_holders: liveness check failed for tid {}: {} - keeping",
+						"retained_cwd_holders: error determining if pidfd to {} is still valid: {}",
 						h.tid(),
 						e
 					);
@@ -2851,19 +2799,30 @@ impl ManagedBindMountSandbox {
 					continue;
 				}
 			}
-			// READ ORDER IS LOAD-BEARING: syscall before cwd (see doc above).
-			if h.in_chdir_syscall() {
+
+			// Check if the thread is in a chdir syscall first before we
+			// check its cwd.  Doing it the other way may lead to races.
+			if h.in_chdir_syscall().unwrap_or_else(|e| {
+				error!(
+					"failed to determine if pid {} is in chdir syscall: {}",
+					h.tid(),
+					e
+				);
+				false
+			}) {
 				out.push(h.clone());
 				continue;
 			}
+			// Now we know that the thread is not in a chdir syscall, and
+			// would not enter one until we return, because our chdir
+			// handler takes the mount tree lock, and we're holding the
+			// lock now.
 			match h.cwd() {
 				Ok(cwd) if cwd.as_encoded_bytes() == target_bytes => out.push(h.clone()),
 				Ok(_) => { /* moved away -> drop */ }
 				Err(e) => {
-					// cwd unreadable (e.g. a race with exit): keep
-					// conservatively; a later reconcile will catch the death.
 					debug!(
-						"retained_cwd_holders: cwd read failed for tid {}: {} - keeping",
+						"retained_cwd_holders: read of cwd for pid {} failed: {}",
 						h.tid(),
 						e
 					);
