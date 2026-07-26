@@ -2287,12 +2287,9 @@ impl ManagedBindMountSandbox {
 		Self::error_for_path(errors, path)
 	}
 
-	/// Reconcile a *transient* `chdir` cwd mount at `target` for the thread
-	/// `pidfd`, without persisting it to the policy.  The mount is
-	/// force-materialised even though it mirrors its covering parent (and so
-	/// would be pruned as "useless"), and is tagged with `pidfd` so a later
-	/// reconcile keeps it alive only while that thread's cwd still needs it.
-	fn reconcile_chdir(
+	/// Create an ephemeral mount at `target` with attribute `mp` to back
+	/// the thread `pidfd`'s cwd, without persisting it to the policy.
+	fn make_ephemeral_mount_for_cwd(
 		&self,
 		target: &OsStr,
 		mp: ManagedMountPoint,
@@ -2525,12 +2522,13 @@ impl ManagedBindMountSandbox {
 						// A `Removed` whose path is gone from the desired
 						// tree, or still present with the *same* host_path,
 						// is not a split: it is a genuine removal (e.g. a
-						// dummy `chdir` mount being garbage-collected now
-						// that the caller dropped it from the desired tree;
-						// or a child swept into a split because an
-						// *ancestor's* host_path changed).  Those go through
-						// the gentle keep-on-EBUSY unmount below so a
-						// still-held cwd / fd isn't broken by a MNT_DETACH.
+						// ephemeral `chdir` mount being garbage-collected
+						// now that the caller dropped it from the desired
+						// tree; or a child swept into a split because an
+						// *ancestor's* host_path changed).  Those go
+						// through the gentle keep-on-EBUSY unmount below
+						// so a still-held cwd / fd isn't broken by a
+						// MNT_DETACH.
 						if let Some(new) = desired_mt.get(sandbox_path)
 							&& new.host_path != old.user.host_path
 						{

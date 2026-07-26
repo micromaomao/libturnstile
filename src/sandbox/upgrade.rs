@@ -660,11 +660,16 @@ impl ManagedBindMountSandbox {
 			return ctx.send_continue();
 		};
 
-		// For a fresh open the identity reference is what the app's own
-		// path resolves to right now (post-grant); skip it when creating
-		// (the leaf may not exist yet).
 		let creating = params.flags & libc::O_CREAT as u64 != 0;
+		// Here we get an expected "identity reference" by opening the
+		// file using the originally passed in target, which might be
+		// relative to some other potentially moving fd.  This is used to
+		// compare with the inode we actually get when opening using
+		// absolute path later, and prevents us from somehow opening a
+		// different file than the one the app intended.
 		let expected = if creating {
+			// ...but we can't do this for files which we will create as
+			// part of the open.
 			None
 		} else {
 			op.target
@@ -677,15 +682,16 @@ impl ManagedBindMountSandbox {
 		let fd = match self.m1_open_checked(&abspath_c, &how, expected) {
 			Ok(fd) => fd,
 			Err(M1OpenError::OpenFailed(errno)) => {
-				// The open failed in m1 too.  We can't safely CONTINUE
-				// (the app's cwd is shadowed, so a native re-resolution
-				// could land elsewhere), so reproduce the errno the app
-				// would have seen.
+				// The open failed in m1 too, either because the policy
+				// did not actually allow the file to be opened with the
+				// requested access despite the caller calling
+				// allow_request, or because of some other reason.  In any
+				// case, pass the error back to the app.
 				return ctx.send_error(-errno);
 			}
 			Err(M1OpenError::IdentityMismatch) => {
-				// The abspath now resolves to a different inode than the
-				// app's own resolution (a TOCTOU race); fail closed.
+				// Can probably retry here but will just return -ESTALE to
+				// avoid complex logic.
 				return ctx.send_error(-libc::ESTALE);
 			}
 		};
@@ -736,31 +742,33 @@ impl ManagedBindMountSandbox {
 			return ctx.send_continue();
 		}
 		let target_os = OsStr::from_bytes(abspath_bytes);
-		// The deepest tracked mount covering the target (the target itself
-		// or an ancestor).  No covering mount means the policy does not
-		// grant this chdir at all, so there is nothing to preempt — CONTINUE
-		// and let the syscall fail / be handled by the caller.
 		let Some((cov_path, cov_host, cov_attrs)) = self.covering_mount(target_os) else {
+			// No covering mount means the policy does not in fact grant
+			// this chdir at all, even though it called allow_request.
+			// Let's just do nothing.
 			return ctx.send_continue();
 		};
-		// If we're already full permission, don't bother setting up dummy mounts
+		// If we're already full permission, don't bother setting up
+		// ephemeral mounts.  This is an optimization to avoid the cost of
+		// creating lots of mount points under paths which the sandboxed
+		// app has full access, at the expense of not being able to take
+		// away access in arbitrarily fine-grained ways in the future.
 		if !cov_attrs.readonly && !cov_attrs.noexec {
 			return ctx.send_continue();
 		}
-		// A mount already exists *exactly* at the target: cwd is pinned to
-		// a tracked mount whose identity reconcile preserves, so there is
-		// nothing to do.
+		// A mount already exists at the target: in this case we don't
+		// need to create any ephemeral mounts.
 		if cov_path.as_os_str() == target_os {
 			return ctx.send_continue();
 		}
-		// Covered only by an ancestor: add a dummy mount *exactly* at the
+		// Covered only by an ancestor: add a ephemeral mount at the
 		// target so a later attribute change can affect the existing cwd
 		// handle (cwd can't be upgraded after the fact).  Inherit the
 		// covering mount's attrs and host subtree so the cwd keeps seeing
-		// the same files and is not over-restricted.  `cov_path` is a strict
-		// ancestor here, so the relative suffix is a component-boundary slice
-		// that already starts with `/` (non-root ancestor) or is the whole
-		// abspath (root mount).
+		// the same files and is not over-restricted.  `cov_path` is a
+		// strict ancestor here, so the relative suffix is a
+		// component-boundary slice that already starts with `/` (non-root
+		// ancestor) or is the whole abspath (root mount).
 		let suffix: &[u8] = if cov_path.as_os_str() == OsStr::new("/") {
 			abspath_bytes
 		} else {
@@ -778,7 +786,8 @@ impl ManagedBindMountSandbox {
 						host_path,
 						attrs: cov_attrs,
 					};
-					if let Err(e) = self.reconcile_chdir(target_os, mp, std::sync::Arc::new(pidfd))
+					if let Err(e) =
+						self.make_ephemeral_mount_for_cwd(target_os, mp, std::sync::Arc::new(pidfd))
 					{
 						warn!(
 							"chdir: failed to add preemptive mount on {:?}: {}",
