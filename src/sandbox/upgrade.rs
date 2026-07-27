@@ -1,39 +1,11 @@
-//! Per-request fd upgrade machinery.
-//!
-//! [`ManagedBindMountSandbox::new_request_handle`] wraps a yielded
-//! `(AccessRequest, RequestContext)` pair into a [`RequestHandle`].  The
-//! caller inspects the request, optionally mutates the mount layout via
-//! `update_from_list` / `update_from_tree`, then calls
-//! [`RequestHandle::allow`] or [`RequestHandle::deny`].
-//!
-//! `allow()` transparently makes the traced process's view match the
-//! live bind-mount layout:
-//!
-//! * `openat`-family - re-resolve the abspath, open it fresh in m1 (so
-//!   it resolves through the *current* layout), identity-check it, and
-//!   hand the new fd to the app as the syscall's return value via
-//!   `SECCOMP_IOCTL_NOTIF_ADDFD` (SEND).
-//! * `chdir` / `fchdir` - preemptively ensure a mount exists on the
-//!   target (cwd can't be upgraded after the fact), then CONTINUE.
-//! * any other access governed by a held fd whose mount is stale (the
-//!   dirfd of an `*at(dirfd, relpath)`, or the target fd of an
-//!   `f*` / `*at(fd, "", AT_EMPTY_PATH)` metadata op) - the choice
-//!   between swapping the fd and proxying the op comes down to whether
-//!   the held fd is *upgradable* (see
-//!   [`ManagedBindMountSandbox::try_upgrade_fd`]).  An
-//!   **upgradable** fd (a directory, or an `O_PATH` fd) carries no
-//!   read/write position to lose, so we m1-open its abspath,
-//!   identity-check, and swap a fresh fd in at the same number
-//!   (`ADDFD SETFD`) before CONTINUE - the kernel then resolves / acts
-//!   through the live layout (a swapped `O_PATH` fd reproduces the
-//!   syscall's native `O_PATH` semantics against that layout).  An
-//!   **unupgradable**
-//!   fd (a regular file, …) would lose its `f_pos`/open state on a swap,
-//!   so for the metadata ops we instead perform the op in m1 and return
-//!   the result directly (no swap, no CONTINUE).  `ftruncate` is exempt
-//!   entirely (always CONTINUE): it needs a writable fd, which can only
-//!   sit on a still-writable mount.
-//! * anything else - CONTINUE.
+//! This module contains per-request fd upgrade logic for the
+//! `ManagedBindMountSandbox`.  The main goal of "fd upgrades" is to
+//! transparently handle cases where a sandboxed application has a handle
+//! to a file or directory opened, and a later policy update results in
+//! that handle pointing to shadowed part of the mount tree.  Essentially
+//! we use ADDFD to swap the opened handle for a new, non-shadowed one.
+//! The entry point for all this logic is
+//! [`ManagedBindMountSandbox::new_request_handle`].
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
@@ -63,6 +35,53 @@ use crate::{
 use crate::{ManagedTreeEntry, MountInternal};
 
 use super::{ManagedBindMountSandbox, ManagedMountPoint, MountAttributes, ProcPidFd};
+
+/// `RequestHandle` wraps an [`AccessRequest`] and [`RequestContext`]
+/// returned from
+/// [`TurnstileTracer::yield_request`](crate::tracer::TurnstileTracer::yield_request).
+/// See [`ManagedBindMountSandbox::new_request_handle`].
+pub struct RequestHandle<'s, 't> {
+	sandbox: &'s ManagedBindMountSandbox,
+	request: AccessRequest,
+	req_ctx: RequestContext<'t>,
+}
+
+impl<'s, 't> RequestHandle<'s, 't> {
+	/// The original [`AccessRequest`].
+	pub fn request(&self) -> &AccessRequest {
+		&self.request
+	}
+
+	/// The original [`RequestContext`].
+	pub fn req_ctx(&self) -> &RequestContext<'t> {
+		&self.req_ctx
+	}
+
+	/// Mutable reference to the original [`RequestContext`].
+	pub fn req_ctx_mut(&mut self) -> &mut RequestContext<'t> {
+		&mut self.req_ctx
+	}
+
+	pub fn into_original_request(self) -> (AccessRequest, RequestContext<'t>) {
+		(self.request, self.req_ctx)
+	}
+
+	/// Assume the caller's intention is to allow the request.
+	/// Transparently upgrade fds or proxy the requested operation in the
+	/// sandbox namespace if necessary, then continues the syscall.
+	///
+	/// This does not actually grant any access on its own, the caller is
+	/// expected to have updated the policy to allow the request.  If not,
+	/// the syscall (proxied or not) will still fail.
+	pub fn allow(mut self) -> Result<(), AccessRequestError> {
+		self.sandbox.allow_request(&self.request, &mut self.req_ctx)
+	}
+
+	/// Deny the request, failing the syscall with `errno`.
+	pub fn deny(mut self, errno: libc::c_int) -> Result<(), AccessRequestError> {
+		self.req_ctx.send_error(-errno.abs())
+	}
+}
 
 /// Convert an absolute path (as bytes, no interior NUL) into a
 /// NUL-terminated `CString`, or `None` if it contains a NUL byte.
@@ -220,10 +239,21 @@ enum UpgradeOutcome {
 }
 
 impl ManagedBindMountSandbox {
-	/// Wrap a request yielded by the tracer into a [`RequestHandle`]
-	/// bound to this sandbox.  The handle's [`RequestHandle::allow`]
-	/// performs the fd-upgrade dispatch against this sandbox's live
-	/// mount layout.
+	/// Wrap a request yielded by the
+	/// [`TurnstileTracer`](crate::tracer::TurnstileTracer) into a
+	/// [`RequestHandle`] tied to this sandbox.  Instead of using
+	/// [`RequestContext::send_continue`] or
+	/// [`RequestContext::send_error`] directly, using the methods from
+	/// this returned handle to "allow" or "deny" the request, after
+	/// inspecting it as usual with
+	/// [`ManagedBindMountSandbox::check_covered`] and applying any
+	/// necessary policy updates, will allow the sandbox a chance to
+	/// transparently upgrade any shadowed fds or proxy the request in the
+	/// namespace with re-resolved path if necessary, to ensure that an
+	/// operation that was not allowed by a previous policy, but is now
+	/// allowed under an updated policy will work even if the sandboxed
+	/// application re-uses previously opened dir fds, or has a cwd that
+	/// is entered before the policy update.
 	pub fn new_request_handle<'s, 't>(
 		&'s self,
 		request: AccessRequest,
@@ -597,10 +627,11 @@ impl ManagedBindMountSandbox {
 		Ok(UpgradeOutcome::Upgraded)
 	}
 
-	/// Upgrades a fd, with support even for regular files, preserving the
-	/// seek offset.  Some state on the fd are still lost, like flock().
-	/// A fd sharing a file description (struct file) with another fd will
-	/// also have this link broken.
+	/// Upgrades an fd, with support even for regular files, preserving
+	/// the seek offset.  Some states on the fd are still lost, like
+	/// flock().  An fd sharing a file description (struct file) with
+	/// another fd will also have this link broken.  Used for exec and
+	/// mmap where proxying is impossible.
 	fn upgrade_regular_file_fd(
 		&self,
 		ctx: &mut RequestContext,
@@ -1195,53 +1226,5 @@ fn proxy_modify(fsop: &FsOperation, fd: libc::c_int) -> Result<(), libc::c_int> 
 			.unwrap_or(libc::EIO))
 	} else {
 		Ok(())
-	}
-}
-
-/// A handle to a single yielded access request, bound to the sandbox it
-/// came from.  Inspect [`Self::request`], optionally update the mount
-/// layout, then call [`Self::allow`] or [`Self::deny`].
-///
-/// Dropping the handle without responding auto-continues the syscall
-/// (inherited from the underlying [`RequestContext`]).
-pub struct RequestHandle<'s, 't> {
-	sandbox: &'s ManagedBindMountSandbox,
-	request: AccessRequest,
-	req_ctx: RequestContext<'t>,
-}
-
-impl<'s, 't> RequestHandle<'s, 't> {
-	/// The parsed access request.
-	pub fn request(&self) -> &AccessRequest {
-		&self.request
-	}
-
-	/// The underlying request context (process info, validity, memory
-	/// access).
-	pub fn req_ctx(&self) -> &RequestContext<'t> {
-		&self.req_ctx
-	}
-
-	/// Mutable access to the underlying request context, e.g. to check
-	/// [`RequestContext::still_valid`] or read
-	/// [`RequestContext::comm`] / [`RequestContext::pid`] while applying
-	/// policy.
-	pub fn req_ctx_mut(&mut self) -> &mut RequestContext<'t> {
-		&mut self.req_ctx
-	}
-
-	/// Allow the request, transparently upgrading fds or proxying the
-	/// operation if the traced process is operating on a fd or cwd
-	/// shadowed by newer mounts.
-	///
-	/// If the request requires any additional mounts, the caller must have
-	/// already added them.
-	pub fn allow(mut self) -> Result<(), AccessRequestError> {
-		self.sandbox.allow_request(&self.request, &mut self.req_ctx)
-	}
-
-	/// Deny the request, failing the syscall with `errno`.
-	pub fn deny(mut self, errno: libc::c_int) -> Result<(), AccessRequestError> {
-		self.req_ctx.send_error(-errno.abs())
 	}
 }
