@@ -498,6 +498,15 @@ fn path_is_ignored(ignore_paths: &[Vec<u8>], abspath: &[u8]) -> bool {
 	})
 }
 
+fn target_is_ignored(
+	ignore_paths: &[Vec<u8>],
+	sandbox_path: Option<&OsStr>,
+	host_path: &[u8],
+) -> bool {
+	sandbox_path.is_some_and(|path| path_is_ignored(ignore_paths, path.as_bytes()))
+		|| path_is_ignored(ignore_paths, host_path)
+}
+
 /// Create a redirect target on the host if it does not yet exist.
 ///
 /// A "redirect" is a rule whose mount source (`host_path`) differs from
@@ -982,20 +991,26 @@ fn tracing_thread(context: &'static Context) {
 									// configured with `ignore: true`, pass the
 									// whole syscall through unmediated rather
 									// than prompting or denying.  We match on the
-									// full target path (its leaf), not the parent
-									// that dir-ops like mkdir / unlink resolve
-									// `abspath` to, so an ignore rule on the entry
-									// being created/removed also matches.
+									// full target path (its leaf), as visible in
+									// the sandbox, not the parent that dir-ops
+									// like mkdir / unlink resolve `abspath` to.
+									// Fall back to the host-resolved target when
+									// the sandbox path cannot yet be resolved.
 									// Coverage was checked first, so a mount on an
 									// ignored path still serves the access it
 									// grants; only what it does not cover is
 									// passed through.
 									let ignore_paths = context.ignore_paths.lock().unwrap();
 									let ignored = !ignore_paths.is_empty() && {
-										let target = t_local.realpath().unwrap_or_else(|_| {
+										let sandbox_target = rwxp.target.realpath().ok();
+										let host_target = t_local.realpath().unwrap_or_else(|_| {
 											OsStr::from_bytes(abspath.as_bytes()).to_owned()
 										});
-										path_is_ignored(&ignore_paths, target.as_bytes())
+										target_is_ignored(
+											&ignore_paths,
+											sandbox_target.as_deref(),
+											host_target.as_bytes(),
+										)
 									};
 									drop(ignore_paths);
 									if ignored {
@@ -1423,8 +1438,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-	use super::{create_missing_redirect_target, path_is_ignored};
-	use std::ffi::CString;
+	use super::{create_missing_redirect_target, path_is_ignored, target_is_ignored};
+	use std::ffi::{CString, OsStr};
 	use std::os::unix::ffi::OsStrExt;
 
 	#[test]
@@ -1450,6 +1465,16 @@ mod tests {
 	#[test]
 	fn ignore_empty_list_matches_nothing() {
 		assert!(!path_is_ignored(&[], b"/proc"));
+	}
+
+	#[test]
+	fn ignore_matches_sandbox_path_before_resolved_host_path() {
+		let ignored = vec![b"/home/mao/Downloads".to_vec()];
+		assert!(target_is_ignored(
+			&ignored,
+			Some(OsStr::new("/home/mao/Downloads/video.mp4")),
+			b"/redirected/downloads/video.mp4",
+		));
 	}
 
 	#[test]
