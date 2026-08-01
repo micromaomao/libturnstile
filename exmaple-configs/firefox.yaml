@@ -1,0 +1,51 @@
+rules:
+  /usr: rx
+  /etc: rx
+  /bin: rx
+  /lib: rx
+  /lib64: rx
+  /dev/null: rw
+  /dev/zero: rw
+  /dev/urandom: rw
+  /proc: rwx
+  /sys: r
+
+  # $XDG_RUNTIME_DIR/wayland-1: rw
+  # $XDG_RUNTIME_DIR/bus: rw
+  $XDG_RUNTIME_DIR: rw
+  # Unfortunate
+
+  /tmp:
+    target: /tmp/firefox-tmp
+    permissions: rwx
+  /dev/shm:
+    target: /tmp/firefox-shm
+    permissions: rwx
+  /dev/tty:
+    ignore: true
+  /dev/dri: rw
+  $HOME/.cache/mesa_shader_cache: rw
+  $HOME/.mozilla: rwx
+  $HOME/.cache/mozilla: rwx
+  /run/dbus/system_bus_socket: rw
+  $HOME/.config/fontconfig: r
+  $HOME/.local/share/fonts: r
+  $HOME/.cache/fontconfig: r
+  /var/cache/fontconfig: r
+  $HOME/.fonts: r
+  /dev/pts:
+    ignore: true
+  /var/lib/flatpak/exports/share/icons: r
+  /dev:
+    ignore: true
+  $HOME/.local/share/icons: r
+  $HOME/.local/share/mime: r
+  /run/systemd/userdb: rw
+  $HOME/.local/share/gvfs-metadata: r
+  /etc/ca-certificates/trust-source: rwx
+  $HOME/.config: rx
+  $HOME/.local/share/applications: rx
+  $HOME/.local/share/flatpak: rx
+  /var/lib/flatpak/exports/share/applications: rx
+  $HOME/Downloads: rw
+  $HOME/.cache: rw
