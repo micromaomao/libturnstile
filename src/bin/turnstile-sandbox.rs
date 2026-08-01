@@ -1375,22 +1375,32 @@ fn tracing_thread(context: &'static Context) {
 	}
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
 	common::init_logger();
 
 	let cli = Cli::parse();
 
 	if cli.permissive && cli.prompter.is_some() {
-		return Err("--permissive and --prompter are mutually exclusive".into());
+		eprintln!("--permissive and --prompter are mutually exclusive");
+		std::process::exit(1);
 	}
 
-	let sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns)?;
-	let path_res_sandbox = ManagedBindMountSandbox::new(true)?;
+	let sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns).unwrap_or_else(|e| {
+		eprintln!("Unable to create sandbox: {}", e);
+		std::process::exit(1);
+	});
+	let path_res_sandbox = ManagedBindMountSandbox::new(true).unwrap_or_else(|e| {
+		eprintln!("Unable to create path resolution sandbox: {}", e);
+		std::process::exit(1);
+	});
 
 	let context: &'static Context = Box::leak(Box::new(Context {
 		sandbox,
 		path_res_sandbox,
-		tracer: TurnstileTracer::new(TracerOptions::default())?,
+		tracer: TurnstileTracer::new(TracerOptions::default()).unwrap_or_else(|e| {
+			eprintln!("Unable to create seccomp-unotify tracer: {}", e);
+			std::process::exit(1);
+		}),
 		pidfd: OnceLock::new(),
 		should_exit: AtomicBool::new(false),
 		permissive: cli.permissive,
@@ -1405,8 +1415,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		sandbox_id: random_sandbox_id(),
 	}));
 
-	let config_watcher = watch_config_file(&context.config_path)?;
-	load_config_into_sandboxes(context)?;
+	let config_watcher = watch_config_file(&context.config_path).unwrap_or_else(|e| {
+		eprintln!("Unable to watch config file: {}", e);
+		std::process::exit(1);
+	});
+	load_config_into_sandboxes(context).unwrap_or_else(|e| {
+		eprintln!("Unable to load config: {}", e);
+		std::process::exit(1);
+	});
 	let config_reload_thread = thread::spawn(move || config_reload_thread(context, config_watcher));
 
 	let program = &cli.command[0];
@@ -1438,8 +1454,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	};
 	let child_pid = res.id();
 	info!("Spawned child process with pid {}", child_pid);
-	context.pidfd.set(ProcPidFd::from_pid(child_pid)?).unwrap();
-	let res = res.wait()?;
+	context
+		.pidfd
+		.set(ProcPidFd::from_pid(child_pid).unwrap_or_else(|e| {
+			eprintln!("Unable to acquire pidfd to child: {}", e);
+			std::process::exit(1);
+		}))
+		.unwrap();
+	let res = res.wait().unwrap_or_else(|e| {
+		eprintln!("error calling wait() on child: {}", e);
+		std::process::exit(1);
+	});
 	if res.success() {
 		info!("Child process exited successfully");
 	} else {
@@ -1450,7 +1475,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.store(true, std::sync::atomic::Ordering::Relaxed);
 	tracing_thread.join().unwrap();
 	config_reload_thread.join().unwrap();
-	Ok(())
 }
 
 #[cfg(test)]
