@@ -503,8 +503,10 @@ fn target_is_ignored(
 	sandbox_path: Option<&OsStr>,
 	host_path: &[u8],
 ) -> bool {
-	sandbox_path.is_some_and(|path| path_is_ignored(ignore_paths, path.as_bytes()))
-		|| path_is_ignored(ignore_paths, host_path)
+	match sandbox_path {
+		Some(path) => path_is_ignored(ignore_paths, path.as_bytes()),
+		None => path_is_ignored(ignore_paths, host_path),
+	}
 }
 
 /// Create a redirect target on the host if it does not yet exist.
@@ -1474,6 +1476,16 @@ mod tests {
 			&ignored,
 			Some(OsStr::new("/home/mao/Downloads/video.mp4")),
 			b"/redirected/downloads/video.mp4",
+		));
+		assert!(!target_is_ignored(
+			&ignored,
+			Some(OsStr::new("/sandbox/downloads/video.mp4")),
+			b"/home/mao/Downloads/video.mp4",
+		));
+		assert!(target_is_ignored(
+			&ignored,
+			None,
+			b"/home/mao/Downloads/video.mp4",
 		));
 	}
 
