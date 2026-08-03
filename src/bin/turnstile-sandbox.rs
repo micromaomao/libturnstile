@@ -50,6 +50,11 @@ struct Cli {
 	#[arg(required = true)]
 	config: PathBuf,
 
+	/// If set, and if the config file provided either does not exist or is
+	/// empty, a default config will be written to the file.
+	#[arg(long = "default-config")]
+	default_config: bool,
+
 	/// If set, the sandbox will log denials in the form of a policy yaml,
 	/// but always allow the operation to continue.  This is mutually
 	/// exclusive with `--prompter` and `--qt-prompter`.
@@ -77,6 +82,30 @@ struct Cli {
 }
 
 const QT_PROMPTER_SCRIPT: &[u8] = include_bytes!("../../prompter/main.py");
+const DEFAULT_CONFIG: &[u8] = include_bytes!("sandbox-config-default.yaml");
+
+fn write_default_config_if_empty(path: &Path) -> io::Result<()> {
+	// Don't require write permission if the config exists.  Therefore we only
+	// open if len is 0 or not exist.
+	let len = match std::fs::metadata(path) {
+		Ok(meta) => meta.len(),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+		Err(e) => return Err(e),
+	};
+	if len > 0 {
+		return Ok(());
+	}
+	let mut file = std::fs::OpenOptions::new()
+		.create(true)
+		.write(true)
+		.truncate(false)
+		.open(path)?;
+	// Check again for good measure (this is still not race-free)
+	if file.metadata()?.len() == 0 {
+		file.write_all(DEFAULT_CONFIG)?;
+	}
+	Ok(())
+}
 
 #[derive(Debug, Default)]
 struct DenialLogNode {
@@ -1392,6 +1421,12 @@ fn main() {
 		eprintln!("--permissive, --prompter, and --qt-prompter are mutually exclusive");
 		std::process::exit(1);
 	}
+	if cli.default_config {
+		write_default_config_if_empty(&cli.config).unwrap_or_else(|e| {
+			eprintln!("Unable to write default config: {}", e);
+			std::process::exit(1);
+		});
+	}
 
 	let sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns).unwrap_or_else(|e| {
 		eprintln!("Unable to create sandbox: {}", e);
@@ -1521,9 +1556,38 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-	use super::{create_missing_redirect_target, path_is_ignored};
+	use super::{
+		DEFAULT_CONFIG, create_missing_redirect_target, path_is_ignored,
+		write_default_config_if_empty,
+	};
 	use std::ffi::CString;
 	use std::os::unix::ffi::OsStrExt;
+
+	#[test]
+	fn writes_default_config_only_for_missing_or_empty_files() {
+		let tmp = std::env::temp_dir().join(format!(
+			"turnstile-default-config-test-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+
+		let missing = tmp.join("missing.yaml");
+		write_default_config_if_empty(&missing).unwrap();
+		assert_eq!(std::fs::read(&missing).unwrap(), DEFAULT_CONFIG);
+
+		let empty = tmp.join("empty.yaml");
+		std::fs::write(&empty, "").unwrap();
+		write_default_config_if_empty(&empty).unwrap();
+		assert_eq!(std::fs::read(&empty).unwrap(), DEFAULT_CONFIG);
+
+		let existing = tmp.join("existing.yaml");
+		std::fs::write(&existing, "rules: {}\n").unwrap();
+		write_default_config_if_empty(&existing).unwrap();
+		assert_eq!(std::fs::read(&existing).unwrap(), b"rules: {}\n");
+
+		std::fs::remove_dir_all(&tmp).unwrap();
+	}
 
 	#[test]
 	fn ignore_exact_and_descendants() {
