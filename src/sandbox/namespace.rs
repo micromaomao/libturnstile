@@ -12,8 +12,8 @@ use std::{ffi::OsStr, io, os::fd::AsRawFd, thread};
 pub(crate) struct ManagedNamespaces {
 	pub l0_user: ForeignFd,
 	pub l0_mnt: ForeignFd,
-	pub l1_user: ForeignFd,
 	pub l1_mnt: ForeignFd,
+	pub l1_user: ForeignFd,
 }
 
 impl ManagedNamespaces {
@@ -82,20 +82,20 @@ impl ManagedNamespaces {
 						if res != 0 {
 							return res;
 						}
-						let ns_fd = libc::open(
+						let l0_usr_fd = libc::open(
 							c"/proc/self/ns/user".as_ptr(),
 							libc::O_RDONLY | libc::O_CLOEXEC,
 						);
-						if ns_fd < 0 {
+						if l0_usr_fd < 0 {
 							return perror!("open user ns fd");
 						}
-						if let Err(e) = unix_send_fd(child_sock, ns_fd) {
+						if let Err(e) = unix_send_fd(child_sock, l0_usr_fd) {
 							if ENABLE_LOG_IN_FORK {
 								error!("Failed to send level 0 userns fd to parent: {}", e);
 							}
 							return e.raw_os_error().unwrap_or(libc::EIO);
 						}
-						libc::close(ns_fd);
+						libc::close(l0_usr_fd);
 
 						if disable_userns {
 							let res = write_to_path(c"/proc/sys/user/max_user_namespaces", "1");
@@ -104,14 +104,14 @@ impl ManagedNamespaces {
 							}
 						}
 
-						let mntns_fd = libc::open(
+						let l0_mnt_fd = libc::open(
 							c"/proc/self/ns/mnt".as_ptr(),
 							libc::O_RDONLY | libc::O_CLOEXEC,
 						);
-						if mntns_fd < 0 {
+						if l0_mnt_fd < 0 {
 							return perror!("open mount ns fd");
 						}
-						if let Err(e) = unix_send_fd(child_sock, mntns_fd) {
+						if let Err(e) = unix_send_fd(child_sock, l0_mnt_fd) {
 							if ENABLE_LOG_IN_FORK {
 								error!(
 									"Failed to send level 0 mount namespace fd to parent: {}",
@@ -120,11 +120,33 @@ impl ManagedNamespaces {
 							}
 							return e.raw_os_error().unwrap_or(libc::EIO);
 						}
-						libc::close(mntns_fd);
+						libc::close(l0_mnt_fd);
 
-						let res = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS);
+						let res = libc::unshare(libc::CLONE_NEWNS);
 						if res != 0 {
-							return perror!("unshare(CLONE_NEWUSER|CLONE_NEWNS)");
+							return perror!("unshare(CLONE_NEWNS)");
+						}
+						let l1_mnt_fd = libc::open(
+							c"/proc/self/ns/mnt".as_ptr(),
+							libc::O_RDONLY | libc::O_CLOEXEC,
+						);
+						if l1_mnt_fd < 0 {
+							return perror!("open nested mount ns fd");
+						}
+						if let Err(e) = unix_send_fd(child_sock, l1_mnt_fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!(
+									"Failed to send level 1 mount namespace fd to parent: {}",
+									e
+								);
+							}
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+						libc::close(l1_mnt_fd);
+
+						let res = libc::unshare(libc::CLONE_NEWUSER);
+						if res != 0 {
+							return perror!("unshare(CLONE_NEWUSER)");
 						}
 						let res = write_to_path(c"/proc/self/uid_map", &uid_map_back);
 						if res != 0 {
@@ -138,35 +160,20 @@ impl ManagedNamespaces {
 						if res != 0 {
 							return res;
 						}
-						let l1_ns_fd = libc::open(
+						let l1_usr_fd = libc::open(
 							c"/proc/self/ns/user".as_ptr(),
 							libc::O_RDONLY | libc::O_CLOEXEC,
 						);
-						if l1_ns_fd < 0 {
+						if l1_usr_fd < 0 {
 							return perror!("open nested user ns fd");
 						}
-						if let Err(e) = unix_send_fd(child_sock, l1_ns_fd) {
+						if let Err(e) = unix_send_fd(child_sock, l1_usr_fd) {
 							if ENABLE_LOG_IN_FORK {
 								error!("Failed to send level 1 user ns fd to parent: {}", e);
 							}
 							return e.raw_os_error().unwrap_or(libc::EIO);
 						}
-						libc::close(l1_ns_fd);
-
-						let l1_mnt_fd = libc::open(
-							c"/proc/self/ns/mnt".as_ptr(),
-							libc::O_RDONLY | libc::O_CLOEXEC,
-						);
-						if l1_mnt_fd < 0 {
-							return perror!("open nested mount ns fd");
-						}
-						if let Err(e) = unix_send_fd(child_sock, l1_mnt_fd) {
-							if ENABLE_LOG_IN_FORK {
-								error!("Failed to send level 1 mount ns fd to parent: {}", e);
-							}
-							return e.raw_os_error().unwrap_or(libc::EIO);
-						}
-						libc::close(l1_mnt_fd);
+						libc::close(l1_usr_fd);
 						0
 					})
 					.map_err(BindMountSandboxError::ForkError)?;
@@ -190,10 +197,10 @@ impl ManagedNamespaces {
 		let l0m = ForeignFd {
 			local_fd: namespaces.1,
 		};
-		let l1u = ForeignFd {
+		let l1m = ForeignFd {
 			local_fd: namespaces.2,
 		};
-		let l1m = ForeignFd {
+		let l1u = ForeignFd {
 			local_fd: namespaces.3,
 		};
 		debug!(
@@ -204,10 +211,10 @@ impl ManagedNamespaces {
 			l0m.readlink()
 				.as_deref()
 				.unwrap_or(OsStr::new("<readlink failed>")),
-			l1u.readlink()
+			l1m.readlink()
 				.as_deref()
 				.unwrap_or(OsStr::new("<readlink failed>")),
-			l1m.readlink()
+			l1u.readlink()
 				.as_deref()
 				.unwrap_or(OsStr::new("<readlink failed>")),
 		);
