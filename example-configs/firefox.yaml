@@ -36,8 +36,6 @@ rules:
   /dev/pts:
     ignore: true
   /var/lib/flatpak/exports/share/icons: r
-  /dev:
-    ignore: true
   $HOME/.local/share/icons: r
   $HOME/.local/share/mime: r
   /run/systemd/userdb: rw
@@ -61,3 +59,18 @@ rules:
     ignore: true
   $HOME/.local/share:
     ignore: true
+  /dev:
+    ignore: true
+  # yubikey
+  /run/udev: rw
+  # todo: we need some kind of glob on source paths, doing this results in error if they don't exist
+  /dev/hidraw1: rw
+  /dev/hidraw2: rw
+  /dev/hidraw3: rw
+  /dev/hidraw4: rw
+  /dev/hidraw5: rw
+  /dev/hidraw6: rw
+  /dev/hidraw7: rw
+  /dev/hidraw8: rw
+  /dev/hidraw9: rw
+  /opt/intel/oneapi: rx
