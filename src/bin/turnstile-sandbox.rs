@@ -856,31 +856,34 @@ fn tracing_thread(context: &'static Context) {
 									}
 								};
 							}
-							let t_local =
-								match rwxp.target.in_root(resolve_sandbox_root.as_raw_fd()) {
-									Ok(t) => t,
-									Err(e) => {
-										check_req_valid!();
-										match e.kind() {
-											io::ErrorKind::NotFound
-											| io::ErrorKind::PermissionDenied => {
-												debug!(
-													"error reopening target dfd in real root for {}: {}",
-													rwxp, e
-												);
-											}
-											_ => {
-												error!(
-													"error reopening target dfd in real root for {}: {}",
-													rwxp, e
-												);
-											}
+							// This is the fd opened in the path resolution sandbox (which is not
+							// the host).  The path resolution sandbox is allowed to access
+							// everything, but still has any redirects applied.
+							let t_pres = match rwxp.target.in_root(resolve_sandbox_root.as_raw_fd())
+							{
+								Ok(t) => t,
+								Err(e) => {
+									check_req_valid!();
+									match e.kind() {
+										io::ErrorKind::NotFound
+										| io::ErrorKind::PermissionDenied => {
+											debug!(
+												"error reopening target dfd in real root for {}: {}",
+												rwxp, e
+											);
 										}
-										debug!("Will not evaluate request");
-										force_continue = true;
-										break;
+										_ => {
+											error!(
+												"error reopening target dfd in real root for {}: {}",
+												rwxp, e
+											);
+										}
 									}
-								};
+									debug!("Will not evaluate request");
+									force_continue = true;
+									break;
+								}
+							};
 							// For a create-like directory operation, if the
 							// target entry itself already exists and is already
 							// covered, the continued syscall will just open the
@@ -894,7 +897,7 @@ fn tracing_thread(context: &'static Context) {
 							// (unlink / rename / link) are excluded.
 							if rwxp.is_dir_op
 								&& matches!(fsop, FsOperation::FsOpen(_) | FsOperation::FsCreate(_))
-								&& let Ok(leaf_fd) = t_local.open_target()
+								&& let Ok(leaf_fd) = t_pres.open_target()
 								&& let Ok(leaf_path) = leaf_fd.readlink()
 							{
 								let mut bytes = leaf_path.into_encoded_bytes();
@@ -918,9 +921,9 @@ fn tracing_thread(context: &'static Context) {
 									);
 									if let Err(e) = create_symlinks_for_user_path(
 										&context.sandbox,
-										t_local.dfd(),
-										t_local.path(),
-										!t_local.no_follow(),
+										t_pres.dfd(),
+										t_pres.path(),
+										!t_pres.no_follow(),
 									) {
 										debug!("could not mirror symlinks for {}: {}", rwxp, e);
 									}
@@ -928,9 +931,9 @@ fn tracing_thread(context: &'static Context) {
 								}
 							}
 							let target_fd = if rwxp.is_dir_op {
-								t_local.open_target_dir().map(|x| x.0)
+								t_pres.open_target_dir().map(|x| x.0)
 							} else {
-								t_local.open_target()
+								t_pres.open_target()
 							};
 							check_req_valid!();
 							if let Err(e) = target_fd {
@@ -953,7 +956,7 @@ fn tracing_thread(context: &'static Context) {
 								}
 								break;
 							}
-							let abspath = match target_fd.unwrap().readlink() {
+							let sandbox_abspath = match target_fd.unwrap().readlink() {
 								Ok(path) => {
 									let mut bytes = path.into_encoded_bytes();
 									bytes.push(b'\0');
@@ -965,13 +968,16 @@ fn tracing_thread(context: &'static Context) {
 									break;
 								}
 							};
-							if !abspath.as_bytes().starts_with(b"/") {
+							if !sandbox_abspath.as_bytes().starts_with(b"/") {
 								check_req_valid!();
 								// might be sockets etc
-								debug!("{} resolved to non-absolute path {:?}", rwxp, abspath);
+								debug!(
+									"{} resolved to non-absolute path {:?}",
+									rwxp, sandbox_abspath
+								);
 								break;
 							}
-							if abspath.as_bytes() == b"/" {
+							if sandbox_abspath.as_bytes() == b"/" {
 								debug!("skipping /");
 								continue;
 							}
@@ -1005,7 +1011,7 @@ fn tracing_thread(context: &'static Context) {
 							// or maybe just takes the FsTarget
 							let cover = check_covered_or_placeholder(
 								&context.sandbox,
-								&abspath,
+								&sandbox_abspath,
 								rwxp.write,
 								rwxp.exec,
 								resolve_only,
@@ -1022,7 +1028,7 @@ fn tracing_thread(context: &'static Context) {
 										if rwxp.read || rwxp.chdir { "r" } else { "-" },
 										if rwxp.write { "w" } else { "-" },
 										if rwxp.exec { "x" } else { "-" },
-										t_local,
+										t_pres,
 									);
 									add_symlinks = true;
 								}
@@ -1042,8 +1048,8 @@ fn tracing_thread(context: &'static Context) {
 									// passed through.
 									let ignore_paths = context.ignore_paths.lock().unwrap();
 									let ignored = !ignore_paths.is_empty() && {
-										let target = t_local.realpath().unwrap_or_else(|_| {
-											OsStr::from_bytes(abspath.as_bytes()).to_owned()
+										let target = t_pres.realpath().unwrap_or_else(|_| {
+											OsStr::from_bytes(sandbox_abspath.as_bytes()).to_owned()
 										});
 										path_is_ignored(&ignore_paths, target.as_bytes())
 									};
@@ -1067,15 +1073,10 @@ fn tracing_thread(context: &'static Context) {
 										if rwxp.read || rwxp.chdir { "r" } else { "-" },
 										if rwxp.write { "w" } else { "-" },
 										if rwxp.exec { "x" } else { "-" },
-										t_local,
+										t_pres,
 									);
-									// TODO: using abspath here is technically wrong -
-									// we want to emit denials in the sandbox's path,
-									// so that if e.g. /tmp is mounted ro to
-									// /tmp/real_tmp, a write at /tmp/aa shows up as a
-									// denial at /tmp/aa, not /tmp/real_tmp/aa.
 									let d = denials.get_mut_or_insert(
-										OsStr::from_bytes(abspath.as_bytes()),
+										OsStr::from_bytes(sandbox_abspath.as_bytes()),
 										DenialLogNode::default,
 									);
 									d.need_read |= rwxp.read || rwxp.chdir;
@@ -1132,7 +1133,7 @@ fn tracing_thread(context: &'static Context) {
 											) {
 												Some(response) => {
 													apply_prompter_response(
-														context, &response, &t_local,
+														context, &response, &t_pres,
 													);
 													match response.action {
 														// Allow the syscall; the
@@ -1177,9 +1178,9 @@ fn tracing_thread(context: &'static Context) {
 								// sandbox.
 								if let Err(e) = create_symlinks_for_user_path(
 									&context.sandbox,
-									t_local.dfd(),
-									t_local.path(),
-									!t_local.no_follow(),
+									t_pres.dfd(),
+									t_pres.path(),
+									!t_pres.no_follow(),
 								) {
 									debug!("could not mirror symlinks for {}: {}", rwxp, e);
 								}
@@ -1189,26 +1190,26 @@ fn tracing_thread(context: &'static Context) {
 								// components, stat-only lookup).  No permission to grant, but we do need to
 								// make the path resolvable inside the sandbox by mirroring the host entry's
 								// type as a placeholder.
-								let ph = match build_resolve_placeholder(&abspath) {
+								let ph = match build_resolve_placeholder(&sandbox_abspath) {
 									Ok(ph) => ph,
 									Err(e) => {
 										debug!(
 											"could not build resolve placeholder for {:?}: {}",
-											abspath, e
+											sandbox_abspath, e
 										);
 										continue;
 									}
 								};
 								if let Err(e) = context.sandbox.add_or_update_placeholder(
-									OsStr::from_bytes(abspath.as_bytes()),
+									OsStr::from_bytes(sandbox_abspath.as_bytes()),
 									ph,
 								) {
 									error!(
 										"error adding resolve placeholder for {:?}: {}",
-										abspath, e
+										sandbox_abspath, e
 									);
 								} else {
-									debug!("added resolve placeholder for {:?}", abspath);
+									debug!("added resolve placeholder for {:?}", sandbox_abspath);
 								}
 							}
 							if add_mount {
@@ -1221,11 +1222,12 @@ fn tracing_thread(context: &'static Context) {
 								let covering = cover.unwrap().1;
 								let exact = covering
 									.as_ref()
-									.filter(|mp| mp.host_path == abspath)
+									.filter(|mp| mp.host_path == sandbox_abspath)
 									.cloned();
-								let ancestor = covering.filter(|mp| mp.host_path != abspath);
+								let ancestor =
+									covering.filter(|mp| mp.host_path != sandbox_abspath);
 								let mut mp = exact.unwrap_or_else(|| ManagedMountPoint {
-									host_path: abspath.clone(),
+									host_path: sandbox_abspath.clone(),
 									attrs: MountAttributes {
 										readonly: true,
 										noexec: true,
@@ -1250,22 +1252,25 @@ fn tracing_thread(context: &'static Context) {
 									mp.attrs.noexec = false;
 								}
 								let new_attrs = mp.attrs;
-								match context
-									.sandbox
-									.add_or_update_mount(OsStr::from_bytes(abspath.as_bytes()), mp)
-								{
+								match context.sandbox.add_or_update_mount(
+									OsStr::from_bytes(sandbox_abspath.as_bytes()),
+									mp,
+								) {
 									Ok(()) => {
 										// Propagate the (possibly newly granted)
 										// access down to any existing, more
 										// restrictive descendant mounts.
 										inherit_attrs_to_descendants(
 											&context.sandbox,
-											&abspath,
+											&sandbox_abspath,
 											new_attrs,
 										);
 									}
 									Err(e) => {
-										error!("error updating mount for {:?}: {}", abspath, e);
+										error!(
+											"error updating mount for {:?}: {}",
+											sandbox_abspath, e
+										);
 									}
 								}
 							}
