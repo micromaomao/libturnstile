@@ -189,7 +189,7 @@ fn config_reload_thread(context: &'static Context, mut watcher: ConfigWatcher) {
 		}
 		if should_reload {
 			info!("reloading config {:?} due to changes", context.config_path);
-			if let Err(e) = load_config_into_sandbox(context) {
+			if let Err(e) = load_config_into_sandboxes(context) {
 				error!(
 					"error reloading config from {:?}: {}",
 					context.config_path, e
@@ -537,10 +537,10 @@ fn create_missing_redirect_target(sandbox_path: &OsStr, host_path: &CStr) -> io:
 	Ok(())
 }
 
-/// (Re)load the user config file referenced by `context.config_path` and
-/// apply it to the sandbox, replacing the current mount/placeholder set.
-/// Used both at startup and when a prompter requests a config reload.
-fn load_config_into_sandbox(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
+/// (Re)load the user config file referenced by `context.config_path` and apply it to the sandbox
+/// and the path resolution sandbox, replacing the current mount/placeholder set.  Used both at
+/// startup and when a prompter requests a config reload.
+fn load_config_into_sandboxes(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
 	let cfg = Config::load(&context.config_path)?;
 	let resolved_entries = cfg.parse_entries()?;
 	if resolved_entries.is_empty() {
@@ -581,6 +581,37 @@ fn load_config_into_sandbox(context: &Context) -> Result<(), Box<dyn std::error:
 		entries.push((e.sandbox_path.as_os_str(), entry));
 	}
 	let mut ignore_paths_lock = context.ignore_paths.lock().unwrap();
+	let mut path_res_entries: Vec<(&OsStr, ManagedTreeEntry)> = Vec::new();
+	path_res_entries.push((
+		OsStr::new("/"),
+		ManagedTreeEntry::BindMount(ManagedMountPoint {
+			host_path: CString::new("/").unwrap(),
+			attrs: MountAttributes {
+				readonly: true,
+				noexec: true,
+			},
+		}),
+	));
+	for (sb_path, ent) in &entries {
+		match ent {
+			ManagedTreeEntry::BindMount(ManagedMountPoint { host_path, .. }) => {
+				if host_path.to_bytes() != sb_path.as_bytes() {
+					path_res_entries.push((sb_path, ManagedTreeEntry::BindMount(ManagedMountPoint {
+						host_path: host_path.clone(),
+						attrs: MountAttributes::rwx(),
+					})));
+				}
+			}
+			ManagedTreeEntry::Placeholder(_) => {}
+		}
+	}
+	context
+		.path_res_sandbox
+		.update_from_list(path_res_entries)
+		.map_err(|e| {
+			error!("Unable to load config to path_res_sandbox: {}", e);
+			e
+		})?;
 	context.sandbox.update_from_list(entries)?;
 	*ignore_paths_lock = ignore_paths;
 	Ok(())
@@ -675,7 +706,7 @@ fn trim_trailing_dot(path: &[u8]) -> &[u8] {
 /// syscall-level decision in `response.action` is handled by the caller.
 fn apply_prompter_response(context: &Context, response: &PrompterResponse, t_local: &FsTarget) {
 	if response.reload_config {
-		match load_config_into_sandbox(context) {
+		match load_config_into_sandboxes(context) {
 			Ok(()) => debug!("prompter: reloaded config from {:?}", context.config_path),
 			Err(e) => error!("prompter: error reloading config: {}", e),
 		}
@@ -1381,20 +1412,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}));
 
 	let config_watcher = watch_config_file(&context.config_path)?;
-	load_config_into_sandbox(context)?;
+	load_config_into_sandboxes(context)?;
 	let config_reload_thread = thread::spawn(move || config_reload_thread(context, config_watcher));
-
-	// TODO: also load config into this
-	context.path_res_sandbox.update_mounts_from_list([(
-		OsStr::new("/"),
-		ManagedMountPoint {
-			host_path: CString::new("/").unwrap(),
-			attrs: MountAttributes {
-				readonly: true,
-				noexec: true,
-			},
-		},
-	)])?;
 
 	let program = &cli.command[0];
 	let args = &cli.command[1..];
