@@ -944,6 +944,14 @@ fn tracing_thread(context: &'static Context) {
 								debug!("skipping /");
 								continue;
 							}
+							let abspath_sandbox = match rwxp.target.realpath() {
+								Ok(path) => path,
+								Err(e) => {
+									check_req_valid!();
+									error!("error reading link for {} in sandbox: {}", rwxp, e);
+									break;
+								}
+							};
 							let mut add_symlinks = false;
 							let mut add_placeholder = false;
 							let mut add_mount = false;
@@ -978,25 +986,14 @@ fn tracing_thread(context: &'static Context) {
 								}
 								Ok(false) => {
 									check_req_valid!();
-									// If the target is, or sits under, a path
-									// configured with `ignore: true`, pass the
-									// whole syscall through unmediated rather
-									// than prompting or denying.  We match on the
-									// full target path (its leaf), not the parent
-									// that dir-ops like mkdir / unlink resolve
-									// `abspath` to, so an ignore rule on the entry
-									// being created/removed also matches.
-									// Coverage was checked first, so a mount on an
-									// ignored path still serves the access it
-									// grants; only what it does not cover is
-									// passed through.
+									// If the target is, or sits under, a path configured with
+									// `ignore: true`, don't do anything.  For on-directory
+									// operations like create, we match on the full target path
+									// including the leaf to be created, so that ignore rules can be
+									// specific to target files.
 									let ignore_paths = context.ignore_paths.lock().unwrap();
-									let ignored = !ignore_paths.is_empty() && {
-										let target = t_local.realpath().unwrap_or_else(|_| {
-											OsStr::from_bytes(abspath.as_bytes()).to_owned()
-										});
-										path_is_ignored(&ignore_paths, target.as_bytes())
-									};
+									let ignored =
+										path_is_ignored(&ignore_paths, abspath_sandbox.as_bytes());
 									drop(ignore_paths);
 									if ignored {
 										debug!(
