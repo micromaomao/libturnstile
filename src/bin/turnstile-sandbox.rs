@@ -1437,20 +1437,31 @@ fn main() {
 		std::process::exit(1);
 	});
 	let mut prompter = cli.prompter.clone();
+	let mut qt_prompter_memfd = -1;
 	if cli.qt_prompter {
-		let memfd = unsafe { libc::memfd_create(c"qt_prompter/main.py".as_ptr(), 0) };
-		if memfd < 0 {
-			eprintln!(
-				"Unable to create memfd for qt prompter: {}",
-				io::Error::last_os_error()
+		unsafe {
+			qt_prompter_memfd = libc::memfd_create(
+				c"qt_prompter/main.py".as_ptr(),
+				libc::MFD_ALLOW_SEALING | libc::MFD_EXEC,
 			);
-			std::process::exit(1);
+			if qt_prompter_memfd < 0 && libc::__errno_location().read() == libc::EINVAL {
+				// no MFD_EXEC?
+				qt_prompter_memfd =
+					libc::memfd_create(c"qt_prompter/main.py".as_ptr(), libc::MFD_ALLOW_SEALING);
+			}
+			if qt_prompter_memfd < 0 {
+				eprintln!(
+					"Unable to create memfd for qt prompter: {}",
+					io::Error::last_os_error()
+				);
+				std::process::exit(1);
+			}
 		}
 		let mut write_pos = 0;
 		while write_pos < QT_PROMPTER_SCRIPT.len() {
 			let written = unsafe {
 				libc::write(
-					memfd,
+					qt_prompter_memfd,
 					QT_PROMPTER_SCRIPT[write_pos..].as_ptr() as *const libc::c_void,
 					QT_PROMPTER_SCRIPT.len() - write_pos,
 				)
@@ -1465,10 +1476,20 @@ fn main() {
 			write_pos += written as usize;
 		}
 		unsafe {
-			libc::lseek(memfd, 0, libc::SEEK_SET);
+			let res = libc::fcntl(
+				qt_prompter_memfd,
+				libc::F_ADD_SEALS,
+				libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+			);
+			if res < 0 {
+				eprintln!(
+					"Unable to seal qt prompter memfd: {}",
+					io::Error::last_os_error()
+				);
+				std::process::exit(1);
+			}
 		}
-		// deliberately "forget" about this fd.
-		prompter = Some(format!("/proc/self/fd/{}", memfd));
+		prompter = Some(format!("/proc/self/fd/{}", qt_prompter_memfd));
 	}
 
 	let context: &'static Context = Box::leak(Box::new(Context {
@@ -1507,11 +1528,20 @@ fn main() {
 	let mut cmd = Command::new(program);
 	cmd.args(args);
 	unsafe {
+		if qt_prompter_memfd >= 0 {
+			cmd.pre_exec(move || {
+				if libc::close(qt_prompter_memfd) < 0 {
+					Err(io::Error::last_os_error())
+				} else {
+					Ok(())
+				}
+			});
+		}
 		cmd.pre_exec(|| {
 			context
 				.tracer
 				.install_filters(true)
-				.map_err(|e| io::ErrorKind::Other.into())
+				.map_err(|_| io::ErrorKind::Other.into())
 		});
 	}
 	let tracing_thread = thread::spawn(move || tracing_thread(context));
