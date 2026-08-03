@@ -1387,6 +1387,7 @@ impl BindMountSandbox {
 	/// process contains more than one threads.
 	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, true) };
+		// TODO: getcwd, then translate into sandbox path
 		restrict_self_impl(nsenter_fn, None).map_err(BindMountSandboxError::RestrictSelf)
 	}
 
@@ -1403,6 +1404,7 @@ impl BindMountSandbox {
 		};
 		let new_cwd_cstr = std::ffi::CString::new(new_cwd.as_os_str().as_encoded_bytes())
 			.expect("current directory path contains NUL byte");
+		// todo: translate new_cwd_cstr into sandbox path
 		self.create_placeholder_hierarchy(&new_cwd_cstr, true)?;
 		unsafe {
 			let nsenter_fn = self.namespaces.nsenter_fn(true, true, true, true);

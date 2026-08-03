@@ -953,6 +953,25 @@ fn tracing_thread(context: &'static Context) {
 							// mount with sufficient permissions, or if it is a
 							// resolve-only request and the path is covered by a
 							// placeholder.
+							//
+							// TODO: this currently only cares about the absolute path of the
+							// target, but really if the sandboxed program used a symlink to reach
+							// the target, we should enforce that that symlink has to be covered too
+							// (either with a mount or placeholder).  Currently we auto-creates it.
+							//
+							// Probably we should just get rid of create_symlinks_for_user_path, and
+							// create a method on BindMountSandbox that's like a more complete
+							// version of "check_covered" / "has_placeholder" that replicates the
+							// path resolution logic to get the last "uncovered" target (either the
+							// symlink, its target, or its target's target, etc until we get the
+							// final one), and returns
+							// enum {
+							//   CoveredBy(ManagedTreeEntry),
+							//   MissingSymlink(OsString),
+							//   MissingTarget(OsString),
+							// }
+							// it then needs to be passed the original sandbox path, and no_follow: bool
+							// or maybe just takes the FsTarget
 							let cover = check_covered_or_placeholder(
 								&context.sandbox,
 								&abspath,
