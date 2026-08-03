@@ -1,15 +1,14 @@
 use std::{
 	collections::VecDeque,
 	ffi::{CStr, CString, OsStr, OsString},
-	fmt::write,
 	io::{self, Write},
 	os::{
 		fd::{AsRawFd, BorrowedFd},
 		unix::{ffi::OsStrExt, process::CommandExt},
 	},
 	path::{Path, PathBuf},
-	process::{Command, ExitStatus},
-	sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
+	process::Command,
+	sync::{Mutex, OnceLock, atomic::AtomicBool},
 	thread::{self, sleep},
 	time::Duration,
 };
@@ -17,10 +16,9 @@ use std::{
 use clap::Parser;
 use inotify::{EventMask, Inotify, WatchMask};
 use libturnstile::{
-	AccessRequestError, BindMountSandbox, BindMountSandboxError, CommonPlaceholderData,
-	ManagedBindMountSandbox, ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry,
-	MountAttributes, PlaceholderDirData, PlaceholderFileData, PlaceholderSymlinkData,
-	RequestContext, TracerOptions, TurnstileTracer,
+	AccessRequestError, BindMountSandboxError, CommonPlaceholderData, ManagedBindMountSandbox,
+	ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry, MountAttributes, PlaceholderDirData,
+	PlaceholderFileData, PlaceholderSymlinkData, RequestContext, TracerOptions, TurnstileTracer,
 	access::{
 		AccessRequest, Operation,
 		fs::{ForeignFd, FsOperation, FsTarget, RwxPermission},
@@ -29,7 +27,7 @@ use libturnstile::{
 };
 use log::{debug, error, info};
 
-use crate::common::{ProcPidFd, handle_child_result};
+use crate::common::ProcPidFd;
 use crate::config::Config;
 use crate::prompter::{Action, PrompterRequest, PrompterResponse, run_prompter};
 
@@ -596,10 +594,13 @@ fn load_config_into_sandboxes(context: &Context) -> Result<(), Box<dyn std::erro
 		match ent {
 			ManagedTreeEntry::BindMount(ManagedMountPoint { host_path, .. }) => {
 				if host_path.to_bytes() != sb_path.as_bytes() {
-					path_res_entries.push((sb_path, ManagedTreeEntry::BindMount(ManagedMountPoint {
-						host_path: host_path.clone(),
-						attrs: MountAttributes::rwx(),
-					})));
+					path_res_entries.push((
+						sb_path,
+						ManagedTreeEntry::BindMount(ManagedMountPoint {
+							host_path: host_path.clone(),
+							attrs: MountAttributes::rwx(),
+						}),
+					));
 				}
 			}
 			ManagedTreeEntry::Placeholder(_) => {}
