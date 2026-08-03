@@ -43,9 +43,21 @@ rules:
   /run/systemd/userdb: rw
   $HOME/.local/share/gvfs-metadata: r
   /etc/ca-certificates/trust-source: rwx
-  $HOME/.config: rx
   $HOME/.local/share/applications: rx
   $HOME/.local/share/flatpak: rx
   /var/lib/flatpak/exports/share/applications: rx
-  $HOME/Downloads: rw
+  $HOME/Downloads:
+    permissions: rw
+    ignore: true
   $HOME/.cache: rw
+  $HOME/.local/share:
+    ignore: true
+  $HOME/.config/dconf: r
+  $HOME/.config/gtk-3.0: r
+  $HOME/.config/user-dirs.dirs: r
+  $HOME/.config/mimeapps.list: r
+  $HOME/.config/pulse: r
+  $HOME/.config:
+    ignore: true
+  $HOME/.local/share:
+    ignore: true
