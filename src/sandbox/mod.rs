@@ -1398,6 +1398,14 @@ impl BindMountSandbox {
 		&self,
 		cmd: &mut std::process::Command,
 	) -> Result<std::process::Child, BindMountSandboxError> {
+		unsafe { self.run_command_with_post_restrict(cmd, || Ok(())) }
+	}
+
+	pub unsafe fn run_command_with_post_restrict(
+		&self,
+		cmd: &mut std::process::Command,
+		post_restrict: impl FnMut() -> Result<(), io::Error> + Send + Sync + 'static,
+	) -> Result<std::process::Child, BindMountSandboxError> {
 		let new_cwd = match cmd.get_current_dir() {
 			Some(path) => Cow::Borrowed(path),
 			None => Cow::Owned(std::env::current_dir().map_err(BindMountSandboxError::Getcwd)?),
@@ -1408,7 +1416,8 @@ impl BindMountSandbox {
 		self.create_placeholder_hierarchy(&new_cwd_cstr, true)?;
 		unsafe {
 			let nsenter_fn = self.namespaces.nsenter_fn(true, true, true, true);
-			cmd.pre_exec(move || restrict_self_impl(&nsenter_fn, Some(&new_cwd_cstr)))
+			cmd.pre_exec(move || restrict_self_impl(&nsenter_fn, Some(&new_cwd_cstr)));
+			cmd.pre_exec(post_restrict);
 		};
 		let child = cmd.spawn().map_err(BindMountSandboxError::Spawn)?;
 		Ok(child)
@@ -2897,6 +2906,17 @@ impl ManagedBindMountSandbox {
 		cmd: &mut std::process::Command,
 	) -> Result<std::process::Child, BindMountSandboxError> {
 		self.sandbox.run_command(cmd)
+	}
+
+	pub unsafe fn run_command_with_post_restrict(
+		&self,
+		cmd: &mut std::process::Command,
+		post_restrict: impl FnMut() -> Result<(), io::Error> + Send + Sync + 'static,
+	) -> Result<std::process::Child, BindMountSandboxError> {
+		unsafe {
+			self.sandbox
+				.run_command_with_post_restrict(cmd, post_restrict)
+		}
 	}
 
 	pub fn root_in_sandbox(&self) -> Result<ForeignFd, BindMountSandboxError> {

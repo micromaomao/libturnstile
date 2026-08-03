@@ -1527,6 +1527,32 @@ fn main() {
 	let args = &cli.command[1..];
 	let mut cmd = Command::new(program);
 	cmd.args(args);
+	let mut self_fds = Vec::new();
+	for elem in std::fs::read_dir("/proc/self/fd")
+		.map_err(|e| {
+			eprintln!("Unable to read /proc/self/fd: {}", e);
+			std::process::exit(1);
+		})
+		.unwrap()
+	{
+		let elem = elem
+			.map_err(|e| {
+				eprintln!("Unable to read /proc/self/fd entry: {}", e);
+				std::process::exit(1);
+			})
+			.unwrap();
+		let fd_str = elem.file_name();
+		if let Ok(fd) = fd_str.to_string_lossy().parse::<i32>() {
+			self_fds.push(fd);
+		} else {
+			eprintln!(
+				"Unable to parse integer from /proc/self/fd entry: {:?}",
+				fd_str
+			);
+			std::process::exit(1);
+		}
+	}
+	let self_fds = &*Box::leak(self_fds.into_boxed_slice());
 	unsafe {
 		if qt_prompter_memfd >= 0 {
 			cmd.pre_exec(move || {
@@ -1545,7 +1571,21 @@ fn main() {
 		});
 	}
 	let tracing_thread = thread::spawn(move || tracing_thread(context));
-	let res = context.sandbox.run_command(&mut cmd);
+	let res = unsafe {
+		context
+			.sandbox
+			.run_command_with_post_restrict(&mut cmd, || {
+				// Close off all fds that might have been inherited from us.
+				for &fd in &self_fds[..] {
+					if fd > 2 {
+						if libc::close(fd) < 0 {
+							return Err(io::Error::last_os_error());
+						}
+					}
+				}
+				Ok(())
+			})
+	};
 	context.tracer.close_child_sock();
 	let mut res = match res {
 		Ok(child) => child,
