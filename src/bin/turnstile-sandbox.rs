@@ -1022,7 +1022,7 @@ fn tracing_thread(context: &'static Context) {
 									// /tmp/real_tmp, a write at /tmp/aa shows up as a
 									// denial at /tmp/aa, not /tmp/real_tmp/aa.
 									let d = denials.get_mut_or_insert(
-										OsStr::from_bytes(abspath.as_bytes()),
+										OsStr::from_bytes(abspath_sandbox.as_bytes()),
 										DenialLogNode::default,
 									);
 									d.need_read |= rwxp.read || rwxp.chdir;
