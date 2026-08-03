@@ -52,7 +52,7 @@ struct Cli {
 
 	/// If set, the sandbox will log denials in the form of a policy yaml,
 	/// but always allow the operation to continue.  This is mutually
-	/// exclusive with `--prompter`.
+	/// exclusive with `--prompter` and `--qt-prompter`.
 	#[arg(long = "permissive")]
 	permissive: bool,
 
@@ -61,14 +61,22 @@ struct Cli {
 	/// expected to accept as input a JSON object, and output a JSON
 	/// object.  See src/bin/prompter.rs for the object's specification,
 	/// and an example implementation at `prompter/main.py`.  This is
-	/// mutually exclusive with `--permissive`.
+	/// mutually exclusive with `--permissive` and `--qt-prompter`.
 	#[arg(long = "prompter")]
 	prompter: Option<String>,
+
+	/// If set, on access denials the sandbox will launch a built-in, Python and
+	/// Qt-based prompter.  Mutually exclusive with `--permissive` and
+	/// `--prompter`.  Requires host Python to have pyside6 and pyyaml.
+	#[arg(long = "qt-prompter")]
+	qt_prompter: bool,
 
 	/// Program to run and its arguments
 	#[arg(required = true)]
 	command: Vec<OsString>,
 }
+
+const QT_PROMPTER_SCRIPT: &[u8] = include_bytes!("../../prompter/main.py");
 
 #[derive(Debug, Default)]
 struct DenialLogNode {
@@ -89,13 +97,7 @@ struct Context {
 	pidfd: OnceLock<ProcPidFd>,
 	should_exit: AtomicBool,
 	permissive: bool,
-	/// If set, on otherwise-denied access requests the sandbox launches
-	/// this program and lets it decide what to do.  See
-	/// [`prompter`](crate::prompter).  Mutually exclusive with
-	/// `permissive`.
 	prompter: Option<String>,
-	/// Path to the config file, forwarded to the prompter and used when
-	/// it requests a config reload.
 	config_path: PathBuf,
 	/// Expanded sandbox paths marked `ignore: true` in the config.  Any
 	/// request whose resolved path equals or sits under one of these is
@@ -1381,8 +1383,13 @@ fn main() {
 
 	let cli = Cli::parse();
 
-	if cli.permissive && cli.prompter.is_some() {
-		eprintln!("--permissive and --prompter are mutually exclusive");
+	if [cli.permissive, cli.prompter.is_some(), cli.qt_prompter]
+		.into_iter()
+		.filter(|&b| b)
+		.count()
+		> 1
+	{
+		eprintln!("--permissive, --prompter, and --qt-prompter are mutually exclusive");
 		std::process::exit(1);
 	}
 
@@ -1394,6 +1401,40 @@ fn main() {
 		eprintln!("Unable to create path resolution sandbox: {}", e);
 		std::process::exit(1);
 	});
+	let mut prompter = cli.prompter.clone();
+	if cli.qt_prompter {
+		let memfd = unsafe { libc::memfd_create(c"qt_prompter/main.py".as_ptr(), 0) };
+		if memfd < 0 {
+			eprintln!(
+				"Unable to create memfd for qt prompter: {}",
+				io::Error::last_os_error()
+			);
+			std::process::exit(1);
+		}
+		let mut write_pos = 0;
+		while write_pos < QT_PROMPTER_SCRIPT.len() {
+			let written = unsafe {
+				libc::write(
+					memfd,
+					QT_PROMPTER_SCRIPT[write_pos..].as_ptr() as *const libc::c_void,
+					QT_PROMPTER_SCRIPT.len() - write_pos,
+				)
+			};
+			if written < 0 {
+				eprintln!(
+					"Unable to write qt prompter to memfd: {}",
+					io::Error::last_os_error()
+				);
+				std::process::exit(1);
+			}
+			write_pos += written as usize;
+		}
+		unsafe {
+			libc::lseek(memfd, 0, libc::SEEK_SET);
+		}
+		// deliberately "forget" about this fd.
+		prompter = Some(format!("/proc/self/fd/{}", memfd));
+	}
 
 	let context: &'static Context = Box::leak(Box::new(Context {
 		sandbox,
@@ -1405,7 +1446,7 @@ fn main() {
 		pidfd: OnceLock::new(),
 		should_exit: AtomicBool::new(false),
 		permissive: cli.permissive,
-		prompter: cli.prompter.clone(),
+		prompter,
 		config_path: cli.config.clone(),
 		ignore_paths: Mutex::new(Vec::new()),
 		sandbox_cmd: cli
