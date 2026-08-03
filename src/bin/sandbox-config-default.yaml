@@ -9,3 +9,7 @@ rules:
   /dev/zero: rw
   /dev/urandom: rw
   /proc: rx
+  /dev/tty:
+    ignore: true
+  /dev/pts:
+    ignore: true
