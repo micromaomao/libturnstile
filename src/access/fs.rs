@@ -23,11 +23,8 @@ use smallvec::{SmallVec, smallvec};
 
 use log::{debug, error, warn};
 
-/// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
-/// refers to a path in the traced process's filesystem namespace.
-///
-/// The fd is closed automatically on drop.  Cloning uses `F_DUPFD_CLOEXEC`
-/// so the duplicate always has the close-on-exec flag set.
+/// An owned fd reference that automatically closes on drop, and duplicates on
+/// clone with F_DUPFD_CLOEXEC.
 #[derive(Debug)]
 pub struct ForeignFd {
 	pub(crate) local_fd: libc::c_int,
@@ -57,6 +54,7 @@ impl ForeignFd {
 		Ok(Self { local_fd })
 	}
 
+	/// Opens a path with O_PATH | O_CLOEXEC.
 	pub(crate) fn from_path<P: AsRef<CStr>>(path: P) -> Result<Self, io::Error> {
 		Self::from_path_with_flags(path, libc::O_PATH | libc::O_CLOEXEC)
 	}
@@ -212,7 +210,8 @@ impl Clone for ForeignFd {
 #[derive(Debug, Clone)]
 pub struct FsTarget {
 	/// The base fd of the target, which may be the root of the process
-	/// being traced if the path is absolute.
+	/// being traced if the path is absolute.  This fd is always O_PATH |
+	/// O_CLOEXEC.
 	pub(crate) dfd: ForeignFd,
 
 	/// The path as originally passed by the traced process, except with
@@ -430,7 +429,7 @@ impl FsTarget {
 			if dfd_path == b"/" {
 				// Don't check inode identity if the dfd is the root.
 				unsafe {
-					let cloned_fd = libc::dup(root);
+					let cloned_fd = libc::fcntl(root, libc::F_DUPFD_CLOEXEC, 0);
 					if cloned_fd < 0 {
 						return Err(io::Error::last_os_error());
 					}
