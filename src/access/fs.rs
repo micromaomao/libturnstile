@@ -23,11 +23,8 @@ use smallvec::{SmallVec, smallvec};
 
 use log::{debug, error, warn};
 
-/// An O_PATH / O_CLOEXEC file descriptor opened in the tracer process that
-/// refers to a path in the traced process's filesystem namespace.
-///
-/// The fd is closed automatically on drop.  Cloning uses `F_DUPFD_CLOEXEC`
-/// so the duplicate always has the close-on-exec flag set.
+/// An owned fd reference that automatically closes on drop, and duplicates on
+/// clone with F_DUPFD_CLOEXEC.
 #[derive(Debug)]
 pub struct ForeignFd {
 	pub(crate) local_fd: libc::c_int,
@@ -213,7 +210,8 @@ impl Clone for ForeignFd {
 #[derive(Debug, Clone)]
 pub struct FsTarget {
 	/// The base fd of the target, which may be the root of the process
-	/// being traced if the path is absolute.
+	/// being traced if the path is absolute.  This fd is always O_PATH |
+	/// O_CLOEXEC.
 	pub(crate) dfd: ForeignFd,
 
 	/// The path as originally passed by the traced process, except with
