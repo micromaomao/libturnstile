@@ -1,15 +1,14 @@
 use std::{
 	collections::VecDeque,
 	ffi::{CStr, CString, OsStr, OsString},
-	fmt::write,
 	io::{self, Write},
 	os::{
 		fd::{AsRawFd, BorrowedFd},
 		unix::{ffi::OsStrExt, process::CommandExt},
 	},
 	path::{Path, PathBuf},
-	process::{Command, ExitStatus},
-	sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
+	process::Command,
+	sync::{Mutex, OnceLock, atomic::AtomicBool},
 	thread::{self, sleep},
 	time::Duration,
 };
@@ -17,10 +16,9 @@ use std::{
 use clap::Parser;
 use inotify::{EventMask, Inotify, WatchMask};
 use libturnstile::{
-	AccessRequestError, BindMountSandbox, BindMountSandboxError, CommonPlaceholderData,
-	ManagedBindMountSandbox, ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry,
-	MountAttributes, PlaceholderDirData, PlaceholderFileData, PlaceholderSymlinkData,
-	RequestContext, TracerOptions, TurnstileTracer,
+	AccessRequestError, BindMountSandboxError, CommonPlaceholderData, ManagedBindMountSandbox,
+	ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry, MountAttributes, PlaceholderDirData,
+	PlaceholderFileData, PlaceholderSymlinkData, RequestContext, TracerOptions, TurnstileTracer,
 	access::{
 		AccessRequest, Operation,
 		fs::{ForeignFd, FsOperation, FsTarget, RwxPermission},
@@ -29,7 +27,7 @@ use libturnstile::{
 };
 use log::{debug, error, info};
 
-use crate::common::{ProcPidFd, handle_child_result};
+use crate::common::ProcPidFd;
 use crate::config::Config;
 use crate::prompter::{Action, PrompterRequest, PrompterResponse, run_prompter};
 
@@ -52,9 +50,14 @@ struct Cli {
 	#[arg(required = true)]
 	config: PathBuf,
 
+	/// If set, and if the config file provided either does not exist or is
+	/// empty, a default config will be written to the file.
+	#[arg(long = "default-config")]
+	default_config: bool,
+
 	/// If set, the sandbox will log denials in the form of a policy yaml,
 	/// but always allow the operation to continue.  This is mutually
-	/// exclusive with `--prompter`.
+	/// exclusive with `--prompter` and `--qt-prompter`.
 	#[arg(long = "permissive")]
 	permissive: bool,
 
@@ -63,13 +66,45 @@ struct Cli {
 	/// expected to accept as input a JSON object, and output a JSON
 	/// object.  See src/bin/prompter.rs for the object's specification,
 	/// and an example implementation at `prompter/main.py`.  This is
-	/// mutually exclusive with `--permissive`.
+	/// mutually exclusive with `--permissive` and `--qt-prompter`.
 	#[arg(long = "prompter")]
 	prompter: Option<String>,
+
+	/// If set, on access denials the sandbox will launch a built-in, Python and
+	/// Qt-based prompter.  Mutually exclusive with `--permissive` and
+	/// `--prompter`.  Requires host Python to have pyside6 and pyyaml.
+	#[arg(long = "qt-prompter")]
+	qt_prompter: bool,
 
 	/// Program to run and its arguments
 	#[arg(required = true)]
 	command: Vec<OsString>,
+}
+
+const QT_PROMPTER_SCRIPT: &[u8] = include_bytes!("../../prompter/main.py");
+const DEFAULT_CONFIG: &[u8] = include_bytes!("sandbox-config-default.yaml");
+
+fn write_default_config_if_empty(path: &Path) -> io::Result<()> {
+	// Don't require write permission if the config exists.  Therefore we only
+	// open if len is 0 or not exist.
+	let len = match std::fs::metadata(path) {
+		Ok(meta) => meta.len(),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+		Err(e) => return Err(e),
+	};
+	if len > 0 {
+		return Ok(());
+	}
+	let mut file = std::fs::OpenOptions::new()
+		.create(true)
+		.write(true)
+		.truncate(false)
+		.open(path)?;
+	// Check again for good measure (this is still not race-free)
+	if file.metadata()?.len() == 0 {
+		file.write_all(DEFAULT_CONFIG)?;
+	}
+	Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -91,13 +126,7 @@ struct Context {
 	pidfd: OnceLock<ProcPidFd>,
 	should_exit: AtomicBool,
 	permissive: bool,
-	/// If set, on otherwise-denied access requests the sandbox launches
-	/// this program and lets it decide what to do.  See
-	/// [`prompter`](crate::prompter).  Mutually exclusive with
-	/// `permissive`.
 	prompter: Option<String>,
-	/// Path to the config file, forwarded to the prompter and used when
-	/// it requests a config reload.
 	config_path: PathBuf,
 	/// Expanded sandbox paths marked `ignore: true` in the config.  Any
 	/// request whose resolved path equals or sits under one of these is
@@ -596,10 +625,13 @@ fn load_config_into_sandboxes(context: &Context) -> Result<(), Box<dyn std::erro
 		match ent {
 			ManagedTreeEntry::BindMount(ManagedMountPoint { host_path, .. }) => {
 				if host_path.to_bytes() != sb_path.as_bytes() {
-					path_res_entries.push((sb_path, ManagedTreeEntry::BindMount(ManagedMountPoint {
-						host_path: host_path.clone(),
-						attrs: MountAttributes::rwx(),
-					})));
+					path_res_entries.push((
+						sb_path,
+						ManagedTreeEntry::BindMount(ManagedMountPoint {
+							host_path: host_path.clone(),
+							attrs: MountAttributes::rwx(),
+						}),
+					));
 				}
 			}
 			ManagedTreeEntry::Placeholder(_) => {}
@@ -1380,9 +1412,20 @@ fn main() {
 
 	let cli = Cli::parse();
 
-	if cli.permissive && cli.prompter.is_some() {
-		eprintln!("--permissive and --prompter are mutually exclusive");
+	if [cli.permissive, cli.prompter.is_some(), cli.qt_prompter]
+		.into_iter()
+		.filter(|&b| b)
+		.count()
+		> 1
+	{
+		eprintln!("--permissive, --prompter, and --qt-prompter are mutually exclusive");
 		std::process::exit(1);
+	}
+	if cli.default_config {
+		write_default_config_if_empty(&cli.config).unwrap_or_else(|e| {
+			eprintln!("Unable to write default config: {}", e);
+			std::process::exit(1);
+		});
 	}
 
 	let sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns).unwrap_or_else(|e| {
@@ -1393,6 +1436,61 @@ fn main() {
 		eprintln!("Unable to create path resolution sandbox: {}", e);
 		std::process::exit(1);
 	});
+	let mut prompter = cli.prompter.clone();
+	let mut qt_prompter_memfd = -1;
+	if cli.qt_prompter {
+		unsafe {
+			qt_prompter_memfd = libc::memfd_create(
+				c"qt_prompter/main.py".as_ptr(),
+				libc::MFD_ALLOW_SEALING | libc::MFD_EXEC,
+			);
+			if qt_prompter_memfd < 0 && libc::__errno_location().read() == libc::EINVAL {
+				// no MFD_EXEC?
+				qt_prompter_memfd =
+					libc::memfd_create(c"qt_prompter/main.py".as_ptr(), libc::MFD_ALLOW_SEALING);
+			}
+			if qt_prompter_memfd < 0 {
+				eprintln!(
+					"Unable to create memfd for qt prompter: {}",
+					io::Error::last_os_error()
+				);
+				std::process::exit(1);
+			}
+		}
+		let mut write_pos = 0;
+		while write_pos < QT_PROMPTER_SCRIPT.len() {
+			let written = unsafe {
+				libc::write(
+					qt_prompter_memfd,
+					QT_PROMPTER_SCRIPT[write_pos..].as_ptr() as *const libc::c_void,
+					QT_PROMPTER_SCRIPT.len() - write_pos,
+				)
+			};
+			if written < 0 {
+				eprintln!(
+					"Unable to write qt prompter to memfd: {}",
+					io::Error::last_os_error()
+				);
+				std::process::exit(1);
+			}
+			write_pos += written as usize;
+		}
+		unsafe {
+			let res = libc::fcntl(
+				qt_prompter_memfd,
+				libc::F_ADD_SEALS,
+				libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+			);
+			if res < 0 {
+				eprintln!(
+					"Unable to seal qt prompter memfd: {}",
+					io::Error::last_os_error()
+				);
+				std::process::exit(1);
+			}
+		}
+		prompter = Some(format!("/proc/self/fd/{}", qt_prompter_memfd));
+	}
 
 	let context: &'static Context = Box::leak(Box::new(Context {
 		sandbox,
@@ -1404,7 +1502,7 @@ fn main() {
 		pidfd: OnceLock::new(),
 		should_exit: AtomicBool::new(false),
 		permissive: cli.permissive,
-		prompter: cli.prompter.clone(),
+		prompter,
 		config_path: cli.config.clone(),
 		ignore_paths: Mutex::new(Vec::new()),
 		sandbox_cmd: cli
@@ -1430,11 +1528,20 @@ fn main() {
 	let mut cmd = Command::new(program);
 	cmd.args(args);
 	unsafe {
+		if qt_prompter_memfd >= 0 {
+			cmd.pre_exec(move || {
+				if libc::close(qt_prompter_memfd) < 0 {
+					Err(io::Error::last_os_error())
+				} else {
+					Ok(())
+				}
+			});
+		}
 		cmd.pre_exec(|| {
 			context
 				.tracer
 				.install_filters(true)
-				.map_err(|e| io::ErrorKind::Other.into())
+				.map_err(|_| io::ErrorKind::Other.into())
 		});
 	}
 	let tracing_thread = thread::spawn(move || tracing_thread(context));
@@ -1479,9 +1586,38 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-	use super::{create_missing_redirect_target, path_is_ignored};
+	use super::{
+		DEFAULT_CONFIG, create_missing_redirect_target, path_is_ignored,
+		write_default_config_if_empty,
+	};
 	use std::ffi::CString;
 	use std::os::unix::ffi::OsStrExt;
+
+	#[test]
+	fn writes_default_config_only_for_missing_or_empty_files() {
+		let tmp = std::env::temp_dir().join(format!(
+			"turnstile-default-config-test-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+
+		let missing = tmp.join("missing.yaml");
+		write_default_config_if_empty(&missing).unwrap();
+		assert_eq!(std::fs::read(&missing).unwrap(), DEFAULT_CONFIG);
+
+		let empty = tmp.join("empty.yaml");
+		std::fs::write(&empty, "").unwrap();
+		write_default_config_if_empty(&empty).unwrap();
+		assert_eq!(std::fs::read(&empty).unwrap(), DEFAULT_CONFIG);
+
+		let existing = tmp.join("existing.yaml");
+		std::fs::write(&existing, "rules: {}\n").unwrap();
+		write_default_config_if_empty(&existing).unwrap();
+		assert_eq!(std::fs::read(&existing).unwrap(), b"rules: {}\n");
+
+		std::fs::remove_dir_all(&tmp).unwrap();
+	}
 
 	#[test]
 	fn ignore_exact_and_descendants() {
