@@ -66,7 +66,7 @@ pub fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 	msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
 	msg.msg_controllen = CMSG_SPACE as libc::size_t;
 
-	let ret = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+	let ret = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
 	if ret < 0 {
 		return Err(std::io::Error::last_os_error());
 	}

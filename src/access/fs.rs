@@ -57,6 +57,7 @@ impl ForeignFd {
 		Ok(Self { local_fd })
 	}
 
+	/// Opens a path with O_PATH | O_CLOEXEC.
 	pub(crate) fn from_path<P: AsRef<CStr>>(path: P) -> Result<Self, io::Error> {
 		Self::from_path_with_flags(path, libc::O_PATH | libc::O_CLOEXEC)
 	}
@@ -430,7 +431,7 @@ impl FsTarget {
 			if dfd_path == b"/" {
 				// Don't check inode identity if the dfd is the root.
 				unsafe {
-					let cloned_fd = libc::dup(root);
+					let cloned_fd = libc::fcntl(root, libc::F_DUPFD_CLOEXEC, 0);
 					if cloned_fd < 0 {
 						return Err(io::Error::last_os_error());
 					}

@@ -23,8 +23,8 @@ impl MountObj {
 	/// supervisor's credentials.
 	pub fn new_tmpfs_mode(mode: Option<&std::ffi::CStr>) -> io::Result<Self> {
 		unsafe {
-			// libc::FSOPEN_CLOEXEC does not exist yet
-			let fs = libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), 0) as libc::c_int;
+			let fs = libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), libc::FSOPEN_CLOEXEC)
+				as libc::c_int;
 			if fs < 0 {
 				let err = perror!("fsopen(tmpfs)");
 				return Err(io::Error::from_raw_os_error(err));
@@ -83,8 +83,7 @@ impl MountObj {
 				libc::close(fs);
 				return Err(io::Error::from_raw_os_error(err));
 			}
-			// libc::FSMOUNT_CLOEXEC does not exist yet
-			let mnt = libc::syscall(libc::SYS_fsmount, fs, 0, 0) as libc::c_int;
+			let mnt = libc::syscall(libc::SYS_fsmount, fs, libc::FSMOUNT_CLOEXEC, 0) as libc::c_int;
 			if mnt < 0 {
 				let err = perror!("fsmount");
 				libc::close(fs);
