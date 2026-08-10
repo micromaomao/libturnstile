@@ -2965,6 +2965,70 @@ mod tests {
 			.map(|e| e.root.as_bytes().to_vec())
 	}
 
+	#[test]
+	fn placeholder_backing_is_writable_beneath_readonly_root() {
+		let Some(sb) = try_new_sandbox() else {
+			return;
+		};
+
+		let backing_id = sb
+			.placeholder_tmpfs
+			.0
+			.inode_id()
+			.expect("stat writable placeholder backing");
+		let backing_mnt_id = sb
+			.placeholder_tmpfs
+			.0
+			.mnt_id()
+			.expect("stat writable placeholder mount");
+		let visible_root = sb.root_in_sandbox().expect("open visible sandbox root");
+		assert_eq!(
+			visible_root.inode_id().expect("stat visible root"),
+			backing_id
+		);
+		assert_ne!(
+			visible_root.mnt_id().expect("stat visible root mount"),
+			backing_mnt_id
+		);
+
+		sb.create_placeholder_hierarchy(c"/backing-write-test", false)
+			.expect("create file through writable backing fd");
+
+		let mut openhow: libc::open_how = unsafe { mem::zeroed() };
+		openhow.flags = (libc::O_WRONLY | libc::O_CLOEXEC) as u64;
+		openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+		match sb.open_in_m1(c"/backing-write-test", &openhow) {
+			Err(BindMountSandboxError::OpenInM1Failed(errno)) => {
+				assert_eq!(errno, libc::EROFS)
+			}
+			other => panic!("visible placeholder should reject writes with EROFS: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn recursive_host_root_bind_excludes_m1_placeholder() {
+		let Some(sb) = try_new_sandbox() else {
+			return;
+		};
+		let host_root_id = sb.host_root_fd.inode_id().expect("stat saved host root");
+		let placeholder_id = sb
+			.placeholder_tmpfs
+			.0
+			.inode_id()
+			.expect("stat placeholder root");
+
+		sb.mount_host_into_sandbox_impl(c"/", c"/", MountAttributes::ro(), false, false, false)
+			.expect("recursively bind host root");
+
+		let mounted_root_id = sb
+			.root_in_sandbox()
+			.expect("open mounted host root")
+			.inode_id()
+			.expect("stat mounted host root");
+		assert_eq!(mounted_root_id, host_root_id);
+		assert_ne!(mounted_root_id, placeholder_id);
+	}
+
 	/// Exercise `read_m1_mountinfo` + `park_to_scratch` +
 	/// `restore_from_scratch`: a mount parked into the hidden scratch
 	/// tmpfs disappears from its original mountpoint, and restoring it
