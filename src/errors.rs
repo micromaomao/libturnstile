@@ -85,8 +85,6 @@ pub enum BindMountSandboxError {
 	RestrictSelf(#[source] std::io::Error),
 	#[error("failed to spawn child process: {0}")]
 	Spawn(#[source] std::io::Error),
-	#[error("Failed to make detached tmpfs mount: errno {0}")]
-	MakeDetachedTmpfsMountFailed(libc::c_int),
 	#[error("Failed to receive mount object fd from child: {0}")]
 	ReceiveMountFd(std::io::Error),
 	#[error("Failed to open root in sandbox namespace: errno {0}")]
@@ -127,6 +125,8 @@ pub enum BindMountSandboxError {
 	UnmountFailed(libc::c_int),
 	#[error("Failed to set up scratch tmpfs in sandbox: errno {0}")]
 	SetupScratchFailed(libc::c_int),
+	#[error("Failed to set up placeholder tmpfs in sandbox: errno {0}")]
+	SetupPlaceholderTmpfsFailed(libc::c_int),
 	#[error("Failed to park mount to scratch: errno {0}")]
 	ParkToScratchFailed(libc::c_int),
 	#[error("Failed to restore mount from scratch: errno {0}")]

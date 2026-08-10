@@ -180,21 +180,25 @@ impl std::fmt::Display for MountAttributes {
 /// Implements a basic bind-mount based sandbox.
 #[derive(Debug)]
 pub struct BindMountSandbox {
+	/// fd references to namespaces
 	namespaces: ManagedNamespaces,
-	/// A fd to the placeholder tmpfs opened inside m0 (the outer mount
-	/// namespace).
-	root_tmpfs: MountObj,
 	/// O_PATH fd to the host "/" opened inside m0.  Used as the dirfd
 	/// when resolving caller-provided host paths so that the resulting fd
-	/// is associated with m0's mount namespace and is therefore
-	/// acceptable to `open_tree()` once the helper process enters m0.
+	/// is from m0 and is therefore acceptable to `open_tree()` in m0.
+	///
+	/// Because all host paths are mounted into the sandbox using
+	/// recursive bind, m0 should not mount any additional trees,
+	/// otherwise they will be mounted into the sandbox as well either at
+	/// mount time or through propagation.
 	host_root_fd: ForeignFd,
-	/// O_PATH fd to the scratch tmpfs root inside m1.  The scratch is a
-	/// separate tmpfs (distinct from `root_tmpfs`) that is first mounted
-	/// into m1, and then shadowed by mounting root_tmpfs on top, so the
-	/// sandboxed app never sees it.  It is used by
-	/// [`Self::park_to_scratch`] to temporarily park a mount, in order to
-	/// unmount a parent, before moving it back.
+	/// O_PATH fd to the read-write placeholder tmpfs mounted in m1.
+	placeholder_tmpfs: MountObj,
+	/// O_PATH fd to the scratch tmpfs mounted in m1.  The scratch is a
+	/// separate tmpfs (separate from the placeholder tmpfs) that is first
+	/// mounted into m1, and then shadowed by mounting the placeholder
+	/// rootfs readonly on top, so the sandboxed app never sees it.  It is
+	/// used by [`Self::park_to_scratch`] to temporarily park a mount, in
+	/// order to unmount a parent, before moving it back.
 	m1_scratch_fd: ForeignFd,
 }
 
@@ -351,21 +355,12 @@ unsafe fn send_fd_from_ns<
 impl BindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
 		let namespaces = ManagedNamespaces::new(disable_userns)?;
-		let root_tmpfs = unsafe {
-			let nsenter_fn = namespaces.nsenter_fn(true, true, false, false);
-			MountObj::new_from_fd(send_fd_from_ns(
-				nsenter_fn,
-				|| MountObj::new_tmpfs().map(IntoRawFd::into_raw_fd),
-				BindMountSandboxError::MakeDetachedTmpfsMountFailed,
-			)?)
-		};
-		// Open a fd to "/" from inside m0 so that subsequent host path
-		// lookups can be performed relative to it, yielding fds that are
-		// already associated with m0's mount namespace.
+		// Store a m0 fd to "/" for easy use later without needing to
+		// enter m0 again.
 		let host_root_fd = unsafe {
-			let nsenter_fn = namespaces.nsenter_fn(true, true, false, false);
+			let nsenter_m0 = namespaces.nsenter_fn(true, true, false, false);
 			let raw_fd = send_fd_from_ns(
-				nsenter_fn,
+				nsenter_m0,
 				|| {
 					let fd = libc::open(
 						c"/".as_ptr(),
@@ -381,19 +376,16 @@ impl BindMountSandbox {
 			)?;
 			ForeignFd { local_fd: raw_fd }
 		};
+
+		// Enter u0 then m1 directly
+		let nsenter_m1 = unsafe { namespaces.nsenter_fn(true, false, true, false) };
+
 		// Create the scratch tmpfs inside m1 and make it m1's root, then
-		// capture an O_PATH handle to it.  This happens before the
-		// root_tmpfs bind below, so the scratch ends up shadowed beneath
-		// the placeholder tmpfs and is invisible to the app.
+		// capture an O_PATH handle to it.
 		let m1_scratch_fd = unsafe {
-			// Enter the first user namespace (where the outside uid is
-			// mapped to root) and then m1.
-			let nsenter_fn = namespaces.nsenter_fn(true, false, true, false);
 			let raw_fd = send_fd_from_ns(
-				nsenter_fn,
+				&nsenter_m1,
 				|| {
-					// fsmount a brand-new tmpfs (distinct from root_tmpfs),
-					// move_mount it onto "/" of m1, and return its fd.
 					let scratch = MountObj::new_tmpfs()?;
 					scratch.mount(libc::AT_FDCWD, c"/", false)?;
 					Ok(scratch.into_raw_fd())
@@ -402,25 +394,54 @@ impl BindMountSandbox {
 			)?;
 			ForeignFd { local_fd: raw_fd }
 		};
-		let s = Self {
+
+		// Create the placeholder tmpfs inside m1 and mount it on "/".
+		let placeholder_tmpfs = unsafe {
+			let raw_fd = send_fd_from_ns(
+				&nsenter_m1,
+				|| {
+					let placeholder = MountObj::new_tmpfs()?;
+					placeholder.mount(libc::AT_FDCWD, c"/", false)?;
+					Ok(placeholder.into_raw_fd())
+				},
+				BindMountSandboxError::SetupPlaceholderTmpfsFailed,
+			)?;
+			MountObj::new_from_fd(raw_fd)
+		};
+
+		// Clone the placeholder as a new ro bind mount, then mount it on
+		// "/" again in m1.
+		let errno = unsafe {
+			fork_wait(|| {
+				if let Err(e) = nsenter_m1() {
+					return e.raw_os_error().unwrap_or(libc::EIO);
+				}
+				let visible_placeholder = match MountObj::new_bind(
+					placeholder_tmpfs.0.as_raw_fd(),
+					c"",
+					MountAttributes::ro(),
+					false,
+				) {
+					Ok(mount) => mount,
+					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
+				};
+				match visible_placeholder.mount(libc::AT_FDCWD, c"/", false) {
+					Ok(()) => 0,
+					Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
+				}
+			})
+		}
+		.map_err(BindMountSandboxError::ForkError)?;
+		if errno != 0 {
+			return Err(BindMountSandboxError::SetupPlaceholderTmpfsFailed(errno));
+		}
+
+		Ok(Self {
 			namespaces,
-			root_tmpfs,
 			host_root_fd,
 			m1_scratch_fd,
-		};
-		// Bind-mount root_tmpfs over m1's "/", shadowing the scratch.
-		s.mount_host_into_sandbox_impl(
-			CStr::from_bytes_with_nul(
-				format!("/proc/self/fd/{}\0", s.root_tmpfs.0.as_raw_fd()).as_bytes(),
-			)
-			.unwrap(),
-			c"/",
-			MountAttributes::ro(),
-			true,
-			false,
-			true,
-		)?;
-		Ok(s)
+			placeholder_tmpfs,
+		})
 	}
 
 	/// Create either a file or directory at the given absolute path
@@ -439,7 +460,7 @@ impl BindMountSandbox {
 	) -> Result<ForeignFd, BindMountSandboxError> {
 		validate_sandbox_path(path)?;
 
-		let mut fd = self.root_tmpfs.0.clone();
+		let mut fd = self.placeholder_tmpfs.0.clone();
 		let components = path
 			.to_bytes()
 			.split(|&b| b == b'/')
@@ -528,7 +549,7 @@ impl BindMountSandbox {
 				libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_XDEV;
 			let fd = libc::syscall(
 				libc::SYS_openat2,
-				self.root_tmpfs.0.as_raw_fd(),
+				self.placeholder_tmpfs.0.as_raw_fd(),
 				parent_path.as_ptr(),
 				&openhow as *const _,
 				std::mem::size_of::<libc::open_how>(),
@@ -859,8 +880,13 @@ impl BindMountSandbox {
 	) -> Result<ForeignFd, BindMountSandboxError> {
 		let (parent, _) = split_parent_leaf(sandbox_path);
 		if parent.as_c_str() == c"/" {
-			let dup =
-				unsafe { libc::fcntl(self.root_tmpfs.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+			let dup = unsafe {
+				libc::fcntl(
+					self.placeholder_tmpfs.0.as_raw_fd(),
+					libc::F_DUPFD_CLOEXEC,
+					0,
+				)
+			};
 			if dup < 0 {
 				return Err(BindMountSandboxError::ResolveSandboxPath(
 					io::Error::last_os_error(),
@@ -876,7 +902,7 @@ impl BindMountSandbox {
 				libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_XDEV;
 			let fd = libc::syscall(
 				libc::SYS_openat2,
-				self.root_tmpfs.0.as_raw_fd(),
+				self.placeholder_tmpfs.0.as_raw_fd(),
 				parent.as_ptr(),
 				&openhow as *const _,
 				std::mem::size_of::<libc::open_how>(),

@@ -8,6 +8,8 @@ use log::{debug, error};
 use smallvec::SmallVec;
 use std::{ffi::OsStr, io, os::fd::AsRawFd, thread};
 
+/// A struct that holds 4 namespaces: u0, m0, m1, u1, in this order.  u0
+/// and u1 are user namespaces, m0 and m1 are mount namespaces.
 #[derive(Debug)]
 pub(crate) struct ManagedNamespaces {
 	pub l0_user: ForeignFd,
