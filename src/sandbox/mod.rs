@@ -2931,7 +2931,7 @@ impl ManagedBindMountSandbox {
 }
 
 #[cfg(test)]
-mod sandbox_integration_tests {
+mod tests {
 	use super::*;
 
 	/// Try to create a low-level sandbox.  Nested user namespaces are
