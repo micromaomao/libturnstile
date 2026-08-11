@@ -1026,7 +1026,8 @@ pub enum FsOperation {
 	FsRemoveXattr(RemoveXattrOperation),
 	UnixConnect(FsTarget),
 	UnixBind(UnixBindOperation),
-	UnixSendto(FsTarget),
+	/// sendto(), sendmsg() or sendmmsg()
+	UnixSendto(Vec<FsTarget>),
 }
 
 #[cfg_attr(feature = "serialize", derive(Serialize))]
@@ -1217,7 +1218,13 @@ impl std::fmt::Display for FsOperation {
 				write!(f, "bind unix:{}", target)?;
 			}
 			Self::UnixSendto(target) => {
-				write!(f, "sendto unix:{}", target)?;
+				write!(f, "sendto ")?;
+				for (i, t) in target.iter().enumerate() {
+					if i > 0 {
+						write!(f, ",")?;
+					}
+					write!(f, "unix:{}", t)?;
+				}
 			}
 		}
 		Ok(())
@@ -1333,7 +1340,11 @@ impl FsOperation {
 				smallvec![make_rwx!(target.clone(), read, write)]
 			}
 			Self::UnixSendto(target) => {
-				smallvec![make_rwx!(target.clone(), read, write)]
+				let mut perms = SmallVec::new();
+				for t in target {
+					perms.push(make_rwx!(t.clone(), read, write));
+				}
+				perms
 			}
 		}
 	}

@@ -278,15 +278,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 						.map(|r| r.trim_ascii().escape_ascii().to_string())
 						.unwrap_or_else(|_| String::from("???"));
 					let write_res = if cli.rwx {
-						match &rwxp[..] {
-							[p] => writeln!(output, "{}[{}] {}", comm, pid, p),
-							[p1, p2] => {
-								writeln!(output, "{}[{}] {}; {}", comm, pid, p1, p2)
+						let mut r = write!(output, "{}[{}] ", comm, pid);
+						if r.is_ok() {
+							for (i, p) in rwxp.iter().enumerate() {
+								if i > 0 {
+									r = write!(output, "; ");
+									if r.is_err() {
+										break;
+									}
+								}
+								r = write!(output, "{}", p);
+								if r.is_err() {
+									break;
+								}
 							}
-							_ => panic!(
-								"unexpected number of permissions returned by as_rwx_permissions()"
-							),
 						}
+						if r.is_ok() {
+							r = writeln!(output, "");
+						}
+						r
 					} else {
 						writeln!(output, "{}[{}] {}", comm, pid, fs_op)
 					};

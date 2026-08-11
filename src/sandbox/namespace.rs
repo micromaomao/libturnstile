@@ -2,7 +2,7 @@ use super::{ENABLE_LOG_IN_FORK, write_to_path};
 use crate::{
 	BindMountSandboxError,
 	access::fs::ForeignFd,
-	utils::{fork_wait, unix_recv_fd, unix_send_fd},
+	utils::{fork_wait, initialize_unix_send_fd_msghdr, unix_recv_fd, unix_send_fd},
 };
 use log::{debug, error};
 use smallvec::SmallVec;
@@ -20,6 +20,7 @@ pub(crate) struct ManagedNamespaces {
 
 impl ManagedNamespaces {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
+		initialize_unix_send_fd_msghdr();
 		// These functions are always successful
 		let uid = unsafe { libc::getuid() };
 		let gid = unsafe { libc::getgid() };
