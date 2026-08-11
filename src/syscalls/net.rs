@@ -1,6 +1,6 @@
 use std::mem::{MaybeUninit, offset_of};
 
-use libseccomp::ScmpFilterContext;
+use libseccomp::{ScmpArgCompare, ScmpFilterContext};
 
 use crate::{
 	AccessRequestError, TurnstileTracerError,
@@ -9,6 +9,7 @@ use crate::{
 		fs::{FsOperation, FsTarget, UnixBindOperation},
 	},
 	syscalls::{RequestContext, lazy_syscall_table_name_to_number},
+	utils::initialize_unix_send_fd_msghdr,
 };
 
 /// (name, handler, addr arg index, addrlen arg index).
@@ -31,15 +32,21 @@ lazy_syscall_table_name_to_number!(
 	u8
 );
 
+/// (name, handler, msghdr arg index for sendmsg)
 const SENDMSG_LIKE_HANDLERS: &[(
 	&str,
 	fn(&mut RequestContext) -> Result<Vec<FsTarget>, AccessRequestError>,
-)] = &[("sendmsg", handle_sendmsg), ("sendmmsg", handle_sendmmsg)];
+	Option<u8>,
+)] = &[
+	("sendmsg", handle_sendmsg, Some(1)),
+	("sendmmsg", handle_sendmmsg, None),
+];
 
 lazy_syscall_table_name_to_number!(
 	SENDMSG_LIKE_HANDLERS,
 	sendmsg_like_syscalls_table,
-	fn(&mut RequestContext) -> Result<Vec<FsTarget>, AccessRequestError>
+	fn(&mut RequestContext) -> Result<Vec<FsTarget>, AccessRequestError>,
+	Option<u8>
 );
 
 /// Try to read a Unix socket path from a sockaddr pointer in the target
@@ -166,10 +173,27 @@ pub(crate) fn add_filter_rules(
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 
-	for &(sys, ..) in sendmsg_like_syscalls_table() {
-		filter_ctx
-			.add_rule(libseccomp::ScmpAction::Notify, sys)
-			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	// Hacky way to avoid notify on the sendmsg performed by our
+	// unix_send_fd.
+	let special_msghdr_ptr = initialize_unix_send_fd_msghdr();
+	for &(sys, _, msghdr_arg) in sendmsg_like_syscalls_table() {
+		if let Some(arg_idx) = msghdr_arg {
+			filter_ctx
+				.add_rule_conditional(
+					libseccomp::ScmpAction::Notify,
+					sys,
+					&[ScmpArgCompare::new(
+						arg_idx.into(),
+						libseccomp::ScmpCompareOp::NotEqual,
+						special_msghdr_ptr as u64,
+					)],
+				)
+				.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+		} else {
+			filter_ctx
+				.add_rule(libseccomp::ScmpAction::Notify, sys)
+				.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+		}
 	}
 	Ok(())
 }
@@ -197,7 +221,7 @@ pub(crate) fn handle_notification<'a>(
 		return Ok(None);
 	}
 
-	for &(sys, handler) in sendmsg_like_syscalls_table() {
+	for &(sys, handler, _) in sendmsg_like_syscalls_table() {
 		if syscall != sys {
 			continue;
 		}

@@ -1,10 +1,67 @@
+use std::{ptr, sync::Mutex};
+
 use log::{debug, error};
+use rand::RngExt;
 
 #[cfg(feature = "serialize")]
 use serde::{Deserialize, Serialize};
 
+static mut UNIX_SEND_FD_MSGHDR_RANDOM_PTR: *mut libc::msghdr = ptr::null_mut();
+static UNIX_SEND_FD_MSGHDR_RANDOM_PTR_INITIALIZATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// This function can be safely called more than once.  Initializes the
+/// msghdr random pointer and returns its value.
+pub fn initialize_unix_send_fd_msghdr() -> *mut libc::msghdr {
+	let _lock = UNIX_SEND_FD_MSGHDR_RANDOM_PTR_INITIALIZATION_LOCK
+		.lock()
+		.unwrap();
+	if !unsafe { UNIX_SEND_FD_MSGHDR_RANDOM_PTR.is_null() } {
+		return unsafe { UNIX_SEND_FD_MSGHDR_RANDOM_PTR };
+	}
+	// Allocate a page specifically for the "msghdr" argument of the
+	// sendmsg() syscall we will issue from unix_send_fd.  This page will
+	// have an address that is completely random to avoid any accidental
+	// collisions with addresses used by any traced process.
+	let mut rng = rand::rng();
+	let page_size = page_size::get();
+	loop {
+		#[cfg(target_pointer_width = "64")]
+		let max = 0x0000_7fff_f000_0000usize;
+		#[cfg(target_pointer_width = "32")]
+		let max = 0x7f00_0000usize;
+		let page_addr = rng.random_range(0x10000usize..=max) & !(page_size - 1);
+		let page = unsafe {
+			let ret = libc::mmap(
+				page_addr as *mut libc::c_void,
+				page_size,
+				libc::PROT_READ | libc::PROT_WRITE,
+				libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+				-1,
+				0,
+			);
+			if ret == libc::MAP_FAILED {
+				let err = std::io::Error::last_os_error();
+				error!("mmap failed to allocate page for msghdr: {}", err);
+				continue;
+			}
+			ret as *mut u8
+		};
+		let align = std::mem::align_of::<libc::msghdr>();
+		let max_off = page_size - std::mem::size_of::<libc::msghdr>();
+		let off = rng.random_range(0usize..=(max_off / align)) * align;
+		let msghdr_ptr = unsafe { page.add(off) as *mut libc::msghdr };
+		debug!(
+			"Initialized UNIX_SEND_FD_MSGHDR_RANDOM_PTR to {:p}",
+			msghdr_ptr
+		);
+		unsafe { UNIX_SEND_FD_MSGHDR_RANDOM_PTR = msghdr_ptr };
+		return msghdr_ptr;
+	}
+}
+
 /// Send a file descriptor to another process via a Unix socket using
-/// SCM_RIGHTS.  This function can safely be used in pre_exec context
+/// SCM_RIGHTS. This function can safely be used in pre_exec context after
+/// [`initialize_unix_send_fd_msghdr`] has been called in the parent process.
 pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
 	assert!(sock >= 0);
 	// Use a [u64] buffer to ensure 8-byte alignment required by cmsghdr.
@@ -18,6 +75,18 @@ pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Resul
 		iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
 		iov_len: 1,
 	};
+
+	let msghdr_ptr = unsafe { UNIX_SEND_FD_MSGHDR_RANDOM_PTR };
+	assert!(!msghdr_ptr.is_null());
+	let msghdr_byte_ptr = msghdr_ptr as *mut u8;
+	for boff in 0..std::mem::size_of::<libc::msghdr>() {
+		if unsafe { msghdr_byte_ptr.add(boff).read_volatile() } != 0 {
+			panic!(
+				"UNIX_SEND_FD_MSGHDR_RANDOM_PTR contains non-zero byte at offset {} - used concurrently from another thread?",
+				boff
+			);
+		}
+	}
 
 	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
 	msg.msg_iov = &mut iov;
@@ -40,7 +109,12 @@ pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Resul
 		std::ptr::write_unaligned(fd_data, fd);
 	}
 
-	let ret = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
+	unsafe { msghdr_ptr.write_volatile(msg) };
+
+	let ret = unsafe { libc::sendmsg(sock, msghdr_ptr, libc::MSG_NOSIGNAL) };
+	unsafe {
+		msghdr_ptr.write_volatile(std::mem::zeroed());
+	}
 	if ret < 0 {
 		return Err(std::io::Error::last_os_error());
 	}
