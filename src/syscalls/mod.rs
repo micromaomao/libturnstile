@@ -296,11 +296,13 @@ impl<'a> RequestContext<'a> {
 	}
 
 	/// Reads the `fd_arg_index+1`-th syscall argument and opens it as a
-	/// `ForeignFd` via `/proc/{pid}/...`.  Does error checking and
-	/// handles AT_FDCWD.
+	/// [`ForeignFd`] via `/proc/{pid}/...`.  AT_FDCWD is handled
+	/// transparently by opening /proc/{pid}/cwd instead.  After acquiring
+	/// the fd, the seccomp request is validated before returning the
+	/// result.
 	pub fn arg_to_fd(&mut self, fd_arg_index: usize) -> Result<ForeignFd, AccessRequestError> {
 		let fd = self.arg(fd_arg_index) as libc::c_int;
-		if fd == libc::AT_FDCWD {
+		let res = if fd == libc::AT_FDCWD {
 			let path = format!("/proc/{}/cwd\0", self.sreq.pid);
 			ForeignFd::from_path(CStr::from_bytes_with_nul(path.as_bytes()).unwrap())
 				.map_err(|e| AccessRequestError::OpenFd(path, e))
@@ -310,7 +312,11 @@ impl<'a> RequestContext<'a> {
 				.map_err(|e| AccessRequestError::OpenFd(path, e))
 		} else {
 			Err(AccessRequestError::InvalidSyscallData("fd invalid"))
+		};
+		if !self.still_valid()? {
+			return Err(AccessRequestError::RequestNoLongerValid);
 		}
+		res
 	}
 
 	fn read_target_memory_partial(

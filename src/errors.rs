@@ -3,6 +3,7 @@ use std::ffi::CString;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum TurnstileTracerError {
 	#[error("seccomp_init : {0}")]
 	Init(#[source] libseccomp::error::SeccompError),
@@ -34,6 +35,7 @@ pub enum TurnstileTracerError {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum AccessRequestError {
 	#[error("seccomp_notify_receive: {0}")]
 	NotifyReceive(libseccomp::error::SeccompError),
@@ -61,11 +63,14 @@ pub enum AccessRequestError {
 	AddFd(std::io::Error),
 	#[error("attempted to respond to a notification that was already answered")]
 	NotificationAlreadyAnswered,
+	#[error("seccomp-unotify request is no longer valid")]
+	RequestNoLongerValid,
 	#[error("failed to upgrade or proxy fd for request: {0}")]
 	FdUpgrade(#[source] Box<BindMountSandboxError>),
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum BindMountSandboxError {
 	#[error("Failed to set up tracer: {0}")]
 	TurnstileTracerError(#[from] TurnstileTracerError),
