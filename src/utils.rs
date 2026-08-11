@@ -24,6 +24,7 @@ pub fn initialize_unix_send_fd_msghdr() -> *mut libc::msghdr {
 	// collisions with addresses used by any traced process.
 	let mut rng = rand::rng();
 	let page_size = page_size::get();
+	let mut num_attempts = 0;
 	loop {
 		#[cfg(target_pointer_width = "64")]
 		let max = 0x0000_7fff_f000_0000usize;
@@ -42,6 +43,13 @@ pub fn initialize_unix_send_fd_msghdr() -> *mut libc::msghdr {
 			if ret == libc::MAP_FAILED {
 				let err = std::io::Error::last_os_error();
 				error!("mmap failed to allocate page for msghdr: {}", err);
+				num_attempts += 1;
+				if num_attempts > 10 {
+					error!(
+						"Failed to allocate page for msghdr after 10 attempts: {}",
+						err
+					);
+				}
 				continue;
 			}
 			ret as *mut u8
