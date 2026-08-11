@@ -3,6 +3,7 @@ use std::ffi::CString;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum TurnstileTracerError {
 	#[error("seccomp_init : {0}")]
 	Init(#[source] libseccomp::error::SeccompError),
@@ -34,6 +35,7 @@ pub enum TurnstileTracerError {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum AccessRequestError {
 	#[error("seccomp_notify_receive: {0}")]
 	NotifyReceive(libseccomp::error::SeccompError),
@@ -68,6 +70,7 @@ pub enum AccessRequestError {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum BindMountSandboxError {
 	#[error("Failed to set up tracer: {0}")]
 	TurnstileTracerError(#[from] TurnstileTracerError),
