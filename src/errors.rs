@@ -61,6 +61,8 @@ pub enum AccessRequestError {
 	AddFd(std::io::Error),
 	#[error("attempted to respond to a notification that was already answered")]
 	NotificationAlreadyAnswered,
+	#[error("seccomp-unotify request is no longer valid")]
+	RequestNoLongerValid,
 	#[error("failed to upgrade or proxy fd for request: {0}")]
 	FdUpgrade(#[source] Box<BindMountSandboxError>),
 }
