@@ -65,6 +65,9 @@ fn read_sockaddr_un(
 	if addrlen < OFFSET_PATH + 1 {
 		return Ok(None);
 	}
+	if addrlen > 0x1000 {
+		return Err(AccessRequestError::InvalidSyscallData("addrlen too large"));
+	}
 
 	let mut buf: Vec<u8> = Vec::with_capacity(addrlen + 1);
 	req.read_target_memory(addr_ptr, &mut buf.spare_capacity_mut()[..addrlen])?;
