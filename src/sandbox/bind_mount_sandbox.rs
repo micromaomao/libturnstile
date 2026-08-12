@@ -348,16 +348,15 @@ impl BindMountSandbox {
 		Ok(ForeignFd { local_fd: host_fd })
 	}
 
-	// todo: the semantic of follow_ns_symlinks is ill-defined due to use
-	// of create_hierarchy, which has no visibility into bind-mounted
-	// symlinks
+	// Note: there is no "sandbox-side equivalent" to
+	// follow_host_symlinks, since we use create_hierarchy, which has no
+	// visibility into bind-mounted symlinks
 	pub(super) fn mount_host_into_sandbox_impl(
 		&self,
 		host_path: &CStr,
 		ns_path: &CStr,
 		attrs: MountAttributes,
 		follow_host_symlinks: bool,
-		follow_ns_symlinks: bool,
 		create_placeholders: bool,
 	) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(ns_path)?;
@@ -411,7 +410,7 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
-				match source_tree.mount(libc::AT_FDCWD, ns_path, follow_ns_symlinks) {
+				match source_tree.mount(libc::AT_FDCWD, ns_path, false) {
 					Ok(()) => (),
 					Err(e) => {
 						return e.raw_os_error().unwrap_or(libc::EIO);
@@ -459,8 +458,7 @@ impl BindMountSandbox {
 		child_ns_paths: &[CString],
 	) -> Result<(), BindMountSandboxError> {
 		if child_ns_paths.is_empty() {
-			return self
-				.mount_host_into_sandbox_impl(host_path, ns_path, attrs, false, false, false);
+			return self.mount_host_into_sandbox_impl(host_path, ns_path, attrs, false, false);
 		}
 		validate_sandbox_path(ns_path)?;
 

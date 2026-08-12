@@ -59,7 +59,6 @@ pub struct MountBuilder<'a, 'b> {
 	pub(super) sandbox_path: &'a CStr,
 	pub(super) attrs: MountAttributes,
 	pub(super) follow_host_symlinks: bool,
-	// follow_sandbox_symlinks: bool,
 	pub(super) sandbox: &'b BindMountSandbox,
 }
 
@@ -78,11 +77,6 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 		self
 	}
 
-	// pub fn follow_sandbox_symlinks(&mut self, follow: bool) -> &mut Self {
-	// 	self.follow_sandbox_symlinks = follow;
-	// 	self
-	// }
-
 	pub fn mount(self) -> Result<(), BindMountSandboxError> {
 		self.sandbox
 			.mount_host_into_sandbox_impl(
@@ -90,8 +84,6 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 				self.sandbox_path,
 				self.attrs,
 				self.follow_host_symlinks,
-				// self.follow_sandbox_symlinks,
-				false,
 				true,
 			)
 			.map(|_| ())

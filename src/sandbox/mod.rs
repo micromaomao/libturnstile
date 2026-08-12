@@ -60,15 +60,8 @@ mod sandbox_integration_tests {
 		let Some(sb) = try_new_sandbox() else {
 			return;
 		};
-		sb.mount_host_into_sandbox_impl(
-			c"/etc",
-			c"/etc",
-			MountAttributes::ro(),
-			false,
-			false,
-			true,
-		)
-		.expect("mount /etc");
+		sb.mount_host_into_sandbox_impl(c"/etc", c"/etc", MountAttributes::ro(), false, true)
+			.expect("mount /etc");
 
 		let before = sb.read_m1_mountinfo().expect("read mountinfo");
 		assert!(
@@ -105,19 +98,12 @@ mod sandbox_integration_tests {
 			return;
 		};
 		// Parent bind: /etc at /p (creates the /p placeholder).
-		sb.mount_host_into_sandbox_impl(c"/etc", c"/p", MountAttributes::ro(), false, false, true)
+		sb.mount_host_into_sandbox_impl(c"/etc", c"/p", MountAttributes::ro(), false, true)
 			.expect("mount parent /p");
 		// Child bind: /etc at /p/ssl (mountpoint /etc/ssl exists through the
 		// /p bind; also creates a /p/ssl placeholder on the revealed layer).
-		sb.mount_host_into_sandbox_impl(
-			c"/etc",
-			c"/p/ssl",
-			MountAttributes::ro(),
-			false,
-			false,
-			true,
-		)
-		.expect("mount child /p/ssl");
+		sb.mount_host_into_sandbox_impl(c"/etc", c"/p/ssl", MountAttributes::ro(), false, true)
+			.expect("mount child /p/ssl");
 
 		let before = sb.read_m1_mountinfo().expect("read mountinfo");
 		assert!(
