@@ -13,6 +13,8 @@ use std::thread;
 
 use log::{debug, error, info};
 
+use super::SandboxOptions;
+
 use crate::{
 	BindMountSandboxError,
 	access::fs::ForeignFd,
@@ -85,8 +87,8 @@ pub struct BindMountSandbox {
 }
 
 impl BindMountSandbox {
-	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
-		let namespaces = ManagedNamespaces::new(disable_userns)?;
+	pub fn new(options: SandboxOptions) -> Result<Self, BindMountSandboxError> {
+		let namespaces = ManagedNamespaces::new(options.disable_userns)?;
 		// Store a m0 fd to "/" for easy use later without needing to
 		// enter m0 again.
 		let host_root_fd = unsafe {

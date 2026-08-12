@@ -16,6 +16,7 @@ use crate::{
 	access::fs::ForeignFd,
 	fstree::FsTree,
 	sandbox::{
+		SandboxOptions,
 		bind_mount_sandbox::BindMountSandbox,
 		mount_attributes::MountAttributes,
 		placeholders::{
@@ -290,9 +291,9 @@ pub struct ManagedBindMountSandbox {
 }
 
 impl ManagedBindMountSandbox {
-	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
+	pub fn new(options: SandboxOptions) -> Result<Self, BindMountSandboxError> {
 		Ok(Self {
-			sandbox: BindMountSandbox::new(disable_userns)?,
+			sandbox: BindMountSandbox::new(options)?,
 			current_policy: Mutex::new(FsTree::new()),
 			current_placeholder_tree: Mutex::new(FsTree::new()),
 			current_mount_tree: Mutex::new(FsTree::new()),

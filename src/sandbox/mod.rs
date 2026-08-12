@@ -9,6 +9,21 @@ mod placeholders;
 mod upgrade;
 mod utils;
 
+/// Options for [`BindMountSandbox::new`] and [`ManagedBindMountSandbox::new`].
+#[derive(Debug, Clone)]
+pub struct SandboxOptions {
+	/// Block further user namespaces creation within the sandbox.
+	pub disable_userns: bool,
+}
+
+impl Default for SandboxOptions {
+	fn default() -> Self {
+		Self {
+			disable_userns: false,
+		}
+	}
+}
+
 pub use bind_mount_sandbox::*;
 pub use managed_bind_mount_sandbox::*;
 pub use mount_attributes::*;
@@ -26,7 +41,7 @@ mod sandbox_integration_tests {
 	/// these privileged integration tests are a no-op where they can't
 	/// run but still exercise the m1 mount logic where they can.
 	fn try_new_sandbox() -> Option<BindMountSandbox> {
-		match BindMountSandbox::new(false) {
+		match BindMountSandbox::new(SandboxOptions::default()) {
 			Ok(sb) => Some(sb),
 			Err(e) => {
 				eprintln!("skipping privileged sandbox test: setup failed: {e}");
@@ -139,7 +154,7 @@ mod sandbox_integration_tests {
 	/// (the `Removed` branch routes through `unmount_covering`).
 	#[test]
 	fn managed_remove_preserves_child_mount() {
-		let msb = match ManagedBindMountSandbox::new(false) {
+		let msb = match ManagedBindMountSandbox::new(SandboxOptions::default()) {
 			Ok(s) => s,
 			Err(e) => {
 				eprintln!("skipping privileged managed test: setup failed: {e}");
@@ -179,7 +194,7 @@ mod sandbox_integration_tests {
 	/// The mountpoint must survive and rebind to the new host source.
 	#[test]
 	fn managed_host_path_change_rebinds() {
-		let msb = match ManagedBindMountSandbox::new(false) {
+		let msb = match ManagedBindMountSandbox::new(SandboxOptions::default()) {
 			Ok(s) => s,
 			Err(e) => {
 				eprintln!("skipping privileged managed test: setup failed: {e}");
