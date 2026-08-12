@@ -55,6 +55,44 @@ mod sandbox_integration_tests {
 			.any(|e| e.mount_point.as_encoded_bytes() == mp)
 	}
 
+	fn mountinfo_mountpoint_id(raw: &[u8], mp: &[u8]) -> Option<u64> {
+		mountinfo::parse_mountinfo(raw)
+			.iter()
+			.find(|e| e.mount_point.as_encoded_bytes() == mp)
+			.map(|e| e.mnt_id)
+	}
+
+	#[test]
+	fn mount_and_unmount_root() {
+		let Some(sb) = try_new_sandbox() else {
+			return;
+		};
+		let before = sb.read_m1_mountinfo().expect("read mountinfo");
+		let root_before = mountinfo_mountpoint_id(&before, b"/").expect("sandbox root mount");
+
+		sb.mount_host_into_sandbox(c"/etc", c"/")
+			.mount()
+			.expect("mount /etc at /");
+		let mounted = sb
+			.read_m1_mountinfo()
+			.expect("read mountinfo after mounting root");
+		assert_ne!(
+			mountinfo_mountpoint_id(&mounted, b"/"),
+			Some(root_before),
+			"mounting at / should replace the visible root mount"
+		);
+
+		sb.unmount(c"/", false).expect("unmount /");
+		let unmounted = sb
+			.read_m1_mountinfo()
+			.expect("read mountinfo after unmounting root");
+		assert_eq!(
+			mountinfo_mountpoint_id(&unmounted, b"/"),
+			Some(root_before),
+			"unmounting / should reveal the original sandbox root"
+		);
+	}
+
 	/// Exercise `read_m1_mountinfo` + `park_to_scratch` +
 	/// `restore_from_scratch`: a mount parked into the hidden scratch
 	/// tmpfs disappears from its original mountpoint, and restoring it

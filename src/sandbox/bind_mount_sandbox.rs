@@ -87,6 +87,8 @@ pub struct BindMountSandbox {
 	/// used by [`Self::park_to_scratch`] to temporarily park a mount, in
 	/// order to unmount a parent, before moving it back.
 	m1_scratch_fd: ForeignFd,
+	/// O_PATH fd to the read-only placeholder tmpfs mounted in m1.
+	placeholder_tmpfs_ro: MountObj,
 }
 
 impl BindMountSandbox {
@@ -148,36 +150,30 @@ impl BindMountSandbox {
 
 		// Clone the placeholder as a new ro bind mount, then mount it on
 		// "/" again in m1.
-		let errno = unsafe {
-			fork_wait(|| {
-				if let Err(e) = nsenter_m1() {
-					return e.raw_os_error().unwrap_or(libc::EIO);
-				}
-				let visible_placeholder = match MountObj::new_bind(
-					placeholder_tmpfs.0.as_raw_fd(),
-					c"",
-					MountAttributes::ro(),
-					false,
-				) {
-					Ok(mount) => mount,
-					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
-				};
-				match visible_placeholder.mount(libc::AT_FDCWD, c"/", false) {
-					Ok(()) => 0,
-					Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
-				}
-			})
-		}
-		.map_err(BindMountSandboxError::ForkError)?;
-		if errno != 0 {
-			return Err(BindMountSandboxError::SetupPlaceholderTmpfsFailed(errno));
-		}
+		let placeholder_tmpfs_ro = unsafe {
+			let raw_fd = send_fd_from_ns(
+				&nsenter_m1,
+				|| {
+					let ro_bind = MountObj::new_bind(
+						placeholder_tmpfs.0.as_raw_fd(),
+						c"",
+						MountAttributes::ro(),
+						false,
+					)?;
+					ro_bind.mount(libc::AT_FDCWD, c"/", false)?;
+					Ok(ro_bind.into_raw_fd())
+				},
+				BindMountSandboxError::SetupPlaceholderTmpfsFailed,
+			)?;
+			MountObj::new_from_fd(raw_fd)
+		};
 
 		Ok(Self {
 			namespaces,
 			host_root_fd,
 			m1_scratch_fd,
 			placeholder_tmpfs,
+			placeholder_tmpfs_ro,
 		})
 	}
 
@@ -500,8 +496,8 @@ impl BindMountSandbox {
 		}
 	}
 
-	/// Unmount a bind mount at the given sandbox path.  The path must not
-	/// be "/".  The path must have been previously bind-mounted with
+	/// Unmount a bind mount at the given sandbox path.  The path must
+	/// have been previously bind-mounted with
 	/// [`Self::mount_host_into_sandbox`].
 	///
 	/// If `mnt_detach` is true, umount is called with `MNT_DETACH`.  This
@@ -512,13 +508,9 @@ impl BindMountSandbox {
 		mnt_detach: bool,
 	) -> Result<(), BindMountSandboxError> {
 		validate_sandbox_path(sandbox_path)?;
-		if sandbox_path.to_bytes() == b"/" {
-			return Err(BindMountSandboxError::InvalidSandboxPath(
-				"cannot unmount root",
-				sandbox_path.to_owned(),
-			));
-		}
 		let (parent_path, leaf) = split_parent_leaf(sandbox_path);
+		let is_root = sandbox_path == c"/";
+		let leaf = if is_root { c"/.." } else { leaf }; // See comment below
 
 		debug!(
 			"Umounting {:?} from sandbox (mnt_detach = {})",
@@ -540,20 +532,37 @@ impl BindMountSandbox {
 				let mut openhow: libc::open_how = mem::zeroed();
 				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY) as u64;
 				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
-				let parent_fd = libc::syscall(
-					libc::SYS_openat2,
-					libc::AT_FDCWD,
-					parent_path.as_ptr(),
-					&openhow as *const _,
-					std::mem::size_of::<libc::open_how>(),
-				) as libc::c_int;
-				if parent_fd < 0 {
-					return perror!("openat2(parent)");
-				}
-				let res = libc::fchdir(parent_fd);
-				libc::close(parent_fd);
-				if res != 0 {
-					return perror!("fchdir");
+				if !is_root {
+					let parent_fd = libc::syscall(
+						libc::SYS_openat2,
+						libc::AT_FDCWD,
+						parent_path.as_ptr(),
+						&openhow as *const _,
+						std::mem::size_of::<libc::open_how>(),
+					) as libc::c_int;
+					if parent_fd < 0 {
+						return perror!("openat2(parent)");
+					}
+					let res = libc::fchdir(parent_fd);
+					libc::close(parent_fd);
+					if res != 0 {
+						return perror!("fchdir");
+					}
+				} else {
+					// In order to unmount the "/" of the sandbox (for
+					// example, if a previous mount_host_into_sandbox call
+					// mounted something onto "/"), we cannot be within
+					// that "/".  Therefore, we chdir and chroot into the
+					// placeholder tmpfs ro bind, which will be below
+					// whatever's currently mounted above it, then use
+					// ".." (see follow_dotdot() and step_into()) to
+					// acquire the current "/".
+					if libc::fchdir(self.placeholder_tmpfs_ro.0.as_raw_fd()) != 0 {
+						return perror!("fchdir(placeholder root)");
+					}
+					if libc::chroot(c".".as_ptr()) != 0 {
+						return perror!("chroot(placeholder root)");
+					}
 				}
 				let mut flags = libc::UMOUNT_NOFOLLOW;
 				if mnt_detach {

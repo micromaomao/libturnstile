@@ -99,6 +99,29 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn test_split_parent_leaf() {
+		for (path, expected_parent, expected_leaf) in [
+			(c"/", c"/", c""),
+			(c"/leaf", c"/", c"leaf"),
+			(c"/parent/leaf", c"/parent", c"leaf"),
+			(c"/a/b/c", c"/a/b", c"c"),
+		] {
+			let (parent, leaf) = split_parent_leaf(path);
+			assert_eq!(parent.as_c_str(), expected_parent, "parent of {path:?}");
+			assert_eq!(leaf, expected_leaf, "leaf of {path:?}");
+		}
+	}
+
+	#[test]
+	fn test_split_parent_leaf_preserves_non_utf8_bytes() {
+		let path = CStr::from_bytes_with_nul(b"/parent/\xffleaf\0").unwrap();
+		let (parent, leaf) = split_parent_leaf(path);
+
+		assert_eq!(parent.as_c_str(), c"/parent");
+		assert_eq!(leaf.to_bytes(), b"\xffleaf");
+	}
+
+	#[test]
 	fn test_validate_sandbox_path() {
 		// Valid paths
 		assert!(validate_sandbox_path(c"/").is_ok());
