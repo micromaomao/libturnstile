@@ -644,9 +644,11 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// Open the absolute `path` inside m1 and u1, resolving through the
-	/// sandbox's mount layout.
-	pub(super) fn open_in_m1(
+	/// Open an absolute `path` within the sandbox.  The fd returned is
+	/// opened after joining the sandbox's user and mount namespaces.  The
+	/// fd returned is opened after joining the sandbox's user and mount
+	/// namespaces.
+	pub fn open_in_sandbox(
 		&self,
 		path: &CStr,
 		openhow: &libc::open_how,

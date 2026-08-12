@@ -509,7 +509,10 @@ impl ManagedBindMountSandbox {
 		o_path_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
 		o_path_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
 		if log::log_enabled!(log::Level::Debug) {
-			let ns_path_open = self.sandbox.open_in_m1(ns_path, &o_path_openhow).unwrap();
+			let ns_path_open = self
+				.sandbox
+				.open_in_sandbox(ns_path, &o_path_openhow)
+				.unwrap();
 			let mnt_id = ns_path_open.mnt_id().unwrap();
 			debug!(
 				"Mounting {:?} over {:?} (current mnt_id = {}) with {} children",
@@ -519,7 +522,7 @@ impl ManagedBindMountSandbox {
 				child_ns_paths.len()
 			);
 			for c in child_ns_paths {
-				let c_open = self.sandbox.open_in_m1(c, &o_path_openhow).unwrap();
+				let c_open = self.sandbox.open_in_sandbox(c, &o_path_openhow).unwrap();
 				let c_mnt_id = c_open.mnt_id().unwrap();
 				debug!("  will move child {:?} with mnt_id = {}", c, c_mnt_id)
 			}
@@ -640,7 +643,7 @@ impl ManagedBindMountSandbox {
 		);
 		if log::log_enabled!(log::Level::Debug) {
 			for c in child_ns_paths {
-				let c_open = self.sandbox.open_in_m1(c, &o_path_openhow).unwrap();
+				let c_open = self.sandbox.open_in_sandbox(c, &o_path_openhow).unwrap();
 				let c_mnt_id = c_open.mnt_id().unwrap();
 				debug!("  moved child {:?} now with mnt_id = {}", c, c_mnt_id)
 			}
@@ -1011,7 +1014,7 @@ impl ManagedBindMountSandbox {
 		let mut openhow: libc::open_how = unsafe { mem::zeroed() };
 		openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
 		openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
-		match self.sandbox.open_in_m1(ns_path, &openhow) {
+		match self.sandbox.open_in_sandbox(ns_path, &openhow) {
 			Ok(fd) => match fd.mnt_id() {
 				Ok(id) => id,
 				Err(e) => {
