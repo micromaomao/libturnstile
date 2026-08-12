@@ -1187,3 +1187,161 @@ impl ManagedBindMountSandbox {
 		self.sandbox.root_in_sandbox()
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::sandbox::mountinfo;
+
+	fn try_new_sandbox() -> Option<ManagedBindMountSandbox> {
+		match ManagedBindMountSandbox::new(SandboxOptions::default()) {
+			Ok(sandbox) => Some(sandbox),
+			Err(error) => {
+				eprintln!("skipping privileged managed test: setup failed: {error}");
+				None
+			}
+		}
+	}
+
+	fn mountinfo_has_mountpoint(raw: &[u8], mountpoint: &[u8]) -> bool {
+		mountinfo::parse_mountinfo(raw)
+			.iter()
+			.any(|entry| entry.mount_point.as_encoded_bytes() == mountpoint)
+	}
+
+	fn mountinfo_root_for(raw: &[u8], mountpoint: &[u8]) -> Option<Vec<u8>> {
+		mountinfo::parse_mountinfo(raw)
+			.iter()
+			.filter(|entry| entry.mount_point.as_encoded_bytes() == mountpoint)
+			.last()
+			.map(|entry| entry.root.as_bytes().to_vec())
+	}
+
+	/// Exercise `unmount_covering`: a parent mount with a child
+	/// sub-mount is unmounted while the child's `struct mount` identity is
+	/// preserved. Afterwards the parent is gone but the child
+	/// is restored on the revealed placeholder layer.
+	#[test]
+	fn unmount_covering_preserves_child() {
+		let Some(msb) = try_new_sandbox() else {
+			return;
+		};
+		msb.sandbox
+			.mount_host_into_sandbox_impl(c"/etc", c"/p", MountAttributes::ro(), false, true)
+			.expect("mount parent /p");
+		msb.sandbox
+			.mount_host_into_sandbox_impl(c"/etc", c"/p/ssl", MountAttributes::ro(), false, true)
+			.expect("mount child /p/ssl");
+
+		let before = msb.sandbox.read_m1_mountinfo().expect("read mountinfo");
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p"),
+			"/p should be mounted before unmount_covering"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p/ssl"),
+			"/p/ssl should be mounted before unmount_covering"
+		);
+
+		let unmounted = msb
+			.unmount_covering(c"/p", &[CString::new("/p/ssl").unwrap()])
+			.expect("unmount_covering /p");
+		assert!(
+			unmounted,
+			"/p should have been unmounted (nothing holds it)"
+		);
+
+		let after = msb
+			.sandbox
+			.read_m1_mountinfo()
+			.expect("read mountinfo after");
+		assert!(
+			!mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must be gone after unmount_covering"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p/ssl"),
+			"/p/ssl child mount must be preserved after unmount_covering"
+		);
+	}
+
+	/// End-to-end check through the managed reconcile API: removing a
+	/// parent mount that has a still-desired child preserves the child
+	/// (the `Removed` branch routes through `unmount_covering`).
+	#[test]
+	fn managed_remove_preserves_child_mount() {
+		let Some(msb) = try_new_sandbox() else {
+			return;
+		};
+		let mountpoint = ManagedMountPoint {
+			host_path: CString::new("/etc").unwrap(),
+			attrs: MountAttributes::ro(),
+		};
+		msb.add_or_update_mount(OsStr::new("/p"), mountpoint.clone())
+			.expect("add /p");
+		msb.add_or_update_mount(OsStr::new("/p/ssl"), mountpoint)
+			.expect("add /p/ssl");
+
+		let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
+		assert!(mountinfo_has_mountpoint(&before, b"/p"), "/p mounted");
+		assert!(
+			mountinfo_has_mountpoint(&before, b"/p/ssl"),
+			"/p/ssl mounted"
+		);
+
+		msb.remove_mount(OsStr::new("/p")).expect("remove /p");
+
+		let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
+		assert!(
+			!mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must be removed"
+		);
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p/ssl"),
+			"/p/ssl child must be preserved through parent removal"
+		);
+	}
+
+	/// A host_path change is handled as a split (Removed then Added).
+	/// The mountpoint must survive and rebind to the new host source.
+	#[test]
+	fn managed_host_path_change_rebinds() {
+		let Some(msb) = try_new_sandbox() else {
+			return;
+		};
+		msb.add_or_update_mount(
+			OsStr::new("/p"),
+			ManagedMountPoint {
+				host_path: CString::new("/etc").unwrap(),
+				attrs: MountAttributes::ro(),
+			},
+		)
+		.expect("add /p -> /etc");
+		let before = msb.sandbox.read_m1_mountinfo().expect("mountinfo");
+		assert_eq!(
+			mountinfo_root_for(&before, b"/p").as_deref(),
+			Some(&b"/etc"[..]),
+			"/p should bind /etc initially"
+		);
+
+		msb.add_or_update_mount(
+			OsStr::new("/p"),
+			ManagedMountPoint {
+				host_path: CString::new("/usr").unwrap(),
+				attrs: MountAttributes::ro(),
+			},
+		)
+		.expect("rebind /p -> /usr");
+
+		let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
+		assert!(
+			mountinfo_has_mountpoint(&after, b"/p"),
+			"/p must still be mounted after host_path change"
+		);
+		assert_eq!(
+			mountinfo_root_for(&after, b"/p").as_deref(),
+			Some(&b"/usr"[..]),
+			"/p should bind /usr after the host_path change"
+		);
+	}
+}
