@@ -435,10 +435,10 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
-	/// Open the parent directory of `sandbox_path` within the backing
+	/// Open the parent directory of `sandbox_path` within the placeholder
 	/// tmpfs, without creating any intermediate components.  The parent
 	/// must already exist.
-	pub(super) fn open_sandbox_parent(
+	pub(super) fn open_parent_on_placeholder_tmpfs(
 		&self,
 		sandbox_path: &CStr,
 	) -> Result<ForeignFd, BindMountSandboxError> {

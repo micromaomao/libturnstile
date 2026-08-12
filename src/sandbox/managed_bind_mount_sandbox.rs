@@ -949,7 +949,7 @@ impl ManagedBindMountSandbox {
 		}
 		validate_sandbox_path(ns_path)?;
 		let (_, leaf) = split_parent_leaf(ns_path);
-		let parent_fd = self.sandbox.open_sandbox_parent(ns_path)?;
+		let parent_fd = self.sandbox.open_parent_on_placeholder_tmpfs(ns_path)?;
 		create_or_update_placeholder(parent_fd.as_raw_fd(), leaf, placeholder)
 	}
 
