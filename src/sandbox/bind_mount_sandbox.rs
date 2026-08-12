@@ -61,7 +61,10 @@ fn restrict_self_impl<F: FnOnce() -> Result<(), std::io::Error>>(
 	Ok(())
 }
 
-/// Implements a basic bind-mount based sandbox.
+/// Implements a basic bind-mount based sandbox.  Consider using
+/// [`ManagedBindMountSandbox`](crate::sandbox::ManagedBindMountSandbox)
+/// instead, which offer a higher-level API and transparent handling of
+/// policy changes.
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	/// fd references to namespaces
@@ -186,7 +189,10 @@ impl BindMountSandbox {
 	///
 	/// If any of the path's parent doesn't exist or is not a directory, a
 	/// directory is created in its place (overriding any existing files,
-	/// which is sensible since this is a placeholder fs)
+	/// which is sensible since this is a placeholder fs).
+	///
+	/// This backing tmpfs is readonly from the perspective of the
+	/// sandboxed process.
 	pub fn create_placeholder_hierarchy(
 		&self,
 		path: &CStr,
@@ -478,6 +484,7 @@ impl BindMountSandbox {
 		}
 	}
 
+	/// Bind mount a host path onto the given sandbox path within the sandbox.
 	pub fn mount_host_into_sandbox<'a, 'b>(
 		&'b self,
 		host_path: &'a CStr,
@@ -493,26 +500,29 @@ impl BindMountSandbox {
 		}
 	}
 
-	/// Unmount the bind mount at the given absolute path within the
-	/// sandbox.  Symlinks are not followed.  The path must not be "/".
-	/// The path must have been previously bind-mounted with
+	/// Unmount a bind mount at the given sandbox path.  The path must not
+	/// be "/".  The path must have been previously bind-mounted with
 	/// [`Self::mount_host_into_sandbox`].
 	///
 	/// If `mnt_detach` is true, umount is called with `MNT_DETACH`.  This
 	/// will break ".." on any existing handles to within the mount.
-	pub fn unmount(&self, ns_path: &CStr, mnt_detach: bool) -> Result<(), BindMountSandboxError> {
-		validate_sandbox_path(ns_path)?;
-		if ns_path.to_bytes() == b"/" {
+	pub fn unmount(
+		&self,
+		sandbox_path: &CStr,
+		mnt_detach: bool,
+	) -> Result<(), BindMountSandboxError> {
+		validate_sandbox_path(sandbox_path)?;
+		if sandbox_path.to_bytes() == b"/" {
 			return Err(BindMountSandboxError::InvalidSandboxPath(
 				"cannot unmount root",
-				ns_path.to_owned(),
+				sandbox_path.to_owned(),
 			));
 		}
-		let (parent_path, leaf) = split_parent_leaf(ns_path);
+		let (parent_path, leaf) = split_parent_leaf(sandbox_path);
 
 		debug!(
 			"Umounting {:?} from sandbox (mnt_detach = {})",
-			ns_path, mnt_detach
+			sandbox_path, mnt_detach
 		);
 
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
@@ -559,11 +569,11 @@ impl BindMountSandbox {
 		.map_err(BindMountSandboxError::ForkError)?;
 		if fork_res != 0 {
 			if fork_res != libc::EBUSY {
-				error!("Failed to unmount {:?}: errno {}", ns_path, fork_res);
+				error!("Failed to unmount {:?}: errno {}", sandbox_path, fork_res);
 			}
 			return Err(BindMountSandboxError::UnmountFailed(fork_res));
 		} else {
-			info!("Unmounted {:?}", ns_path);
+			info!("Unmounted {:?}", sandbox_path);
 		}
 		Ok(())
 	}

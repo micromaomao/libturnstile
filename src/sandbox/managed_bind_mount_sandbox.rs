@@ -953,12 +953,12 @@ impl ManagedBindMountSandbox {
 		create_or_update_placeholder(parent_fd.as_raw_fd(), leaf, placeholder)
 	}
 
-	/// Build (desired_placeholder_tree, desired_mount_tree) from an
-	/// entry tree.  For each bind-mount entry, a default placeholder is
-	/// synthesized at the mount point if the caller didn't supply one;
-	/// missing ancestor directories are then filled in via
-	/// `FsTree::fill_incomplete_parent` so creation order naturally
-	/// flows parent-before-child.
+	/// Build (desired_placeholder_tree, desired_mount_tree) from a
+	/// `FsTree<ManagedTreeEntry>`.  For each bind-mount entry, a
+	/// placeholder is created at the mount point based on the host path.
+	/// Missing ancestor placeholder dirs are automatically added.
+	/// Returns the placeholder tree, the mount tree, and any errors
+	/// encountered while trying to stat the host paths for bind mounts.
 	fn build_desired_trees(
 		&self,
 		desired_entries: &FsTree<ManagedTreeEntry>,
@@ -984,11 +984,6 @@ impl ManagedBindMountSandbox {
 				}
 				ManagedTreeEntry::BindMount(mp) => {
 					if placeholders.get(path).is_none() {
-						// Skip (and record) this single entry on a stat
-						// failure rather than aborting the whole
-						// reconcile: an unrelated mount whose host source
-						// has vanished must not block updates to other
-						// paths.
 						let stat = match stat_host(&mp.host_path) {
 							Ok(s) => s,
 							Err(e) => {
