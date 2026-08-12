@@ -275,20 +275,44 @@ fn chdir_syscall_nrs() -> &'static [i64] {
 	})
 }
 
-/// Implements a bind-mount based sandbox that automatically mount and
-/// unmounts based on a desired state.
+/// Pick out the reconcile error (if any) that relates to `path`,
+/// discarding errors on unrelated paths.
+fn pick_error_for_path(
+	errors: Vec<(OsString, BindMountSandboxError)>,
+	path: &OsStr,
+) -> Result<(), BindMountSandboxError> {
+	for (p, e) in errors {
+		if p.as_os_str() == path {
+			return Err(e);
+		}
+	}
+	Ok(())
+}
+
+fn check_path_no_nul(path: &OsStr) -> Result<(), BindMountSandboxError> {
+	if path.as_encoded_bytes().contains(&0) {
+		return Err(BindMountSandboxError::InvalidSandboxPath(
+			"path contains NUL byte",
+			CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
+				.expect("debug format should not contain NUL bytes"),
+		));
+	}
+	Ok(())
+}
+
+/// A bind-mount based sandbox that automatically mount and unmounts based
+/// on a desired state.
 #[derive(Debug)]
 pub struct ManagedBindMountSandbox {
 	pub(super) sandbox: BindMountSandbox,
-	/// The desired policy: the source of truth for what *should* be
-	/// mounted.  Mutated by `add_/remove_/update_*` and diffed against the
-	/// live state by `reconcile`.  Kept separate from the live trees below
-	/// (which reflect what is *actually* mounted) so transient mounts that
-	/// are reconciled in but never part of the policy - notably `chdir`
-	/// cwd mounts - are naturally cleaned up on a later reconcile
-	/// instead of lingering forever.
+	/// The desired policy, which may not match the actual current mount
+	/// tree, if for example some mount or unmount operations failed
+	/// during reconciliation.
 	current_policy: Mutex<FsTree<ManagedTreeEntry>>,
+	/// The current, live placeholder tree.
 	current_placeholder_tree: Mutex<FsTree<ManagedPlaceholder>>,
+	/// The current, live mount tree.  This is only updated when the
+	/// corresponding mount or unmount operation succeeds.
 	pub(super) current_mount_tree: Mutex<FsTree<MountInternal>>,
 }
 
@@ -302,36 +326,25 @@ impl ManagedBindMountSandbox {
 		})
 	}
 
-	fn check_path_no_nul(path: &OsStr) -> Result<(), BindMountSandboxError> {
-		if path.as_encoded_bytes().contains(&0) {
-			return Err(BindMountSandboxError::InvalidSandboxPath(
-				"path contains NUL byte",
-				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
-					.expect("debug format should not contain NUL bytes"),
-			));
-		}
-		Ok(())
-	}
-
-	/// Convenience: update a single entry (placeholder or mount) and
-	/// reconcile.
+	/// Update a single entry (placeholder or mount) in the policy, then
+	/// run reconciliation.
 	///
-	/// Reconciliation may touch other paths (ancestors, shadowed
-	/// sub-mounts, previously-tracked entries).  Only an error related to
-	/// `path` itself is surfaced to the caller; failures on unrelated
-	/// paths are logged by `reconcile` but do not fail this call.
+	/// Reconciliation may touch other paths if the policy does not fully
+	/// match the current mount tree, but only an error relating to `path`
+	/// itself is surfaced to the caller; failures on unrelated paths are
+	/// logged by `reconcile` but do not fail this call.
 	pub fn add_or_update_entry(
 		&self,
 		path: &OsStr,
 		entry: ManagedTreeEntry,
 	) -> Result<(), BindMountSandboxError> {
 		debug!("add_or_update_entry: path={:?}, entry={:?}", path, entry);
-		Self::check_path_no_nul(path)?;
+		check_path_no_nul(path)?;
 		let (mut policy, mut pt, mut mt) = self.lock_trees();
 		policy.insert(path, entry);
 		prune_useless_mounts(&mut policy);
 		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
-		Self::error_for_path(errors, path)
+		pick_error_for_path(errors, path)
 	}
 
 	/// Create an ephemeral mount at `target` with attribute `mp` to back
@@ -342,7 +355,7 @@ impl ManagedBindMountSandbox {
 		mp: ManagedMountPoint,
 		pidfd: Arc<ProcPidFd>,
 	) -> Result<(), BindMountSandboxError> {
-		Self::check_path_no_nul(target)?;
+		check_path_no_nul(target)?;
 		let (policy, mut pt, mut mt) = self.lock_trees();
 		let errors = self.reconcile(
 			&mut pt,
@@ -350,23 +363,12 @@ impl ManagedBindMountSandbox {
 			&policy,
 			Some((target.to_owned(), mp, pidfd)),
 		);
-		Self::error_for_path(errors, target)
+		pick_error_for_path(errors, target)
 	}
 
-	/// Pick out the reconcile error (if any) that relates to `path`,
-	/// discarding errors on unrelated paths.
-	fn error_for_path(
-		errors: Vec<(OsString, BindMountSandboxError)>,
-		path: &OsStr,
-	) -> Result<(), BindMountSandboxError> {
-		for (p, e) in errors {
-			if p.as_os_str() == path {
-				return Err(e);
-			}
-		}
-		Ok(())
-	}
-
+	/// A convenience wrapper for
+	/// [`add_or_update_entry`](Self::add_or_update_entry) with a
+	/// [`ManagedMountPoint`] argument.
 	pub fn add_or_update_mount(
 		&self,
 		path: &OsStr,
@@ -376,6 +378,9 @@ impl ManagedBindMountSandbox {
 		self.add_or_update_entry(path, ManagedTreeEntry::BindMount(mp))
 	}
 
+	/// A convenience wrapper for
+	/// [`add_or_update_entry`](Self::add_or_update_entry) with a
+	/// [`ManagedPlaceholder`] argument.
 	pub fn add_or_update_placeholder(
 		&self,
 		path: &OsStr,
@@ -385,68 +390,49 @@ impl ManagedBindMountSandbox {
 		self.add_or_update_entry(path, ManagedTreeEntry::Placeholder(ph))
 	}
 
-	/// Remove either the placeholder or mount entry at the given path.
+	/// Remove either the placeholder or mount entry at the given path
+	/// from the policy if it exists in the policy, then run
+	/// reconciliation.  Reconciliation may touch other paths, but only
+	/// failures relating to `path` itself are surfaced to the caller.
 	pub fn remove_entry(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
-		Self::check_path_no_nul(path)?;
+		check_path_no_nul(path)?;
 		let (mut policy, mut pt, mut mt) = self.lock_trees();
 		policy.remove(path);
 		prune_useless_mounts(&mut policy);
 		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
-		Self::error_for_path(errors, path)
+		pick_error_for_path(errors, path)
 	}
 
-	pub fn remove_mount(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
-		self.remove_entry(path)
-	}
-
+	/// Replace the policy with the given tree, then run reconciliation.
+	/// Returns a list of errors.
 	pub fn update_from_tree(
 		&self,
 		desired_tree: &FsTree<ManagedTreeEntry>,
-	) -> Result<(), BindMountSandboxError> {
+	) -> Vec<(OsString, BindMountSandboxError)> {
 		let (mut policy, mut pt, mut mt) = self.lock_trees();
 		*policy = desired_tree.clone();
 		prune_useless_mounts(&mut policy);
-		let errors = self.reconcile(&mut pt, &mut mt, &policy, None);
-		// A bulk update has no single "target" path, so surface the
-		// first error encountered (all are logged by `reconcile`).
-		match errors.into_iter().next() {
-			Some((_, e)) => Err(e),
-			None => Ok(()),
-		}
+		self.reconcile(&mut pt, &mut mt, &policy, None)
 	}
 
+	/// Convenience wrapper for
+	/// [`update_from_tree`](Self::update_from_tree) that takes a list of
+	/// (path, entry) pairs instead of a tree.
 	pub fn update_from_list<'a>(
 		&self,
 		desired_entries: impl IntoIterator<Item = (&'a OsStr, ManagedTreeEntry)>,
-	) -> Result<(), BindMountSandboxError> {
+	) -> Vec<(OsString, BindMountSandboxError)> {
 		let mut tree = FsTree::new();
+		let mut errors = Vec::new();
 		for (path, entry) in desired_entries {
-			Self::check_path_no_nul(path)?;
-			tree.insert(path, entry);
+			if let Err(e) = check_path_no_nul(path) {
+				errors.push((path.to_owned(), e));
+			} else {
+				tree.insert(path, entry);
+			}
 		}
-		self.update_from_tree(&tree)
-	}
-
-	pub fn update_mounts_from_tree(
-		&self,
-		desired_tree: &FsTree<ManagedMountPoint>,
-	) -> Result<(), BindMountSandboxError> {
-		let mut converted = FsTree::new();
-		desired_tree.walk_top_down(|path, mp| {
-			converted.insert(path, ManagedTreeEntry::BindMount(mp.clone()));
-		});
-		self.update_from_tree(&converted)
-	}
-
-	pub fn update_mounts_from_list<'a>(
-		&self,
-		desired_mounts: impl IntoIterator<Item = (&'a OsStr, ManagedMountPoint)>,
-	) -> Result<(), BindMountSandboxError> {
-		self.update_from_list(
-			desired_mounts
-				.into_iter()
-				.map(|(p, m)| (p, ManagedTreeEntry::BindMount(m))),
-		)
+		errors.extend(self.update_from_tree(&tree).into_iter());
+		errors
 	}
 
 	pub(super) fn lock_trees(
@@ -1292,7 +1278,7 @@ mod tests {
 			"/p/ssl mounted"
 		);
 
-		msb.remove_mount(OsStr::new("/p")).expect("remove /p");
+		msb.remove_entry(OsStr::new("/p")).expect("remove /p");
 
 		let after = msb.sandbox.read_m1_mountinfo().expect("mountinfo after");
 		assert!(
