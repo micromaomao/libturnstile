@@ -1,6 +1,11 @@
-use std::ffi::{CStr, CString};
+use std::{
+	ffi::{CStr, CString},
+	io::{self, Write},
+};
 
-use crate::BindMountSandboxError;
+use log::error;
+
+use crate::{BindMountSandboxError, utils::ENABLE_LOG_IN_FORK};
 
 /// Split a validated absolute path into (parent, leaf).
 pub(crate) fn split_parent_leaf(path: &CStr) -> (CString, &CStr) {
@@ -48,6 +53,42 @@ pub(crate) fn validate_sandbox_path(path: &CStr) -> Result<(), BindMountSandboxE
 				"path must not contain '.' or '..' components",
 				path.to_owned(),
 			));
+		}
+	}
+	Ok(())
+}
+
+/// Generate a unique scratch directory name for parking a mount into the
+/// hidden scratch tmpfs (see [`BindMountSandbox::park_to_scratch`]).
+pub(crate) fn next_scratch_name() -> CString {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+	CString::new(format!("scratch-{n}")).expect("no NUL in generated name")
+}
+
+/// Call umount("/proc/self/fd/<fd>", MNT_DETACH) in a async-signal-safe
+/// manner.
+pub(crate) unsafe fn umount_detach_fd(fd: libc::c_int) -> Result<(), io::Error> {
+	const PREFIX: &[u8] = b"/proc/self/fd/";
+	let mut buf = [0u8; PREFIX.len() + 11];
+	buf[..PREFIX.len()].copy_from_slice(PREFIX);
+	if let Err(e) = write!(&mut buf[PREFIX.len()..], "{}", fd) {
+		if ENABLE_LOG_IN_FORK {
+			error!("Failed to format fd path for umount: {}", e);
+		}
+		return Err(io::Error::from_raw_os_error(libc::EINVAL));
+	}
+	unsafe {
+		if libc::umount2(buf.as_ptr() as *const libc::c_char, libc::MNT_DETACH) != 0 {
+			let errno = libc::__errno_location().read();
+			if ENABLE_LOG_IN_FORK {
+				error!(
+					"umount2(MNT_DETACH) of unmovable child failed: errno {}",
+					errno
+				);
+			}
+			return Err(io::Error::from_raw_os_error(errno));
 		}
 	}
 	Ok(())

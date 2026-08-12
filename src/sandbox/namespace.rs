@@ -1,12 +1,130 @@
-use super::{ENABLE_LOG_IN_FORK, write_to_path};
 use crate::{
 	BindMountSandboxError,
 	access::fs::ForeignFd,
-	utils::{fork_wait, initialize_unix_send_fd_msghdr, unix_recv_fd, unix_send_fd},
+	perror,
+	utils::{
+		ENABLE_LOG_IN_FORK, fork_wait, initialize_unix_send_fd_msghdr, unix_recv_fd, unix_send_fd,
+	},
 };
 use log::{debug, error};
 use smallvec::SmallVec;
-use std::{ffi::OsStr, io, os::fd::AsRawFd, thread};
+use std::{
+	ffi::{CStr, OsStr},
+	io,
+	os::fd::AsRawFd,
+	thread,
+};
+
+fn write_to_path(path: &CStr, content: &str) -> libc::c_int {
+	unsafe {
+		let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+		if fd < 0 {
+			let err = perror!("open");
+			if ENABLE_LOG_IN_FORK {
+				error!("Failed to open {:#?} for writing: errno {}", path, err);
+			}
+			return err;
+		}
+		let bytes = content.as_bytes();
+		let write_res = libc::write(fd, bytes.as_ptr() as *const _, bytes.len());
+		if write_res < 0 {
+			let err = perror!("write");
+			libc::close(fd);
+			return err;
+		}
+		if write_res as usize != bytes.len() {
+			if ENABLE_LOG_IN_FORK {
+				error!(
+					"Short write to {:#?}: expected {} bytes, wrote {} bytes",
+					path,
+					bytes.len(),
+					write_res
+				);
+			}
+			libc::close(fd);
+			return libc::EAGAIN;
+		}
+		libc::close(fd);
+		0
+	}
+}
+
+pub(crate) unsafe fn send_fd_from_ns<
+	F1: FnOnce() -> Result<(), std::io::Error> + Send,
+	F2: FnOnce() -> Result<libc::c_int, std::io::Error> + Send,
+	E: FnOnce(libc::c_int) -> BindMountSandboxError,
+>(
+	nsenter_fn: F1,
+	acquire_fd: F2,
+	map_err: E,
+) -> Result<libc::c_int, BindMountSandboxError> {
+	unsafe {
+		thread::scope(|s| {
+			let mut sock = [-1i32; 2];
+			let res = libc::socketpair(
+				libc::AF_UNIX,
+				libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+				0,
+				sock.as_mut_ptr(),
+			);
+			if res == -1 {
+				return Err(BindMountSandboxError::Socketpair(io::Error::last_os_error()));
+			}
+			let parent_sock = sock[0];
+			let child_sock = sock[1];
+
+			let jh = s.spawn(move || {
+				let recv_res = unix_recv_fd(parent_sock);
+				libc::close(parent_sock);
+				recv_res
+			});
+
+			let fork_res = fork_wait(|| {
+				libc::close(parent_sock);
+				match nsenter_fn() {
+					Ok(()) => (),
+					Err(e) => {
+						if ENABLE_LOG_IN_FORK {
+							error!("Failed to enter namespaces for mount: {}", e);
+						}
+						return e.raw_os_error().unwrap_or(libc::EIO);
+					}
+				}
+				let mut ret = 0;
+				match acquire_fd() {
+					Ok(fd) => {
+						if let Err(e) = unix_send_fd(child_sock, fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!("Failed to send fd to parent: {}", e);
+							}
+							ret = e.raw_os_error().unwrap_or(libc::EIO)
+						}
+						libc::close(child_sock);
+						libc::close(fd);
+						ret
+					}
+					Err(e) => {
+						if ENABLE_LOG_IN_FORK {
+							error!("Failed to acquire fd in child: {}", e);
+						}
+						libc::close(child_sock);
+						e.raw_os_error().unwrap_or(libc::EIO)
+					}
+				}
+			})
+			.map_err(BindMountSandboxError::ForkError)?;
+			libc::close(child_sock);
+
+			if fork_res != 0 {
+				let _ = jh.join().expect("Child thread panicked");
+				return Err(map_err(fork_res));
+			}
+			jh.join()
+				.expect("Child thread panicked")
+				.map_err(BindMountSandboxError::ReceiveMountFd)
+		})
+	}
+}
 
 /// A struct that holds 4 namespaces: u0, m0, m1, u1, in this order.  u0
 /// and u1 are user namespaces, m0 and m1 are mount namespaces.

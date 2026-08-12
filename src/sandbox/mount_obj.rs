@@ -4,8 +4,8 @@ use std::{
 	os::fd::{AsRawFd, IntoRawFd},
 };
 
-use super::{ENABLE_LOG_IN_FORK, MountAttributes};
-use crate::access::fs::ForeignFd;
+use super::MountAttributes;
+use crate::{access::fs::ForeignFd, perror, utils::ENABLE_LOG_IN_FORK};
 use log::error;
 
 #[derive(Debug)]
