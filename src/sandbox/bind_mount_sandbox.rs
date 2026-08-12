@@ -28,7 +28,7 @@ use crate::{
 			placeholder_default_symlink,
 		},
 		remove_entry_at,
-		utils::{next_scratch_name, split_parent_leaf, umount_detach_fd, validate_sandbox_path},
+		utils::{split_parent_leaf, validate_sandbox_path},
 	},
 	utils::{ENABLE_LOG_IN_FORK, fork_wait},
 };
@@ -65,7 +65,7 @@ fn restrict_self_impl<F: FnOnce() -> Result<(), std::io::Error>>(
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	/// fd references to namespaces
-	namespaces: ManagedNamespaces,
+	pub(super) namespaces: ManagedNamespaces,
 	/// O_PATH fd to the host "/" opened inside m0.  Used as the dirfd
 	/// when resolving caller-provided host paths so that the resulting fd
 	/// is from m0 and is therefore acceptable to `open_tree()` in m0.
@@ -305,7 +305,7 @@ impl BindMountSandbox {
 	}
 
 	/// Resolve `host_path` to an `O_PATH` fd in m0.
-	fn host_to_m0(
+	pub(super) fn host_to_m0(
 		&self,
 		host_path: &CStr,
 		follow_host_symlinks: bool,
@@ -430,176 +430,6 @@ impl BindMountSandbox {
 			return Err(BindMountSandboxError::MountFailed(fork_res));
 		}
 		info!("Mount bind {:?} {:?} {}", host_path, ns_path, attrs,);
-		Ok(())
-	}
-
-	/// Bind-mount `host_path` at `ns_path` while "carrying over" any
-	/// existing direct sub-mounts that the new bind would otherwise
-	/// shadow.
-	///
-	/// `child_ns_paths` lists the immediate sub-mounts of `ns_path`.
-	///
-	/// Roughly, this function does:
-	///
-	/// - (in m0) `open_tree` the host source.
-	/// - (in m1) open an `O_PATH` fd to every child.
-	/// - (in m1) `move_mount` the source onto `ns_path` (the children are
-	///   now shadowed).
-	/// - (in m1) `move_mount` each child back onto its own path resolved
-	///   inside the new bind mount.
-	///
-	/// A child whose mountpoint dentry is absent from the new parent's
-	/// host fs cannot be moved back, and so will be unmounted.
-	///
-	/// With no children this is exactly a plain bind mount.
-	pub(super) fn mount_covering(
-		&self,
-		host_path: &CStr,
-		ns_path: &CStr,
-		attrs: MountAttributes,
-		child_ns_paths: &[CString],
-	) -> Result<(), BindMountSandboxError> {
-		if child_ns_paths.is_empty() {
-			return self.mount_host_into_sandbox_impl(host_path, ns_path, attrs, false, false);
-		}
-		validate_sandbox_path(ns_path)?;
-
-		let mut o_path_openhow: libc::open_how = unsafe { mem::zeroed() };
-		o_path_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-		o_path_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
-		if log::log_enabled!(log::Level::Debug) {
-			let ns_path_open = self.open_in_m1(ns_path, &o_path_openhow).unwrap();
-			let mnt_id = ns_path_open.mnt_id().unwrap();
-			debug!(
-				"Mounting {:?} over {:?} (current mnt_id = {}) with {} children",
-				host_path,
-				ns_path,
-				mnt_id,
-				child_ns_paths.len()
-			);
-			for c in child_ns_paths {
-				let c_open = self.open_in_m1(c, &o_path_openhow).unwrap();
-				let c_mnt_id = c_open.mnt_id().unwrap();
-				debug!("  will move child {:?} with mnt_id = {}", c, c_mnt_id)
-			}
-		}
-
-		let host_fd = self.host_to_m0(host_path, false)?;
-
-		// Pre-allocate the fd buffer before we fork so the forked child
-		// does not allocate.
-		let mut child_fds: Vec<libc::c_int> = vec![-1; child_ns_paths.len()];
-		let child_fds_slice = child_fds.as_mut_slice();
-		let n_children = child_ns_paths.len();
-
-		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
-		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
-		let host_fd_raw = host_fd.as_raw_fd();
-		let fork_res = unsafe {
-			fork_wait(move || {
-				if let Err(e) = nsenter_fn_m0() {
-					return e.raw_os_error().unwrap_or(libc::EIO);
-				}
-				let source_tree = match MountObj::new_bind(host_fd_raw, c"", attrs, false) {
-					Ok(tree) => tree,
-					Err(e) => return e.raw_os_error().unwrap_or(libc::EIO),
-				};
-				if let Err(e) = nsenter_fn_m1() {
-					return e.raw_os_error().unwrap_or(libc::EIO);
-				}
-				// Open every child while still reachable.
-				let mut child_openhow: libc::open_how = mem::zeroed();
-				child_openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-				child_openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
-				for i in 0..n_children {
-					let fd = libc::syscall(
-						libc::SYS_openat2,
-						libc::AT_FDCWD,
-						child_ns_paths[i].as_ptr(),
-						&child_openhow as *const _,
-						std::mem::size_of::<libc::open_how>(),
-					) as libc::c_int;
-					if fd < 0 {
-						let err = libc::__errno_location().read();
-						if ENABLE_LOG_IN_FORK {
-							error!(
-								"Failed to open child {:?} for move_mount: errno {}",
-								child_ns_paths[i], err
-							);
-						}
-					}
-					// A child that can't be opened (already gone) is just
-					// skipped; -1 stays in the slot.
-					child_fds_slice[i] = fd;
-				}
-				// Bind the parent over ns_path (shadows the children).
-				if let Err(e) = source_tree.mount(libc::AT_FDCWD, ns_path, false) {
-					if ENABLE_LOG_IN_FORK {
-						error!(
-							"Failed to mount covering {:?} to {:?} with {}: {}",
-							host_path, ns_path, attrs, e
-						);
-					}
-					for &mut fd in child_fds_slice {
-						if fd >= 0 {
-							libc::close(fd);
-						}
-					}
-					return e.raw_os_error().unwrap_or(libc::EIO);
-				}
-				// Move each child back onto its path inside the new bind
-				// mount.  If the mountpoint dentry is missing in the new
-				// parent the child can't be moved back, so lazily detach
-				// it (MNT_DETACH) rather than leaving it shadowed; we
-				// don't fail the whole op.
-				for i in 0..n_children {
-					let fd = child_fds_slice[i];
-					if fd < 0 {
-						continue;
-					}
-					let res = libc::syscall(
-						libc::SYS_move_mount,
-						fd,
-						c"".as_ptr(),
-						libc::AT_FDCWD,
-						child_ns_paths[i].as_ptr(),
-						libc::MOVE_MOUNT_F_EMPTY_PATH,
-					);
-					if res != 0 {
-						let err = libc::__errno_location().read();
-						if ENABLE_LOG_IN_FORK {
-							error!("move_mount(child back) failed: errno {}", err);
-						}
-						if let Err(e) = umount_detach_fd(fd) {
-							if ENABLE_LOG_IN_FORK {
-								error!("umount_detach_fd failed: {}", e);
-							}
-						}
-					}
-					libc::close(fd);
-				}
-				0
-			})
-		}
-		.map_err(BindMountSandboxError::ForkError)?;
-		if fork_res != 0 {
-			error!(
-				"Failed to mount (covering) {:?} to {:?} with {}: errno {}",
-				host_path, ns_path, attrs, fork_res
-			);
-			return Err(BindMountSandboxError::MountFailed(fork_res));
-		}
-		info!(
-			"Mount bind (covering {} children) {:?} {:?} {}",
-			n_children, host_path, ns_path, attrs
-		);
-		if log::log_enabled!(log::Level::Debug) {
-			for c in child_ns_paths {
-				let c_open = self.open_in_m1(c, &o_path_openhow).unwrap();
-				let c_mnt_id = c_open.mnt_id().unwrap();
-				debug!("  moved child {:?} now with mnt_id = {}", c, c_mnt_id)
-			}
-		}
 		Ok(())
 	}
 
@@ -1088,56 +918,6 @@ impl BindMountSandbox {
 			return Err(BindMountSandboxError::RestoreFromScratchFailed(fork_res));
 		}
 		Ok(())
-	}
-
-	/// Unmount `ns_path` while preserving its sub-mounts: park every
-	/// direct sub-mount under `ns_path` to the hidden scratch tmpfs,
-	/// attempt a non-detach `umount2(ns_path)`, then restore the parked
-	/// sub-mounts onto their original paths.  Returns `Ok(true)` if the
-	/// parent mount was successfully unmounted, or `Ok(false)` if it was
-	/// kept because the app still holds it (i.e. the umount returned
-	/// `EBUSY`).  In both cases the children should be kept intact (and
-	/// thus any app fds / cwd resolving through them remain valid).
-	pub(super) fn unmount_covering(
-		&self,
-		ns_path: &CStr,
-		child_ns_paths: &[CString],
-	) -> Result<bool, BindMountSandboxError> {
-		validate_sandbox_path(ns_path)?;
-		// Park each direct child out of the way so it can't pin the
-		// parent; each gets a unique scratch directory.
-		let mut parked: Vec<(CString, &CStr)> = Vec::with_capacity(child_ns_paths.len());
-		for child in child_ns_paths {
-			let name = next_scratch_name();
-			if let Err(e) = self.park_to_scratch(child, &name) {
-				// Best-effort: restore anything already parked before
-				// propagating the failure.
-				for (name, dest) in &parked {
-					let _ = self.restore_from_scratch(name, dest);
-				}
-				return Err(e);
-			}
-			parked.push((name, child.as_c_str()));
-		}
-		// Attempt a non-detach unmount.  With every child parked, only the
-		// app's own references on `ns_path` can still pin it.
-		let unmounted = match self.unmount(ns_path, false) {
-			Ok(()) => true,
-			Err(BindMountSandboxError::UnmountFailed(e)) if e == libc::EBUSY => false,
-			Err(e) => {
-				for (name, dest) in &parked {
-					let _ = self.restore_from_scratch(name, dest);
-				}
-				return Err(e);
-			}
-		};
-		// Restore each parked child onto its original path: on the
-		// revealed placeholder layer when unmounted, or under the kept
-		// mount on EBUSY.
-		for (name, dest) in &parked {
-			self.restore_from_scratch(name, dest)?;
-		}
-		Ok(unmounted)
 	}
 
 	/// instead of [`Self::run_command`], most likely within a pre_exec
