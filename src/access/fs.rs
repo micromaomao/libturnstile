@@ -446,7 +446,7 @@ impl FsTarget {
 		} as libc::c_int;
 		if fd < 0 {
 			let e = io::Error::last_os_error();
-			warn!(
+			debug!(
 				"open_target_dfd_in_root: openat2 of dfd path {:?} in root fd {} failed: {}",
 				dfd_path, root, e
 			);

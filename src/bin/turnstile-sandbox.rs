@@ -989,6 +989,9 @@ fn tracing_thread(context: &'static Context) {
 											rwxp, e
 										);
 									}
+									io::ErrorKind::NotADirectory => {
+										debug!("ENOTDIR opening target for {}: {}", rwxp, e);
+									}
 									_ => {
 										error!(
 											"error opening target in real root for {}: {}",
