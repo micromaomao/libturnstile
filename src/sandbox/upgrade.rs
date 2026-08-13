@@ -305,7 +305,7 @@ impl ManagedBindMountSandbox {
 	) -> Result<ForeignFd, M1OpenError> {
 		let mut attempts = 0u32;
 		loop {
-			match self.sandbox.open_in_m1(path, how) {
+			match self.sandbox.open_in_sandbox(path, how) {
 				Ok(fd) => match expected {
 					None => return Ok(fd),
 					Some(exp) => match fd.inode_id() {

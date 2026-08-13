@@ -3,6 +3,28 @@ use std::{ptr, sync::Mutex};
 use log::{debug, error};
 use rand::RngExt;
 
+/// We technically can't safely log or format strings in fork or pre_exec
+/// context, but to make our life easier we will do it anyway in debug
+/// builds.
+pub(crate) const ENABLE_LOG_IN_FORK: bool = cfg!(debug_assertions);
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! perror {
+	($s:literal) => {{
+		let err = libc::__errno_location().read();
+		if ENABLE_LOG_IN_FORK {
+			let strerr = libc::strerror(err);
+			error!(
+				concat!($s, ": errno {} ({:#?})"),
+				err,
+				std::ffi::CStr::from_ptr(strerr)
+			);
+		}
+		err
+	}};
+}
+
 #[cfg(feature = "serialize")]
 use serde::{Deserialize, Serialize};
 

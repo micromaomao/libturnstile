@@ -18,7 +18,8 @@ use inotify::{EventMask, Inotify, WatchMask};
 use libturnstile::{
 	AccessRequestError, BindMountSandboxError, CommonPlaceholderData, ManagedBindMountSandbox,
 	ManagedMountPoint, ManagedPlaceholder, ManagedTreeEntry, MountAttributes, PlaceholderDirData,
-	PlaceholderFileData, PlaceholderSymlinkData, RequestContext, TracerOptions, TurnstileTracer,
+	PlaceholderFileData, PlaceholderSymlinkData, RequestContext, SandboxOptions, TracerOptions,
+	TurnstileTracer,
 	access::{
 		AccessRequest, Operation,
 		fs::{ForeignFd, FsOperation, FsTarget, RwxPermission},
@@ -1428,11 +1429,17 @@ fn main() {
 		});
 	}
 
-	let sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns).unwrap_or_else(|e| {
+	let sandbox = ManagedBindMountSandbox::new(SandboxOptions {
+		disable_userns: cli.block_nested_userns,
+	})
+	.unwrap_or_else(|e| {
 		eprintln!("Unable to create sandbox: {}", e);
 		std::process::exit(1);
 	});
-	let path_res_sandbox = ManagedBindMountSandbox::new(true).unwrap_or_else(|e| {
+	let path_res_sandbox = ManagedBindMountSandbox::new(SandboxOptions {
+		disable_userns: true,
+	})
+	.unwrap_or_else(|e| {
 		eprintln!("Unable to create path resolution sandbox: {}", e);
 		std::process::exit(1);
 	});
