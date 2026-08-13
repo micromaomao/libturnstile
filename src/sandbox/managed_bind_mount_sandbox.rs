@@ -657,32 +657,56 @@ impl ManagedBindMountSandbox {
 		for child in child_ns_paths {
 			let name = next_scratch_name();
 			if let Err(e) = self.sandbox.park_to_scratch(child, &name) {
-				// Best-effort: restore anything already parked before
-				// propagating the failure.
+				error!("Failed to park {:?} to scratch {:?}: {}", child, name, e);
+				// Restore anything already parked, but if any of these
+				// restoration attempt fails there's nothing we can do.
 				for (name, dest) in &parked {
-					let _ = self.sandbox.restore_from_scratch(name, dest);
+					if let Err(e) = self.sandbox.restore_from_scratch(name, dest) {
+						error!(
+							"Failed to restore mount parked as {:?} to {:?}: {}",
+							name, dest, e
+						);
+					}
 				}
 				return Err(e);
 			}
 			parked.push((name, child.as_c_str()));
 		}
-		// Attempt a non-detach unmount.  With every child parked, only the
-		// app's own references on `ns_path` can still pin it.
+		// Attempt a non-detach unmount.  With every child parked, only
+		// the sandboxed program's own references on `ns_path` can still
+		// cause EBUSY.
 		let unmounted = match self.sandbox.unmount(ns_path, false) {
-			Ok(()) => true,
-			Err(BindMountSandboxError::UnmountFailed(e)) if e == libc::EBUSY => false,
+			Ok(()) => {
+				debug!("Unmounted {:?} successfully", ns_path);
+				true
+			}
+			Err(BindMountSandboxError::UnmountFailed(e)) if e == libc::EBUSY => {
+				debug!("Unmount of {:?} returned EBUSY", ns_path);
+				false
+			}
 			Err(e) => {
 				for (name, dest) in &parked {
-					let _ = self.sandbox.restore_from_scratch(name, dest);
+					if let Err(e) = self.sandbox.restore_from_scratch(name, dest) {
+						error!(
+							"Failed to restore mount parked as {:?} to {:?}: {}",
+							name, dest, e
+						);
+					}
 				}
 				return Err(e);
 			}
 		};
-		// Restore each parked child onto its original path: on the
-		// revealed placeholder layer when unmounted, or under the kept
-		// mount on EBUSY.
+		// Restore each parked child onto its original path on the lower
+		// level mount, or under the same mount as before if umounting got
+		// -EBUSY.
 		for (name, dest) in &parked {
-			self.sandbox.restore_from_scratch(name, dest)?;
+			if let Err(e) = self.sandbox.restore_from_scratch(name, dest) {
+				error!(
+					"Failed to restore mount parked as {:?} to {:?}: {}",
+					name, dest, e
+				);
+				return Err(e);
+			}
 		}
 		Ok(unmounted)
 	}
