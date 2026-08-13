@@ -638,14 +638,23 @@ fn load_config_into_sandboxes(context: &Context) -> Result<(), Box<dyn std::erro
 			ManagedTreeEntry::Placeholder(_) => {}
 		}
 	}
-	context
-		.path_res_sandbox
-		.update_from_list(path_res_entries)
-		.map_err(|e| {
-			error!("Unable to load config to path_res_sandbox: {}", e);
-			e
-		})?;
-	context.sandbox.update_from_list(entries)?;
+	fn print_errs(errs: &[(OsString, BindMountSandboxError)]) {
+		for (path, err) in errs {
+			error!("  {:?}: {}", path, err);
+		}
+	}
+	let mut errs = context.path_res_sandbox.update_from_list(path_res_entries);
+	if !errs.is_empty() {
+		error!("errors applying config to path resolution sandbox:");
+		print_errs(&errs);
+		return Err(Box::new(errs.swap_remove(0).1));
+	}
+	errs = context.sandbox.update_from_list(entries);
+	if !errs.is_empty() {
+		error!("errors applying config to sandbox:");
+		print_errs(&errs);
+		return Err(Box::new(errs.swap_remove(0).1));
+	}
 	*ignore_paths_lock = ignore_paths;
 	Ok(())
 }
