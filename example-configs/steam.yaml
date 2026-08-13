@@ -1,0 +1,85 @@
+rules:
+  /usr:
+    permissions: rx
+  /etc: rx
+  /bin: rx
+  /lib: rx
+  /lib64: rx
+  /dev/null: rw
+  /dev/zero: rw
+  /dev/urandom: rw
+  /proc: rwx
+  /dev/tty:
+    ignore: true
+  /dev/pts:
+    ignore: true
+  /tmp:
+    target: /tmp/steam-tmp
+    permissions: rwx
+  /tmp/.X11-unix:
+    target: /tmp/.X11-unix
+    permissions: rw
+  /tmp/.X0-lock:
+    target: /tmp/.X0-lock
+    permissions: rw
+  /dev:
+    permissions: r
+  /home:
+    permissions: ''
+    ignore: true
+  $HOME/.local: ''
+  $HOME/.local/share: ''
+  $HOME/.steam: rwx
+  $HOME/.local/share/Steam: rwx
+  $HOME/Desktop/steam.desktop: rw
+  /run/systemd/userdb: r
+  /run/systemd/userdb/org.gnome.DisplayManager: rw
+  /run/systemd/userdb/io.systemd.Multiplexer: rw
+  /run/systemd/userdb/io.systemd.DynamicUser: rw
+  $HOME/.config/user-dirs.dirs: r
+  $HOME/.local/share/gvfs-metadata: r
+  $XDG_RUNTIME_DIR: rw
+  /opt/intel/oneapi:
+    permissions: rwx
+  $HOME/.config/fontconfig: r
+  $HOME/.config/gtk-4.0: r
+  $HOME/.local/share/fonts: r
+  $HOME/.cache/fontconfig: r
+  /var/cache/fontconfig:
+    permissions: r
+    ignore: true
+  $HOME/.fonts: r
+  /var/lib/flatpak/exports/share/icons: r
+  $HOME/.local/share/icons: r
+  $HOME/.config/dconf/user: r
+  /dev/dri: rw
+  $HOME/.cache/mesa_shader_cache: rw
+  /sys/bus/pci: rw
+  /etc/fonts:
+    permissions: r
+  /etc/fonts/fonts.conf: r
+  /run/dbus/system_bus_socket: rw
+  /var/cache/ldconfig:
+    permissions: r
+  /dev/shm: rwx
+  /sys: rwx
+  /run/udev: r
+  /var/tmp: r
+  /dev/hidraw9: rw
+  /dev/hidraw8: rw
+  /dev/hidraw6: rw
+  /dev/hidraw5: rw
+  /dev/hidraw4: rw
+  /dev/hidraw3: rw
+  /dev/hidraw2: rw
+  /dev/hidraw1: rw
+  /dev/hidraw0: rw
+  /dev/hidraw7: rw
+  /dev/input: rw
+  /run/systemd/journal:
+    ignore: true
+  /dev/console:
+    ignore: true
+  /run:
+    ignore: true
+  $HOME/.config/unity3d: rwx
