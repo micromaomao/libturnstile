@@ -432,25 +432,36 @@ impl FsTarget {
 			return Err(io::Error::from_raw_os_error(libc::ENOENT));
 		}
 		let dfd_path = CString::from_vec_with_nul(dfd_path).unwrap();
-		let fd = unsafe {
-			let mut openhow: libc::open_how = std::mem::zeroed();
-			openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-			openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
-			libc::syscall(
-				libc::SYS_openat2,
-				root,
-				dfd_path.as_ptr(),
-				&openhow,
-				std::mem::size_of_val(&openhow),
-			)
-		} as libc::c_int;
-		if fd < 0 {
-			let e = io::Error::last_os_error();
-			debug!(
-				"open_target_dfd_in_root: openat2 of dfd path {:?} in root fd {} failed: {}",
-				dfd_path, root, e
-			);
-			return Err(e);
+		let mut fd;
+		loop {
+			fd = unsafe {
+				let mut openhow: libc::open_how = std::mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				libc::syscall(
+					libc::SYS_openat2,
+					root,
+					dfd_path.as_ptr(),
+					&openhow,
+					std::mem::size_of_val(&openhow),
+				)
+			} as libc::c_int;
+			if fd < 0 {
+				let e = io::Error::last_os_error();
+				if e.raw_os_error() == Some(libc::EAGAIN) {
+					debug!(
+						"open_target_dfd_in_root EAGAIN from openat2 of path {:?} in root fd {}",
+						dfd_path, root
+					);
+					continue;
+				}
+				debug!(
+					"open_target_dfd_in_root: openat2 of dfd path {:?} in root fd {} failed: {}",
+					dfd_path, root, e
+				);
+				return Err(e);
+			}
+			break;
 		}
 		let opened = ForeignFd { local_fd: fd };
 		return Ok(opened);
