@@ -320,12 +320,17 @@ impl FsTarget {
 		path_arg_index: u8,
 		at_flags: Option<u64>,
 	) -> Result<Self, AccessRequestError> {
-		let at_empty_path = at_flags.map_or(false, |f| f & libc::AT_EMPTY_PATH as u64 != 0);
 		let no_follow = at_flags.map_or(false, |f| f & libc::AT_SYMLINK_NOFOLLOW as u64 != 0);
 
 		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
 		let path_is_null = path_ptr.is_null();
 		let path;
+		// For some syscalls (e.g. utimensat), you can pass in a NULL path
+		// to act as an empty path, without requiring AT_EMPTY_PATH.
+		// readlinkat also allows empty path but does not explicitly take
+		// AT_EMPTY_PATH.  Therefore, we simply ignore AT_EMPTY_PATH
+		// altogether.  If the path is empty or NULL, it's treated as an
+		// empty path.
 		if path_is_null {
 			path = CString::default();
 		} else {
@@ -342,15 +347,6 @@ impl FsTarget {
 				no_follow,
 				original_handle: OriginalHandle::Root,
 			});
-		}
-
-		// For some syscalls (e.g. utimensat), you can pass in a NULL path
-		// to act as an empty path, without requiring AT_EMPTY_PATH.
-		// TODO: only allow this for utime* syscalls
-		if pathb.len() == 0 && !at_empty_path && !path_is_null {
-			return Err(AccessRequestError::InvalidSyscallData(
-				"empty path without AT_EMPTY_PATH",
-			));
 		}
 
 		let dfd_arg = req.arg(dfd_arg_index as usize) as libc::c_int;
