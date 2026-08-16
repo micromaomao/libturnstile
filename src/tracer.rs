@@ -10,7 +10,9 @@ use std::{
 	thread,
 };
 
-use libseccomp::{ScmpArch, ScmpFd, ScmpFilterContext, ScmpNotifReq};
+use libseccomp::{
+	ScmpArch, ScmpFd, ScmpFilterContext, ScmpNotifReq, error::SeccompErrno::ECANCELED,
+};
 use libseccomp_sys::scmp_filter_ctx;
 
 use crate::{
@@ -20,7 +22,7 @@ use crate::{
 	utils::{unix_recv_fd, unix_send_fd},
 };
 
-use log::{error, warn};
+use log::{debug, error, warn};
 
 fn dump_seccomp_request(req: &ScmpNotifReq) -> String {
 	let comm = std::fs::read_to_string(format!("/proc/{}/comm", req.pid))
@@ -267,7 +269,17 @@ impl TurnstileTracer {
 		&'a self,
 	) -> Result<Option<(AccessRequest, RequestContext<'a>)>, AccessRequestError> {
 		let notify_fd = self.notify_fd_state.wait_notify_fd();
-		let req = ScmpNotifReq::receive(notify_fd).map_err(AccessRequestError::NotifyReceive)?;
+		let req = ScmpNotifReq::receive(notify_fd).map_err(|e| {
+			let errno = if e.errno() == Some(ECANCELED) {
+				Some(unsafe { *libc::__errno_location() })
+			} else {
+				None
+			};
+			AccessRequestError::NotifyReceive(e, errno)
+		})?;
+		if log::log_enabled!(log::Level::Debug) {
+			debug!("Got request: {}", dump_seccomp_request(&req));
+		}
 		let procmem = format!("/proc/{}/mem\0", req.pid);
 		let mut ctx = RequestContext {
 			_tracer: self,

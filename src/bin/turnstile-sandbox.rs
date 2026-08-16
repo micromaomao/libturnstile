@@ -989,6 +989,9 @@ fn tracing_thread(context: &'static Context) {
 											rwxp, e
 										);
 									}
+									io::ErrorKind::NotADirectory => {
+										debug!("ENOTDIR opening target for {}: {}", rwxp, e);
+									}
 									_ => {
 										error!(
 											"error opening target in real root for {}: {}",
@@ -1337,8 +1340,11 @@ fn tracing_thread(context: &'static Context) {
 					debug!("error finalizing request (likely no longer valid): {}", e);
 				}
 			}
-			Ok(None) => {}
+			Ok(None) => {
+				debug!("yield_request: Ok(None)");
+			}
 			Err(e) => {
+				debug!("error yielding request: {}", e);
 				std::thread::sleep(Duration::from_millis(20));
 				if let Some(pidfd) = context.pidfd.get() {
 					match pidfd.is_alive() {

@@ -37,8 +37,8 @@ pub enum TurnstileTracerError {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum AccessRequestError {
-	#[error("seccomp_notify_receive: {0}")]
-	NotifyReceive(libseccomp::error::SeccompError),
+	#[error("seccomp_notify_receive: {0} (errno {1:?})")]
+	NotifyReceive(libseccomp::error::SeccompError, Option<libc::c_int>),
 	#[error("seccomp_notify_respond: {0}")]
 	NotifyRespond(libseccomp::error::SeccompError),
 	#[error("failed to send continue response: {0}")]

@@ -308,8 +308,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 						error!("error sending continue response: {}", e);
 					}
 				}
-				Ok(None) => {}
+				Ok(None) => {
+					debug!("yield_request: Ok(None)");
+				}
 				Err(e) => {
+					debug!("error yielding request: {}", e);
 					std::thread::sleep(Duration::from_millis(20));
 					if let Some(pidfd) = context.pidfd.get() {
 						match pidfd.is_alive() {
