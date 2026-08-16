@@ -970,7 +970,7 @@ pub(crate) fn dfd_arg_indices(syscall: libseccomp::ScmpSyscall) -> smallvec::Sma
 pub(crate) fn handle_notification<'a>(
 	request_ctx: &mut RequestContext<'a>,
 ) -> Result<Option<AccessRequest>, AccessRequestError> {
-	let syscall = request_ctx.sreq.data.syscall;
+	let syscall = request_ctx.syscall();
 
 	for &(sys, handler, path_arg_index) in fs_syscalls_path_table() {
 		if syscall == sys {
