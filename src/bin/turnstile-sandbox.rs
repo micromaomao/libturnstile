@@ -849,11 +849,37 @@ fn apply_prompter_response(context: &Context, response: &PrompterResponse, t_loc
 	}
 }
 
+fn has_inode_permission(
+	statx: &libc::statx,
+	our_uid: libc::uid_t,
+	our_gid: libc::gid_t,
+	need_read: bool,
+	need_write: bool,
+	need_exec: bool,
+) -> bool {
+	let mode = u32::from(statx.stx_mode);
+	// Linux permissions are not "cumulative".  In other words, if uid is
+	// equal, the group permission is not used, etc.
+	let permissions = if statx.stx_uid == our_uid {
+		(mode >> 6) & 0o7
+	} else if statx.stx_gid == our_gid {
+		(mode >> 3) & 0o7
+	} else {
+		mode & 0o7
+	};
+
+	(!need_read || permissions & 0o4 != 0)
+		&& (!need_write || permissions & 0o2 != 0)
+		&& (!need_exec || permissions & 0o1 != 0)
+}
+
 fn tracing_thread(context: &'static Context) {
 	if let Err(e) = context.tracer.receive_notify_fd() {
 		error!("error receiving notify fd: {}", e);
 		std::process::exit(1);
 	}
+	let uid = unsafe { libc::getuid() };
+	let gid = unsafe { libc::getgid() };
 	let mut denials = FsTree::<DenialLogNode>::new();
 	let resolve_sandbox_root = match context.path_res_sandbox.root_in_sandbox() {
 		Ok(fd) => fd,
@@ -1001,7 +1027,8 @@ fn tracing_thread(context: &'static Context) {
 								}
 								break;
 							}
-							let sandbox_abspath = match target_fd.unwrap().readlink() {
+							let target_fd = target_fd.unwrap();
+							let sandbox_abspath = match target_fd.readlink() {
 								Ok(path) => {
 									let mut bytes = path.into_encoded_bytes();
 									bytes.push(b'\0');
@@ -1124,6 +1151,28 @@ fn tracing_thread(context: &'static Context) {
 											add_placeholder = true;
 										}
 									} else if let Some(program) = &context.prompter {
+										// First, don't prompt if we don't have the
+										// requested inode access anyway on the file.
+										if !matches!(fsop, FsOperation::FsChmod(_))
+											&& let Ok(statx) = target_fd.statx(
+												libc::STATX_UID
+													| libc::STATX_GID | libc::STATX_MODE,
+											) && !has_inode_permission(
+											&statx, uid, gid, rwxp.read, rwxp.write, rwxp.exec,
+										) {
+											force_continue = true;
+											debug!(
+												"{}[{}] target {} does not have the requested inode permissions; \
+												 not prompting",
+												req_ctx
+													.comm()
+													.unwrap_or_else(|_| OsString::from("???"))
+													.to_string_lossy(),
+												req_ctx.pid(),
+												t_pres,
+											);
+											break;
+										}
 										// Ask the prompter what to do.  We prompt at
 										// most once per syscall, sending all of its
 										// rwx permissions; the mounts / placeholders
@@ -1609,7 +1658,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
 	use super::{
-		DEFAULT_CONFIG, create_missing_redirect_target, path_is_ignored,
+		DEFAULT_CONFIG, create_missing_redirect_target, has_inode_permission, path_is_ignored,
 		write_default_config_if_empty,
 	};
 	use std::ffi::CString;
@@ -1664,6 +1713,33 @@ mod tests {
 	#[test]
 	fn ignore_empty_list_matches_nothing() {
 		assert!(!path_is_ignored(&[], b"/proc"));
+	}
+
+	#[test]
+	fn inode_permissions_use_the_matching_mode_class() {
+		let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+		statx.stx_uid = 1000;
+		statx.stx_gid = 100;
+		statx.stx_mode = 0o642;
+
+		assert!(has_inode_permission(&statx, 1000, 999, true, true, false));
+		assert!(!has_inode_permission(&statx, 1000, 100, false, false, true));
+		assert!(has_inode_permission(&statx, 2000, 100, true, false, false));
+		assert!(!has_inode_permission(&statx, 2000, 100, false, true, false));
+		assert!(has_inode_permission(&statx, 2000, 200, false, true, false));
+	}
+
+	#[test]
+	fn inode_permissions_require_every_requested_bit_from_one_class() {
+		let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+		statx.stx_uid = 1000;
+		statx.stx_gid = 100;
+		statx.stx_mode = 0o421;
+
+		assert!(has_inode_permission(&statx, 1000, 100, false, false, false));
+		assert!(!has_inode_permission(&statx, 1000, 100, true, false, true));
+		assert!(!has_inode_permission(&statx, 2000, 100, true, true, false));
+		assert!(!has_inode_permission(&statx, 2000, 200, false, true, true));
 	}
 
 	#[test]
