@@ -7,7 +7,7 @@ use std::{
 	slice,
 };
 
-use libseccomp::{ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
+use libseccomp::{ScmpArch, ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags, ScmpSyscall};
 use log::warn;
 
 use crate::{AccessRequestError, TurnstileTracer, access::fs::ForeignFd};
@@ -64,6 +64,13 @@ macro_rules! lazy_syscall_table_name_to_number {
 	};
 }
 pub(crate) use lazy_syscall_table_name_to_number;
+
+fn normalize_syscall(syscall: ScmpSyscall, arch: ScmpArch) -> ScmpSyscall {
+	syscall
+		.get_name_by_arch(arch)
+		.and_then(|name| ScmpSyscall::from_name(&name))
+		.unwrap_or(syscall)
+}
 
 // _IOW('!', 3, struct seccomp_notif_addfd)
 // This value does not depend on the architecture, and is stable because
@@ -183,9 +190,10 @@ impl<'a> RequestContext<'a> {
 		))
 	}
 
-	/// Returns the syscall number that triggered this notification.
+	/// Returns the syscall that triggered this notification, normalized to
+	/// the native architecture's syscall number.
 	pub fn syscall(&self) -> libseccomp::ScmpSyscall {
-		self.sreq.data.syscall
+		normalize_syscall(self.sreq.data.syscall, self.sreq.data.arch)
 	}
 
 	/// Install `srcfd` into the traced process and atomically complete the
@@ -423,5 +431,18 @@ impl Drop for RequestContext<'_> {
 			warn!("RequestContext dropped without sending a response — auto-continuing");
 			_ = self.send_continue();
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn normalizes_foreign_arch_syscall_number() {
+		let foreign = ScmpSyscall::from_name_by_arch("openat", ScmpArch::X86).unwrap();
+		let native = ScmpSyscall::from_name("openat").unwrap();
+
+		assert_eq!(normalize_syscall(foreign, ScmpArch::X86), native);
 	}
 }
