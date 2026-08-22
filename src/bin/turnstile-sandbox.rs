@@ -77,6 +77,11 @@ struct Cli {
 	#[arg(long = "qt-prompter")]
 	qt_prompter: bool,
 
+	/// ID identifying this sandbox instance in requests sent to the prompter.
+	/// Defaults to a randomly generated value.
+	#[arg(long = "sandbox-id")]
+	sandbox_id: Option<u64>,
+
 	/// Program to run and its arguments
 	#[arg(required = true)]
 	command: Vec<OsString>,
@@ -1581,7 +1586,7 @@ fn main() {
 			.iter()
 			.map(|s| s.to_string_lossy().into_owned())
 			.collect(),
-		sandbox_id: random_sandbox_id(),
+		sandbox_id: cli.sandbox_id.unwrap_or_else(random_sandbox_id),
 	}));
 
 	let config_watcher = watch_config_file(&context.config_path).unwrap_or_else(|e| {
@@ -1658,11 +1663,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
 	use super::{
-		DEFAULT_CONFIG, create_missing_redirect_target, has_inode_permission, path_is_ignored,
+		Cli, DEFAULT_CONFIG, create_missing_redirect_target, has_inode_permission, path_is_ignored,
 		write_default_config_if_empty,
 	};
+	use clap::Parser;
 	use std::ffi::CString;
 	use std::os::unix::ffi::OsStrExt;
+
+	#[test]
+	fn parses_optional_sandbox_id() {
+		let cli = Cli::try_parse_from([
+			"turnstile-sandbox",
+			"--sandbox-id",
+			"12345",
+			"config.yaml",
+			"command",
+		])
+		.unwrap();
+		assert_eq!(cli.sandbox_id, Some(12345));
+
+		let cli = Cli::try_parse_from(["turnstile-sandbox", "config.yaml", "command"]).unwrap();
+		assert_eq!(cli.sandbox_id, None);
+	}
 
 	#[test]
 	fn writes_default_config_only_for_missing_or_empty_files() {
