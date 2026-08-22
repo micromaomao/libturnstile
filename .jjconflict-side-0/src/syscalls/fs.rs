@@ -1,0 +1,1045 @@
+use libseccomp::ScmpFilterContext;
+
+use crate::{
+	AccessRequestError, TurnstileTracerError,
+	access::fs::{
+		ChmodOperation, ChownOperation, CreateKind, CreateOperation, ExecOperation,
+		FallocateOperation, FsTarget, GetXattrOperation, LinkOperation, ListXattrOperation,
+		MmapOperation, OpenOperation, RemoveXattrOperation, RenameOperation, SetXattrOperation,
+		TruncateOperation, UnlinkOperation, UtimensOperation,
+	},
+	access::{
+		AccessRequest, Operation,
+		fs::{AccessOperation, StatOperation},
+	},
+	syscalls::RequestContext,
+};
+
+use super::lazy_syscall_table_name_to_number;
+
+type SyscallHandler1 =
+	fn(req: &mut RequestContext, target: FsTarget) -> Result<Operation, AccessRequestError>;
+
+type SyscallHandler1Optional =
+	fn(req: &mut RequestContext, fd_arg_index: u8) -> Result<Option<Operation>, AccessRequestError>;
+
+type SyscallHandler2 = fn(
+	req: &mut RequestContext,
+	target1: FsTarget,
+	target2: FsTarget,
+) -> Result<Operation, AccessRequestError>;
+
+use crate::access::Operation::FsOperation as fsop;
+use crate::access::fs::FsOperation::*;
+
+fn handle_access_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+	access_mode: u64,
+) -> Result<Operation, AccessRequestError> {
+	Ok(fsop(FsAccess(AccessOperation {
+		target,
+		need_read: access_mode & libc::R_OK as u64 != 0,
+		need_write: access_mode & libc::W_OK as u64 != 0,
+		need_exec: access_mode & libc::X_OK as u64 != 0,
+	})))
+}
+
+fn handle_open_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+	create_mode: Option<libc::mode_t>,
+	openat_flags: Option<u64>,
+	_openat2_resolve: Option<u64>,
+) -> Result<Operation, AccessRequestError> {
+	// creat(2) has no explicit flags arg; default to O_CREAT|O_WRONLY|O_TRUNC.
+	let flags = openat_flags.unwrap_or((libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64)
+		as libc::c_int;
+
+	// When O_PATH is specified in flags, flag bits other than O_CLOEXEC,
+	// O_DIRECTORY, and O_NOFOLLOW are ignored.
+	let need_read =
+		flags & libc::O_PATH == 0 && (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY == 0);
+	let need_write =
+		flags & libc::O_PATH == 0 && (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY != 0);
+
+	// Create if O_CREAT is set, or if there are no openat_flags (for creat()).
+	let create_mode = if flags & libc::O_CREAT != 0 || openat_flags.is_none() {
+		create_mode
+	} else {
+		None
+	};
+
+	Ok(fsop(FsOpen(OpenOperation {
+		target,
+		need_read,
+		need_write,
+		create_mode,
+	})))
+}
+
+fn handle_openat2(
+	req: &mut RequestContext,
+	target: FsTarget,
+) -> Result<Operation, AccessRequestError> {
+	let open_how_ptr = req.arg(2) as *const libc::open_how;
+	let open_how = req.value_from_target_memory(open_how_ptr)?;
+	handle_open_like(
+		req,
+		target,
+		Some(open_how.mode as libc::mode_t),
+		Some(open_how.flags),
+		Some(open_how.resolve),
+	)
+}
+
+fn handle_exec_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+) -> Result<Operation, AccessRequestError> {
+	Ok(fsop(FsExec(ExecOperation { target })))
+}
+
+fn handle_mknod_like(
+	mut target: FsTarget,
+	mode: libc::mode_t,
+	kind: CreateKind,
+) -> Result<Operation, AccessRequestError> {
+	// mkdir / mknod never dereference an existing final symlink: they
+	// operate on the name itself and fail with EEXIST onto a symlink, so
+	// the leaf must not be followed when resolving the target.
+	target.no_follow = true;
+	Ok(fsop(FsCreate(CreateOperation { target, mode, kind })))
+}
+
+fn handle_symlink_like(
+	req: &mut RequestContext,
+	mut target: FsTarget,
+	src_arg_index: u8,
+) -> Result<Operation, AccessRequestError> {
+	let src_ptr = req.arg(src_arg_index as usize) as *const libc::c_char;
+	let src = req.cstr_from_target_memory(src_ptr)?;
+	// The link being created is a name, not something to dereference.
+	target.no_follow = true;
+	Ok(fsop(FsCreate(CreateOperation {
+		target,
+		mode: 0o777,
+		kind: CreateKind::Symlink { target: src },
+	})))
+}
+
+fn handle_readlink_like(
+	_req: &mut RequestContext,
+	mut target: FsTarget,
+) -> Result<Operation, AccessRequestError> {
+	target.no_follow = true;
+	Ok(fsop(FsReadlink(target)))
+}
+
+fn handle_chdir_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+) -> Result<Operation, AccessRequestError> {
+	Ok(fsop(FsChdir(target)))
+}
+
+fn handle_stat_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+	lstat: bool,
+) -> Result<Operation, AccessRequestError> {
+	Ok(fsop(FsStat(StatOperation { target, lstat })))
+}
+
+/// A `timespec` whose `tv_nsec` is `UTIME_NOW`, i.e. "set this timestamp
+/// to the current time".  Used when the syscall passes a NULL `times`
+/// pointer.
+fn timespec_now() -> libc::timespec {
+	libc::timespec {
+		tv_sec: 0,
+		tv_nsec: libc::UTIME_NOW,
+	}
+}
+
+/// Read the `times` argument of `utimensat`/`futimens` (an array of two
+/// `timespec`s) from the traced process, returning `[timespec_now(),
+/// timespec_now()]` if the pointer is NULL.
+fn read_timespec_times(
+	req: &mut RequestContext,
+	times_arg: usize,
+) -> Result<[libc::timespec; 2], AccessRequestError> {
+	let ptr = req.arg(times_arg) as *const [libc::timespec; 2];
+	if ptr.is_null() {
+		return Ok([timespec_now(), timespec_now()]);
+	}
+	req.value_from_target_memory(ptr)
+}
+
+/// Read the `times` argument of `utimes`/`futimesat` (an array of two
+/// `timeval`s) and normalise it to the `utimensat` `timespec`
+/// representation, returning `[timespec_now(), timespec_now()]` if the
+/// pointer is NULL.
+fn read_timeval_times(
+	req: &mut RequestContext,
+	times_arg: usize,
+) -> Result<[libc::timespec; 2], AccessRequestError> {
+	let ptr = req.arg(times_arg) as *const [libc::timeval; 2];
+	if ptr.is_null() {
+		return Ok([timespec_now(), timespec_now()]);
+	}
+	let tv = req.value_from_target_memory(ptr)?;
+	let conv = |t: libc::timeval| libc::timespec {
+		tv_sec: t.tv_sec,
+		tv_nsec: (t.tv_usec as i64) * 1000,
+	};
+	Ok([conv(tv[0]), conv(tv[1])])
+}
+
+// (name, handler, arg index of the path)
+const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
+	(
+		"open",
+		|req, target| {
+			handle_open_like(
+				req,
+				target,
+				Some(req.arg(2) as libc::mode_t),
+				Some(req.arg(1)),
+				None,
+			)
+		},
+		0,
+	),
+	(
+		"access",
+		|req, target| handle_access_like(req, target, req.arg(1)),
+		0,
+	),
+	(
+		"mkdir",
+		|req, target| handle_mknod_like(target, req.arg(1) as libc::mode_t, CreateKind::Directory),
+		0,
+	),
+	(
+		"rmdir",
+		|_req, mut target| {
+			target.no_follow = true;
+			Ok(fsop(FsUnlink(UnlinkOperation { target, dir: true })))
+		},
+		0,
+	),
+	(
+		"creat",
+		|req, target| handle_open_like(req, target, Some(req.arg(1) as libc::mode_t), None, None),
+		0,
+	),
+	(
+		"mknod",
+		|req, target| {
+			let mode = req.arg(1) as libc::mode_t;
+			let dev = req.arg(2) as libc::dev_t;
+			let kind =
+				if mode & libc::S_IFMT == libc::S_IFBLK || mode & libc::S_IFMT == libc::S_IFCHR {
+					CreateKind::Device { dev }
+				} else {
+					CreateKind::File
+				};
+			handle_mknod_like(target, mode, kind)
+		},
+		0,
+	),
+	(
+		"unlink",
+		|_req, mut target| {
+			target.no_follow = true;
+			Ok(fsop(FsUnlink(UnlinkOperation { target, dir: false })))
+		},
+		0,
+	),
+	("execve", handle_exec_like, 0),
+	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
+	(
+		"symlink",
+		|req, target| handle_symlink_like(req, target, 0),
+		1,
+	),
+	("readlink", handle_readlink_like, 0),
+	("chdir", handle_chdir_like, 0),
+	(
+		"newstat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+	),
+	(
+		"newlstat",
+		|req, target| handle_stat_like(req, target, true),
+		0,
+	),
+	(
+		"stat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+	),
+	(
+		"lstat",
+		|req, target| handle_stat_like(req, target, true),
+		0,
+	),
+	(
+		"chmod",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(1) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"chown",
+		|req, target| {
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"lchown",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"truncate",
+		|req, target| {
+			Ok(fsop(FsTruncate(TruncateOperation {
+				target,
+				length: req.arg(1) as i64,
+			})))
+		},
+		0,
+	),
+	(
+		"utimes",
+		|req, target| {
+			Ok(fsop(FsUtimens(UtimensOperation {
+				times: read_timeval_times(req, 1)?,
+				target,
+			})))
+		},
+		0,
+	),
+	(
+		"listxattr",
+		|req, target| handle_listxattr_like(req, target),
+		0,
+	),
+	(
+		"llistxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_listxattr_like(req, target)
+		},
+		0,
+	),
+	(
+		"getxattr",
+		|req, target| handle_getxattr_like(req, target, 1),
+		0,
+	),
+	(
+		"lgetxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_getxattr_like(req, target, 1)
+		},
+		0,
+	),
+	(
+		"setxattr",
+		|req, target| handle_setxattr_like(req, target, 1, 2, 3, 4),
+		0,
+	),
+	(
+		"lsetxattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_setxattr_like(req, target, 1, 2, 3, 4)
+		},
+		0,
+	),
+	(
+		"removexattr",
+		|req, target| handle_removexattr_like(req, target, 1),
+		0,
+	),
+	(
+		"lremovexattr",
+		|req, target| {
+			let mut target = target;
+			target.no_follow = true;
+			handle_removexattr_like(req, target, 1)
+		},
+		0,
+	),
+];
+
+// (name, handler, arg index of the dfd, arg index of the path, arg index of AT_* flags or None if no such flag)
+const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
+	(
+		"openat",
+		|req, target| {
+			handle_open_like(
+				req,
+				target,
+				Some(req.arg(3) as libc::mode_t),
+				Some(req.arg(2)),
+				None,
+			)
+		},
+		0,
+		1,
+		None,
+	),
+	("openat2", handle_openat2, 0, 1, None),
+	(
+		"faccessat",
+		|req, target| handle_access_like(req, target, req.arg(2)),
+		0,
+		1,
+		None,
+	),
+	(
+		"faccessat2",
+		|req, target| handle_access_like(req, target, req.arg(2)),
+		0,
+		1,
+		Some(3),
+	),
+	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
+	(
+		"symlinkat",
+		|req, target| handle_symlink_like(req, target, 0),
+		1,
+		2,
+		None,
+	),
+	(
+		"unlinkat",
+		|req, mut target| {
+			let flags = req.arg(2);
+			let dir = flags & libc::AT_REMOVEDIR as u64 != 0;
+			target.no_follow = true;
+			Ok(fsop(FsUnlink(UnlinkOperation { target, dir })))
+		},
+		0,
+		1,
+		None,
+	),
+	(
+		"mkdirat",
+		|req, target| handle_mknod_like(target, req.arg(2) as libc::mode_t, CreateKind::Directory),
+		0,
+		1,
+		None,
+	),
+	(
+		"mknodat",
+		|req, target| {
+			let mode = req.arg(2) as libc::mode_t;
+			let dev = req.arg(3) as libc::dev_t;
+			let kind =
+				if mode & libc::S_IFMT == libc::S_IFBLK || mode & libc::S_IFMT == libc::S_IFCHR {
+					CreateKind::Device { dev }
+				} else {
+					CreateKind::File
+				};
+			handle_mknod_like(target, mode, kind)
+		},
+		0,
+		1,
+		None,
+	),
+	("execveat", handle_exec_like, 0, 1, Some(4)),
+	("readlinkat", handle_readlink_like, 0, 1, None),
+	(
+		"fchmodat",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(2) as u32,
+			})))
+		},
+		0,
+		1,
+		// The raw `fchmodat` syscall takes no flags argument (only
+		// `dfd`, `path`, `mode`); AT_SYMLINK_NOFOLLOW is emulated by
+		// glibc.  `fchmodat2` below carries the real flags.
+		None,
+	),
+	(
+		"fchmodat2",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(2) as u32,
+			})))
+		},
+		0,
+		1,
+		Some(3),
+	),
+	(
+		"fchownat",
+		|req, target| {
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(2) as u32,
+				gid: req.arg(3) as u32,
+			})))
+		},
+		0,
+		1,
+		Some(4),
+	),
+	(
+		"utimensat",
+		|req, target| {
+			Ok(fsop(FsUtimens(UtimensOperation {
+				times: read_timespec_times(req, 2)?,
+				target,
+			})))
+		},
+		0,
+		1,
+		Some(3),
+	),
+	(
+		"futimesat",
+		|req, target| {
+			Ok(fsop(FsUtimens(UtimensOperation {
+				times: read_timeval_times(req, 2)?,
+				target,
+			})))
+		},
+		0,
+		1,
+		// futimesat has no flags argument.
+		None,
+	),
+	(
+		"newfstatat",
+		|req, target| {
+			handle_stat_like(
+				req,
+				target,
+				req.arg(3) & libc::AT_SYMLINK_NOFOLLOW as u64 != 0,
+			)
+		},
+		0,
+		1,
+		Some(3),
+	),
+	(
+		"statx",
+		|req, target| {
+			let lstat = req.arg(2) & libc::AT_SYMLINK_NOFOLLOW as u64 != 0;
+			handle_stat_like(req, target, lstat)
+		},
+		0,
+		1,
+		Some(2),
+	),
+	// open_tree() without OPEN_TREE_CLONE behaves like openat() with
+	// O_PATH.  We don't handle privileged operations, so we pretend that
+	// it's just openat().
+	(
+		"open_tree",
+		|_req, target| {
+			Ok(fsop(FsOpen(OpenOperation {
+				target,
+				need_read: false,
+				need_write: false,
+				create_mode: None,
+			})))
+		},
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"open_tree_attr",
+		|_req, target| {
+			Ok(fsop(FsOpen(OpenOperation {
+				target,
+				need_read: false,
+				need_write: false,
+				create_mode: None,
+			})))
+		},
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"setxattrat",
+		|req, target| handle_setxattr_like(req, target, 3, 4, 5, 2),
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"getxattrat",
+		|req, target| handle_getxattr_like(req, target, 3),
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"listxattrat",
+		|req, target| handle_listxattr_like(req, target),
+		0,
+		1,
+		Some(2),
+	),
+	(
+		"removexattrat",
+		|req, target| handle_removexattr_like(req, target, 3),
+		0,
+		1,
+		Some(2),
+	),
+];
+// (name, handler, arg index of the first path, arg index of the second path)
+const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
+	(
+		"rename",
+		|_req, mut target1, mut target2| {
+			// rename operates on the names themselves; neither final
+			// component is dereferenced.
+			target1.no_follow = true;
+			target2.no_follow = true;
+			Ok(fsop(FsRename(RenameOperation {
+				from: target1,
+				to: target2,
+				exchange: false,
+			})))
+		},
+		0,
+		1,
+	),
+	(
+		"link",
+		|_req, mut target1, mut target2| {
+			// Without AT_SYMLINK_FOLLOW the source symlink is hard-linked
+			// as-is, and the destination name is never dereferenced.
+			target1.no_follow = true;
+			target2.no_follow = true;
+			Ok(fsop(FsLink(LinkOperation {
+				from: target1,
+				to: target2,
+				follow_src_symlink: false,
+			})))
+		},
+		0,
+		1,
+	),
+];
+// (name, handler, dfd1, path1, dfd2, path2, arg index of AT_* flags affecting path1, or None if no such flag)
+const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, Option<u8>)] = &[
+	(
+		"renameat",
+		|_req, mut target1, mut target2| {
+			target1.no_follow = true;
+			target2.no_follow = true;
+			Ok(fsop(FsRename(RenameOperation {
+				from: target1,
+				to: target2,
+				exchange: false,
+			})))
+		},
+		0,
+		1,
+		2,
+		3,
+		None,
+	),
+	(
+		"renameat2",
+		|req, mut target1, mut target2| {
+			let exchange = req.arg(4) & libc::RENAME_EXCHANGE as u64 != 0;
+			target1.no_follow = true;
+			target2.no_follow = true;
+			Ok(fsop(FsRename(RenameOperation {
+				from: target1,
+				to: target2,
+				exchange,
+			})))
+		},
+		0,
+		1,
+		2,
+		3,
+		None,
+	),
+	(
+		"linkat",
+		|req, mut target1, mut target2| {
+			let flags = req.arg(4);
+			let follow_src_symlink = flags & libc::AT_SYMLINK_FOLLOW as u64 != 0;
+			// The source is followed only with AT_SYMLINK_FOLLOW; the
+			// destination name is never dereferenced.
+			target1.no_follow = !follow_src_symlink;
+			target2.no_follow = true;
+			Ok(fsop(FsLink(LinkOperation {
+				from: target1,
+				to: target2,
+				follow_src_symlink,
+			})))
+		},
+		0,
+		1,
+		2,
+		3,
+		Some(4),
+	),
+];
+
+// (name, handler, fd)
+const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
+	("fchdir", handle_chdir_like, 0),
+	(
+		"newfstat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+	),
+	(
+		"fstat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+	),
+	(
+		"fchmod",
+		|req, target| {
+			Ok(fsop(FsChmod(ChmodOperation {
+				target,
+				mode: req.arg(1) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"fchown",
+		|req, target| {
+			Ok(fsop(FsChown(ChownOperation {
+				target,
+				uid: req.arg(1) as u32,
+				gid: req.arg(2) as u32,
+			})))
+		},
+		0,
+	),
+	(
+		"ftruncate",
+		|req, target| {
+			Ok(fsop(FsTruncate(TruncateOperation {
+				target,
+				length: req.arg(1) as i64,
+			})))
+		},
+		0,
+	),
+	(
+		"fallocate",
+		|req, target| {
+			Ok(fsop(FsFallocate(FallocateOperation {
+				target,
+				mode: req.arg(1) as i32,
+				offset: req.arg(2) as i64,
+				length: req.arg(3) as i64,
+			})))
+		},
+		0,
+	),
+	(
+		"flistxattr",
+		|req, target| handle_listxattr_like(req, target),
+		0,
+	),
+	(
+		"fgetxattr",
+		|req, target| handle_getxattr_like(req, target, 1),
+		0,
+	),
+	(
+		"fsetxattr",
+		|req, target| handle_setxattr_like(req, target, 1, 2, 3, 4),
+		0,
+	),
+	(
+		"fremovexattr",
+		|req, target| handle_removexattr_like(req, target, 1),
+		0,
+	),
+];
+
+// (name, handler, fd)
+const FS_SYSCALLS_FD_OPTIONAL: &[(&str, SyscallHandler1Optional, u8)] = &[("mmap", handle_mmap, 4)];
+
+fn handle_listxattr_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+) -> Result<Operation, AccessRequestError> {
+	Ok(fsop(FsListXattr(ListXattrOperation { target })))
+}
+
+fn handle_getxattr_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	Ok(fsop(FsGetXattr(GetXattrOperation { target, name })))
+}
+
+fn handle_setxattr_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+	value_arg: usize,
+	size_arg: usize,
+	flags_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	let size = req.arg(size_arg) as usize;
+	// include/uapi/linux/limits.h
+	const XATTR_SIZE_MAX: usize = 65536;
+	if size > XATTR_SIZE_MAX {
+		return Err(AccessRequestError::InvalidSyscallData(
+			"setxattr value size exceeds XATTR_SIZE_MAX",
+		));
+	}
+	let value_ptr = req.arg(value_arg) as *const u8;
+	let value = req.bytes_from_target_memory(value_ptr, size)?;
+	Ok(fsop(FsSetXattr(SetXattrOperation {
+		target,
+		name,
+		value,
+		flags: req.arg(flags_arg) as i32,
+	})))
+}
+
+fn handle_removexattr_like(
+	req: &mut RequestContext,
+	target: FsTarget,
+	name_arg: usize,
+) -> Result<Operation, AccessRequestError> {
+	let name_ptr = req.arg(name_arg) as *const libc::c_char;
+	let name = req.cstr_from_target_memory(name_ptr)?;
+	Ok(fsop(FsRemoveXattr(RemoveXattrOperation { target, name })))
+}
+
+// ignores anonymous mmaps
+fn handle_mmap(
+	req: &mut RequestContext,
+	fd_arg_index: u8,
+) -> Result<Option<Operation>, AccessRequestError> {
+	let flags = req.arg(3);
+	let fd = req.arg(fd_arg_index as usize) as libc::c_int;
+	if flags & libc::MAP_ANONYMOUS as u64 != 0 || fd < 0 {
+		return Ok(None);
+	}
+	let target = FsTarget::from_fd(req, fd_arg_index)?;
+	let prot = req.arg(2);
+	let shared = flags & libc::MAP_SHARED as u64 != 0;
+	Ok(Some(fsop(FsMmap(MmapOperation {
+		target,
+		need_read: prot & libc::PROT_READ as u64 != 0,
+		need_write: shared && prot & libc::PROT_WRITE as u64 != 0,
+		need_exec: prot & libc::PROT_EXEC as u64 != 0,
+	}))))
+}
+
+pub(crate) fn add_filter_rules(
+	filter_ctx: &mut ScmpFilterContext,
+) -> Result<(), TurnstileTracerError> {
+	for &(sys, ..) in fs_syscalls_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_dfd_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_path_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_dfd_path_dfd_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_fd_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_fd_optional_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	Ok(())
+}
+
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_PATH,
+	fs_syscalls_path_table,
+	SyscallHandler1,
+	u8
+);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_DFD_PATH,
+	fs_syscalls_dfd_path_table,
+	SyscallHandler1,
+	u8,
+	u8,
+	Option<u8>
+);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_PATH_PATH,
+	fs_syscalls_path_path_table,
+	SyscallHandler2,
+	u8,
+	u8
+);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_DFD_PATH_DFD_PATH,
+	fs_syscalls_dfd_path_dfd_path_table,
+	SyscallHandler2,
+	u8,
+	u8,
+	u8,
+	u8,
+	Option<u8>
+);
+lazy_syscall_table_name_to_number!(FS_SYSCALLS_FD, fs_syscalls_fd_table, SyscallHandler1, u8);
+lazy_syscall_table_name_to_number!(
+	FS_SYSCALLS_FD_OPTIONAL,
+	fs_syscalls_fd_optional_table,
+	SyscallHandler1Optional,
+	u8
+);
+
+/// Argument indices of any dir fds this syscall accepts, derived from the
+/// existing request-parsing tables, for use by fd upgrade logic in
+/// ManagedBindMountSandbox.
+pub(crate) fn dfd_arg_indices(syscall: libseccomp::ScmpSyscall) -> smallvec::SmallVec<[u8; 2]> {
+	for &(sys, _h, dfd, _path, _flags) in fs_syscalls_dfd_path_table() {
+		if sys == syscall {
+			return smallvec::smallvec![dfd];
+		}
+	}
+	for &(sys, _h, dfd1, _p1, dfd2, _p2, _flags) in fs_syscalls_dfd_path_dfd_path_table() {
+		if sys == syscall {
+			return smallvec::smallvec![dfd1, dfd2];
+		}
+	}
+	smallvec::smallvec![]
+}
+
+pub(crate) fn handle_notification<'a>(
+	request_ctx: &mut RequestContext<'a>,
+) -> Result<Option<AccessRequest>, AccessRequestError> {
+	let syscall = request_ctx.sreq.data.syscall;
+
+	for &(sys, handler, path_arg_index) in fs_syscalls_path_table() {
+		if syscall == sys {
+			let target = FsTarget::from_path(request_ctx, path_arg_index)?;
+			let op = handler(request_ctx, target)?;
+			return Ok(Some(AccessRequest { operation: op }));
+		}
+	}
+
+	for &(sys, handler, dfd_arg_index, path_arg_index, flags_arg_index) in
+		fs_syscalls_dfd_path_table()
+	{
+		if syscall == sys {
+			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
+			let target =
+				FsTarget::from_at_path(request_ctx, dfd_arg_index, path_arg_index, at_flags)?;
+			let op = handler(request_ctx, target)?;
+			return Ok(Some(AccessRequest { operation: op }));
+		}
+	}
+
+	for &(sys, handler, path1_arg_index, path2_arg_index) in fs_syscalls_path_path_table() {
+		if syscall == sys {
+			let target1 = FsTarget::from_path(request_ctx, path1_arg_index)?;
+			let target2 = FsTarget::from_path(request_ctx, path2_arg_index)?;
+			let op = handler(request_ctx, target1, target2)?;
+			return Ok(Some(AccessRequest { operation: op }));
+		}
+	}
+
+	for &(
+		sys,
+		handler,
+		dfd1_arg_index,
+		path1_arg_index,
+		dfd2_arg_index,
+		path2_arg_index,
+		flags_arg_index,
+	) in fs_syscalls_dfd_path_dfd_path_table()
+	{
+		if syscall == sys {
+			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
+			let target1 =
+				FsTarget::from_at_path(request_ctx, dfd1_arg_index, path1_arg_index, at_flags)?;
+			let target2 =
+				FsTarget::from_at_path(request_ctx, dfd2_arg_index, path2_arg_index, None)?;
+			let op = handler(request_ctx, target1, target2)?;
+			return Ok(Some(AccessRequest { operation: op }));
+		}
+	}
+
+	for &(sys, handler, fd_arg_index) in fs_syscalls_fd_table() {
+		if syscall == sys {
+			let target = FsTarget::from_fd(request_ctx, fd_arg_index)?;
+			let op = handler(request_ctx, target)?;
+			return Ok(Some(AccessRequest { operation: op }));
+		}
+	}
+
+	for &(sys, handler, fd_arg_index) in fs_syscalls_fd_optional_table() {
+		if syscall == sys {
+			let op = handler(request_ctx, fd_arg_index)?;
+			if let Some(op) = op {
+				return Ok(Some(AccessRequest { operation: op }));
+			} else {
+				return Ok(None);
+			}
+		}
+	}
+
+	Ok(None)
+}

@@ -1,0 +1,389 @@
+use crate::{
+	BindMountSandboxError,
+	access::fs::ForeignFd,
+	perror,
+	utils::{
+		ENABLE_LOG_IN_FORK, fork_wait, initialize_unix_send_fd_msghdr, unix_recv_fd, unix_send_fd,
+	},
+};
+use log::{debug, error};
+use smallvec::SmallVec;
+use std::{
+	ffi::{CStr, OsStr},
+	io,
+	os::fd::AsRawFd,
+	thread,
+};
+
+fn write_to_path(path: &CStr, content: &str) -> libc::c_int {
+	unsafe {
+		let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+		if fd < 0 {
+			let err = perror!("open");
+			if ENABLE_LOG_IN_FORK {
+				error!("Failed to open {:#?} for writing: errno {}", path, err);
+			}
+			return err;
+		}
+		let bytes = content.as_bytes();
+		let write_res = libc::write(fd, bytes.as_ptr() as *const _, bytes.len());
+		if write_res < 0 {
+			let err = perror!("write");
+			libc::close(fd);
+			return err;
+		}
+		if write_res as usize != bytes.len() {
+			if ENABLE_LOG_IN_FORK {
+				error!(
+					"Short write to {:#?}: expected {} bytes, wrote {} bytes",
+					path,
+					bytes.len(),
+					write_res
+				);
+			}
+			libc::close(fd);
+			return libc::EAGAIN;
+		}
+		libc::close(fd);
+		0
+	}
+}
+
+pub(crate) unsafe fn send_fd_from_ns<
+	F1: FnOnce() -> Result<(), std::io::Error> + Send,
+	F2: FnOnce() -> Result<libc::c_int, std::io::Error> + Send,
+	E: FnOnce(libc::c_int) -> BindMountSandboxError,
+>(
+	nsenter_fn: F1,
+	acquire_fd: F2,
+	map_err: E,
+) -> Result<libc::c_int, BindMountSandboxError> {
+	unsafe {
+		thread::scope(|s| {
+			let mut sock = [-1i32; 2];
+			let res = libc::socketpair(
+				libc::AF_UNIX,
+				libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+				0,
+				sock.as_mut_ptr(),
+			);
+			if res == -1 {
+				return Err(BindMountSandboxError::Socketpair(io::Error::last_os_error()));
+			}
+			let parent_sock = sock[0];
+			let child_sock = sock[1];
+
+			let jh = s.spawn(move || {
+				let recv_res = unix_recv_fd(parent_sock);
+				libc::close(parent_sock);
+				recv_res
+			});
+
+			let fork_res = fork_wait(|| {
+				libc::close(parent_sock);
+				match nsenter_fn() {
+					Ok(()) => (),
+					Err(e) => {
+						if ENABLE_LOG_IN_FORK {
+							error!("Failed to enter namespaces for mount: {}", e);
+						}
+						return e.raw_os_error().unwrap_or(libc::EIO);
+					}
+				}
+				let mut ret = 0;
+				match acquire_fd() {
+					Ok(fd) => {
+						if let Err(e) = unix_send_fd(child_sock, fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!("Failed to send fd to parent: {}", e);
+							}
+							ret = e.raw_os_error().unwrap_or(libc::EIO)
+						}
+						libc::close(child_sock);
+						libc::close(fd);
+						ret
+					}
+					Err(e) => {
+						if ENABLE_LOG_IN_FORK {
+							error!("Failed to acquire fd in child: {}", e);
+						}
+						libc::close(child_sock);
+						e.raw_os_error().unwrap_or(libc::EIO)
+					}
+				}
+			})
+			.map_err(BindMountSandboxError::ForkError)?;
+			libc::close(child_sock);
+
+			if fork_res != 0 {
+				let _ = jh.join().expect("Child thread panicked");
+				return Err(map_err(fork_res));
+			}
+			jh.join()
+				.expect("Child thread panicked")
+				.map_err(BindMountSandboxError::ReceiveMountFd)
+		})
+	}
+}
+
+/// A struct that holds 4 namespaces: u0, m0, m1, u1, in this order.  u0
+/// and u1 are user namespaces, m0 and m1 are mount namespaces.
+#[derive(Debug)]
+pub(crate) struct ManagedNamespaces {
+	pub l0_user: ForeignFd,
+	pub l0_mnt: ForeignFd,
+	pub l1_mnt: ForeignFd,
+	pub l1_user: ForeignFd,
+}
+
+impl ManagedNamespaces {
+	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
+		initialize_unix_send_fd_msghdr();
+		// These functions are always successful
+		let uid = unsafe { libc::getuid() };
+		let gid = unsafe { libc::getgid() };
+
+		let uid_map = format!("0 {} 1\n", uid);
+		let gid_map = format!("0 {} 1\n", gid);
+		let uid_map_back = format!("{} 0 1\n", uid);
+		let gid_map_back = format!("{} 0 1\n", gid);
+
+		let mut sock = [-1, -1];
+		let res = unsafe {
+			libc::socketpair(
+				libc::AF_UNIX,
+				libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+				0,
+				sock.as_mut_ptr(),
+			)
+		};
+		if res != 0 {
+			error!("socketpair failed: {}", io::Error::last_os_error());
+			return Err(BindMountSandboxError::Socketpair(io::Error::last_os_error()));
+		}
+		let parent_sock = sock[0];
+		let child_sock = sock[1];
+
+		let namespaces = thread::scope(
+			|s| -> Result<
+				(libc::c_int, libc::c_int, libc::c_int, libc::c_int),
+				BindMountSandboxError,
+			> {
+				let jh = s.spawn(|| unsafe {
+					let fds = unix_recv_fd(parent_sock).and_then(|fd1| {
+						unix_recv_fd(parent_sock).and_then(|fd2| {
+							unix_recv_fd(parent_sock).and_then(|fd3| {
+								unix_recv_fd(parent_sock).map(|fd4| (fd1, fd2, fd3, fd4))
+							})
+						})
+					});
+					libc::close(parent_sock);
+					match fds {
+						Ok(fds) => Ok(fds),
+						Err(e) => Err(BindMountSandboxError::ReceiveNamespaceFd(e)),
+					}
+				});
+				let res = unsafe {
+					let res = fork_wait(|| {
+						libc::close(parent_sock);
+
+						let res = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS);
+						if res != 0 {
+							return perror!("unshare(CLONE_NEWUSER|CLONE_NEWNS)");
+						}
+						let res = write_to_path(c"/proc/self/uid_map", &uid_map);
+						if res != 0 {
+							return res;
+						}
+						let res = write_to_path(c"/proc/self/setgroups", "deny");
+						if res != 0 {
+							return res;
+						}
+						let res = write_to_path(c"/proc/self/gid_map", &gid_map);
+						if res != 0 {
+							return res;
+						}
+						let l0_usr_fd = libc::open(
+							c"/proc/self/ns/user".as_ptr(),
+							libc::O_RDONLY | libc::O_CLOEXEC,
+						);
+						if l0_usr_fd < 0 {
+							return perror!("open user ns fd");
+						}
+						if let Err(e) = unix_send_fd(child_sock, l0_usr_fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!("Failed to send level 0 userns fd to parent: {}", e);
+							}
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+						libc::close(l0_usr_fd);
+
+						if disable_userns {
+							let res = write_to_path(c"/proc/sys/user/max_user_namespaces", "1");
+							if res != 0 {
+								return res;
+							}
+						}
+
+						let l0_mnt_fd = libc::open(
+							c"/proc/self/ns/mnt".as_ptr(),
+							libc::O_RDONLY | libc::O_CLOEXEC,
+						);
+						if l0_mnt_fd < 0 {
+							return perror!("open mount ns fd");
+						}
+						if let Err(e) = unix_send_fd(child_sock, l0_mnt_fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!(
+									"Failed to send level 0 mount namespace fd to parent: {}",
+									e
+								);
+							}
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+						libc::close(l0_mnt_fd);
+
+						let res = libc::unshare(libc::CLONE_NEWNS);
+						if res != 0 {
+							return perror!("unshare(CLONE_NEWNS)");
+						}
+						let l1_mnt_fd = libc::open(
+							c"/proc/self/ns/mnt".as_ptr(),
+							libc::O_RDONLY | libc::O_CLOEXEC,
+						);
+						if l1_mnt_fd < 0 {
+							return perror!("open nested mount ns fd");
+						}
+						if let Err(e) = unix_send_fd(child_sock, l1_mnt_fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!(
+									"Failed to send level 1 mount namespace fd to parent: {}",
+									e
+								);
+							}
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+						libc::close(l1_mnt_fd);
+
+						let res = libc::unshare(libc::CLONE_NEWUSER);
+						if res != 0 {
+							return perror!("unshare(CLONE_NEWUSER)");
+						}
+						let res = write_to_path(c"/proc/self/uid_map", &uid_map_back);
+						if res != 0 {
+							return res;
+						}
+						let res = write_to_path(c"/proc/self/setgroups", "deny");
+						if res != 0 {
+							return res;
+						}
+						let res = write_to_path(c"/proc/self/gid_map", &gid_map_back);
+						if res != 0 {
+							return res;
+						}
+						let l1_usr_fd = libc::open(
+							c"/proc/self/ns/user".as_ptr(),
+							libc::O_RDONLY | libc::O_CLOEXEC,
+						);
+						if l1_usr_fd < 0 {
+							return perror!("open nested user ns fd");
+						}
+						if let Err(e) = unix_send_fd(child_sock, l1_usr_fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!("Failed to send level 1 user ns fd to parent: {}", e);
+							}
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+						libc::close(l1_usr_fd);
+						0
+					})
+					.map_err(BindMountSandboxError::ForkError)?;
+					libc::close(child_sock);
+					res
+				};
+				if res != 0 {
+					_ = jh.join();
+					return Err(match res {
+						libc::EPERM | libc::ENOSPC => BindMountSandboxError::UserNsNotAllowed,
+						err => BindMountSandboxError::NamespaceSetupFailed(err),
+					});
+				}
+				let namespaces = jh.join().expect("Namespace setup thread panicked")?;
+				Ok(namespaces)
+			},
+		)?;
+		let l0u = ForeignFd {
+			local_fd: namespaces.0,
+		};
+		let l0m = ForeignFd {
+			local_fd: namespaces.1,
+		};
+		let l1m = ForeignFd {
+			local_fd: namespaces.2,
+		};
+		let l1u = ForeignFd {
+			local_fd: namespaces.3,
+		};
+		debug!(
+			"Successfully set up namespaces: {:?}, {:?}, {:?}, {:?}",
+			l0u.readlink()
+				.as_deref()
+				.unwrap_or(OsStr::new("<readlink failed>")),
+			l0m.readlink()
+				.as_deref()
+				.unwrap_or(OsStr::new("<readlink failed>")),
+			l1m.readlink()
+				.as_deref()
+				.unwrap_or(OsStr::new("<readlink failed>")),
+			l1u.readlink()
+				.as_deref()
+				.unwrap_or(OsStr::new("<readlink failed>")),
+		);
+		Ok(Self {
+			l0_user: l0u,
+			l0_mnt: l0m,
+			l1_user: l1u,
+			l1_mnt: l1m,
+		})
+	}
+
+	pub unsafe fn nsenter_fn(
+		&self,
+		usr_0: bool,
+		mnt_0: bool,
+		mnt_1: bool,
+		usr_1: bool,
+	) -> impl Fn() -> io::Result<()> + 'static {
+		let mut ns_fds = SmallVec::<[libc::c_int; 4]>::new();
+		if usr_0 {
+			ns_fds.push(self.l0_user.as_raw_fd());
+		}
+		if mnt_0 {
+			ns_fds.push(self.l0_mnt.as_raw_fd());
+		}
+		if mnt_1 {
+			ns_fds.push(self.l1_mnt.as_raw_fd());
+		}
+		if usr_1 {
+			ns_fds.push(self.l1_user.as_raw_fd());
+		}
+		move || unsafe {
+			for (i, &fd) in ns_fds.iter().enumerate() {
+				let res = libc::setns(fd, 0);
+				if res != 0 {
+					let err = libc::__errno_location().read();
+					if ENABLE_LOG_IN_FORK {
+						error!(
+							"setns for fd ns_fds[{}] (= {}) failed with errno {}",
+							i, fd, err
+						);
+					}
+					return Err(io::Error::from_raw_os_error(err));
+				} else if ENABLE_LOG_IN_FORK {
+					debug!("Joined namespace ns_fds[{}] = {}", i, fd);
+				}
+			}
+			Ok(())
+		}
+	}
+}

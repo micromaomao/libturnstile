@@ -1,0 +1,76 @@
+rules:
+  /usr: rx
+  /etc: rx
+  /bin: rx
+  /lib: rx
+  /lib64: rx
+  /dev/null: rw
+  /dev/zero: rw
+  /dev/urandom: rw
+  /proc: rwx
+  /sys: r
+
+  # $XDG_RUNTIME_DIR/wayland-1: rw
+  # $XDG_RUNTIME_DIR/bus: rw
+  $XDG_RUNTIME_DIR: rw
+  # Unfortunate
+
+  /tmp:
+    target: /tmp/firefox-tmp
+    permissions: rwx
+  /dev/shm:
+    target: /tmp/firefox-shm
+    permissions: rwx
+  /dev/tty:
+    ignore: true
+  /dev/dri: rw
+  $HOME/.cache/mesa_shader_cache: rw
+  $HOME/.mozilla: rwx
+  $HOME/.cache/mozilla: rwx
+  /run/dbus/system_bus_socket: rw
+  $HOME/.config/fontconfig: r
+  $HOME/.local/share/fonts: r
+  $HOME/.cache/fontconfig: r
+  /var/cache/fontconfig: r
+  $HOME/.fonts: r
+  /dev/pts:
+    ignore: true
+  /var/lib/flatpak/exports/share/icons: r
+  $HOME/.local/share/icons: r
+  $HOME/.local/share/mime: r
+  /run/systemd/userdb: rw
+  $HOME/.local/share/gvfs-metadata: r
+  /etc/ca-certificates/trust-source: rwx
+  $HOME/.local/share/applications: rx
+  $HOME/.local/share/flatpak: rx
+  /var/lib/flatpak/exports/share/applications: rx
+  $HOME/Downloads:
+    permissions: rw
+    ignore: true
+  $HOME/.cache: rw
+  $HOME/.local/share:
+    ignore: true
+  $HOME/.config/dconf: r
+  $HOME/.config/gtk-3.0: r
+  $HOME/.config/user-dirs.dirs: r
+  $HOME/.config/mimeapps.list: r
+  $HOME/.config/pulse: r
+  $HOME/.config:
+    ignore: true
+  $HOME/.local/share:
+    ignore: true
+  /dev:
+    ignore: true
+  # yubikey
+  /run/udev: rw
+  # todo: we need some kind of glob on source paths, doing this results in error if they don't exist
+  /dev/hidraw1: rw
+  /dev/hidraw2: rw
+  /dev/hidraw3: rw
+  /dev/hidraw4: rw
+  /dev/hidraw5: rw
+  /dev/hidraw6: rw
+  /dev/hidraw7: rw
+  /dev/hidraw8: rw
+  /dev/hidraw9: rw
+  /opt/intel/oneapi: rx

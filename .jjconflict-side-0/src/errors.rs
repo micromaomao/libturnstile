@@ -1,0 +1,143 @@
+use std::ffi::CString;
+
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum TurnstileTracerError {
+	#[error("seccomp_init : {0}")]
+	Init(#[source] libseccomp::error::SeccompError),
+	#[error("seccomp_arch_add : {0}")]
+	AddArch(#[source] libseccomp::error::SeccompError),
+	#[error("seccomp_load failed with error code {0}")]
+	Load(libc::c_int),
+	#[error("seccomp_set_ctl_tsync : {0}")]
+	SetCtlTsync(#[source] libseccomp::error::SeccompError),
+	#[error("seccomp_set_ctl_no_new_privs : {0}")]
+	SetCtlNoNewPrivs(#[source] libseccomp::error::SeccompError),
+	#[error("seccomp_notify_fd failed with error code {0}")]
+	NotifyFd(libc::c_int),
+	#[error("socketpair: {0}")]
+	Socketpair(#[source] std::io::Error),
+	#[error("failed to spawn child process: {0}")]
+	Spawn(#[source] std::io::Error),
+	#[error("failed to send notify fd to parent process: {0}")]
+	SendNotifyFd(#[source] std::io::Error),
+	#[error("failed to receive notify fd from child process: {0}")]
+	ReceiveNotifyFd(#[source] std::io::Error),
+	#[error("failed to resolve syscall {0}: {1}")]
+	ResolveSyscall(&'static str, #[source] libseccomp::error::SeccompError),
+	#[error("failed to add filter rule for syscall {0}: {1}")]
+	AddRule(
+		libseccomp::ScmpSyscall,
+		#[source] libseccomp::error::SeccompError,
+	),
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum AccessRequestError {
+	#[error("seccomp_notify_receive: {0} (errno {1:?})")]
+	NotifyReceive(libseccomp::error::SeccompError, Option<libc::c_int>),
+	#[error("seccomp_notify_respond: {0}")]
+	NotifyRespond(libseccomp::error::SeccompError),
+	#[error("failed to send continue response: {0}")]
+	SendContinue(libseccomp::error::SeccompError),
+	#[error("failed to send error response: {0}")]
+	SendError(libseccomp::error::SeccompError),
+	#[error("failed to check seccomp_notify_id_valid(): {0}")]
+	NotifyIdValid(libseccomp::error::SeccompError),
+	#[error("Open /proc/{0}/mem failed: {1}")]
+	ReadProcessMemoryOpen(u32, std::io::Error),
+	#[error("Read from /proc/{0}/mem failed: {1}")]
+	ReadProcessMemoryPread(u32, std::io::Error),
+	#[error("Traced process issued invalid syscall: {0}")]
+	InvalidSyscallData(&'static str),
+	#[error("Failed to open {0}: {1}")]
+	OpenFd(String, std::io::Error),
+	#[error("Short read from /proc/{0}/mem: expected {1} bytes, got {2}")]
+	ShortReadProcessMemory(u32, usize, usize),
+	#[error("Read from /proc/{0}/comm failed: {1}")]
+	ReadPidComm(u32, std::io::Error),
+	#[error("SECCOMP_IOCTL_NOTIF_ADDFD failed: {0}")]
+	AddFd(std::io::Error),
+	#[error("attempted to respond to a notification that was already answered")]
+	NotificationAlreadyAnswered,
+	#[error("seccomp-unotify request is no longer valid")]
+	RequestNoLongerValid,
+	#[error("failed to upgrade or proxy fd for request: {0}")]
+	FdUpgrade(#[source] Box<BindMountSandboxError>),
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum BindMountSandboxError {
+	#[error("Failed to set up tracer: {0}")]
+	TurnstileTracerError(#[from] TurnstileTracerError),
+	#[error("getcwd failed: {0}")]
+	Getcwd(std::io::Error),
+	#[error("socketpair: {0}")]
+	Socketpair(std::io::Error),
+	#[error("Failed to fork process: {0}")]
+	ForkError(std::io::Error),
+	#[error("Failed to set up namespaces: errno {0}")]
+	NamespaceSetupFailed(libc::c_int),
+	#[error("Setting up new user namespace is denied")]
+	UserNsNotAllowed,
+	#[error("Failed to receive namespace fd from child: {0}")]
+	ReceiveNamespaceFd(std::io::Error),
+	#[error("Failed to restrict self to sandbox: {0}")]
+	RestrictSelf(#[source] std::io::Error),
+	#[error("failed to spawn child process: {0}")]
+	Spawn(#[source] std::io::Error),
+	#[error("Failed to receive mount object fd from child: {0}")]
+	ReceiveMountFd(std::io::Error),
+	#[error("Failed to open root in sandbox namespace: errno {0}")]
+	OpenRootInSandboxFailed(libc::c_int),
+	#[error("mount failed: errno {0}")]
+	MountFailed(libc::c_int),
+	#[error("Failed to open path within sandbox: {0}")]
+	ResolveSandboxPath(#[source] std::io::Error),
+	#[error("Failed to open directory within sandbox: {0}")]
+	OpenSandboxDir(#[source] std::io::Error),
+	#[error("Failed to open path on host: {0:?}: {1}")]
+	ResolveHostPath(CString, #[source] std::io::Error),
+	#[error("Failed to mkdir {0:?} within sandbox: {1}")]
+	Mkdir(CString, #[source] std::io::Error),
+	#[error("Failed to create file {0:?} within sandbox: {1}")]
+	Mkfile(CString, #[source] std::io::Error),
+	#[error("Failed to create symlink {0:?} -> {1:?} within sandbox: {2}")]
+	Symlinkat(CString, CString, #[source] std::io::Error),
+	#[error("Failed to chmod {0:?} within sandbox: {1}")]
+	Chmod(CString, #[source] std::io::Error),
+	#[error("Failed to set timestamps on {0:?} within sandbox: {1}")]
+	Utimens(CString, #[source] std::io::Error),
+	#[error("readlink {0:?} within sandbox: {1}")]
+	Readlink(CString, #[source] std::io::Error),
+	#[error("Conflicting concurrent modification while creating placeholder {0:?} within sandbox")]
+	SandboxPlaceholderConflict(CString),
+	#[error("Failed to set attribute on mountpoint within sandbox: {0}")]
+	MountSetAttrsFailed(libc::c_int),
+	#[error("Failed to stat path on host: {0:?}: {1}")]
+	StatHostPath(CString, #[source] std::io::Error),
+	#[error("Failed to stat path within sandbox: {0}")]
+	StatSandboxPath(#[source] std::io::Error),
+	#[error("Failed to remove path within sandbox: {0}")]
+	RemoveSandboxPath(#[source] std::io::Error),
+	#[error("Invalid sandbox path: {0}: {1:?}")]
+	InvalidSandboxPath(&'static str, CString),
+	#[error("unmount failed: errno {0}")]
+	UnmountFailed(libc::c_int),
+	#[error("Failed to set up scratch tmpfs in sandbox: errno {0}")]
+	SetupScratchFailed(libc::c_int),
+	#[error("Failed to set up placeholder tmpfs in sandbox: errno {0}")]
+	SetupPlaceholderTmpfsFailed(libc::c_int),
+	#[error("Failed to park mount to scratch: errno {0}")]
+	ParkToScratchFailed(libc::c_int),
+	#[error("Failed to restore mount from scratch: errno {0}")]
+	RestoreFromScratchFailed(libc::c_int),
+	#[error("Failed to open path in m1: errno {0}")]
+	OpenInM1Failed(libc::c_int),
+	#[error("Failed to read m1 mountinfo: {0}")]
+	ReadMountinfoFailed(#[source] std::io::Error),
+}
