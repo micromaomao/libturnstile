@@ -269,6 +269,20 @@ fn readlinkat_foreign(dir_fd: &ForeignFd, name: &CStr) -> Result<OsString, io::E
 }
 
 impl FsTarget {
+	pub fn new(
+		dfd: ForeignFd,
+		path: CString,
+		no_follow: bool,
+		original_handle: OriginalHandle,
+	) -> Self {
+		Self {
+			dfd,
+			path,
+			no_follow,
+			original_handle,
+		}
+	}
+
 	pub(crate) fn from_path(
 		req: &mut RequestContext,
 		path_arg_index: u8,
