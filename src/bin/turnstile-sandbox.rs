@@ -22,11 +22,12 @@ use libturnstile::{
 	TurnstileTracer,
 	access::{
 		AccessRequest, Operation,
-		fs::{ForeignFd, FsOperation, FsTarget, RwxPermission},
+		fs::{ForeignFd, FsOperation, FsTarget, OriginalHandle, RwxPermission},
 	},
 	fstree::FsTree,
 };
 use log::{debug, error, info};
+use smallvec::smallvec;
 
 use crate::common::ProcPidFd;
 use crate::config::Config;
@@ -278,11 +279,13 @@ fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io:
 	})
 }
 
-/// Walk the *ancestor* components of a user-supplied path (the raw
+/// Walk the ancestor components of a user-supplied path (the raw
 /// `path` as passed by the app, resolved against `dfd`) on the host.
-/// For every symlink encountered we record a symlink placeholder in the
-/// sandbox that mirrors the host (same target), and continue resolution
-/// through the symlink.  The leaf component is never touched.
+/// For every symlink encountered we create a symlink placeholder in
+/// the sandbox that mirrors the host, and continue resolution through
+/// the symlink.
+///
+/// Anything under /proc is not followed.
 ///
 /// `dfd` is the base the path resolves against (the target's dfd,
 /// already reopened in the host-mapped root); its `readlink()` gives the
@@ -434,6 +437,17 @@ fn create_symlinks_for_user_path(
 		} else {
 			debug!("walked to {:?}", OsStr::from_bytes(&candidate));
 			resolved = candidate;
+			if resolved.starts_with(b"/proc/") || resolved == b"/proc" {
+				// Don't walk anything under /proc.  We can't
+				// reasonably recreate things like /proc/self or
+				// /proc/*/fd/*.  This should not be necessary anyway
+				// if the policy has /proc mounted whole.
+				debug!(
+					"create_symlinks_for_user_path: stopping at {:?}",
+					OsStr::from_bytes(&resolved)
+				);
+				return Ok(());
+			}
 		}
 	}
 	Ok(())
@@ -918,12 +932,74 @@ fn tracing_thread(context: &'static Context) {
 				// Set when we cannot evaluate the request at all (e.g.
 				// request is for an anonymous pipe or socket)
 				let mut force_continue = false;
+				let mut is_proc = false;
 				match request.operation() {
 					Operation::FsOperation(fsop) => {
-						let rwxps = fsop.as_rwx_permissions();
+						let mut rwxps = fsop.as_rwx_permissions();
 						if req_ctx.still_valid().ok() != Some(true) {
 							debug!("request is no longer valid");
 							continue;
+						}
+						// Catch usage of things inside /proc, and just
+						// request permission on the entire /proc.
+						//
+						// If we miss anything (e.g. if the sandbox sets
+						// up a symlink pointing to within /proc), this is
+						// not a security concern, but does mean that a
+						// request to /proc might not get reported.
+						//
+						// TODO: once we fix the pathwalk, we can just
+						// check for /proc special links while doing the
+						// pathwalk, and not have to do this.
+						if rwxps.iter().all(|rwxp| {
+							let mut lby =
+								if rwxp.target.get_original_handle() != OriginalHandle::Root {
+									let Ok(l) = rwxp.target.dfd().readlink() else {
+										return false;
+									};
+									if l.as_bytes().first() != Some(&b'/') {
+										return false;
+									}
+									l.into_encoded_bytes()
+								} else {
+									Vec::from(b"/")
+								};
+							lby.push(b'/');
+							lby.extend_from_slice(rwxp.target.path().to_bytes());
+							let mut components_iter =
+								lby.split(|c| c == &b'/').filter(|c| !c.is_empty());
+							components_iter.next() == Some(b"proc")
+								&& components_iter.next().is_some()
+						}) {
+							is_proc = true;
+							debug!(
+								"Requested access within /proc, treating as access on /proc instead."
+							);
+							let mut chdir = false;
+							let mut write = false;
+							let mut exec = false;
+							for rwxp in &rwxps {
+								chdir |= rwxp.chdir;
+								write |= rwxp.write;
+								exec |= rwxp.exec;
+							}
+							rwxps = smallvec![RwxPermission {
+								chdir,
+								// We're accessing files inside /proc, so
+								// we always need read on /proc even if
+								// it's a metadata request
+								read: true,
+								write,
+								exec,
+								metadata_read: false,
+								is_dir_op: false,
+								target: FsTarget::new(
+									resolve_sandbox_root.clone(),
+									c"proc/".to_owned(),
+									false,
+									OriginalHandle::Root
+								)
+							}];
 						}
 						for rwxp in &rwxps {
 							macro_rules! check_req_valid {
@@ -1028,11 +1104,11 @@ fn tracing_thread(context: &'static Context) {
 									io::ErrorKind::NotADirectory => {
 										debug!("ENOTDIR opening target for {}: {}", rwxp, e);
 									}
+									_ if e.raw_os_error() == Some(libc::ELOOP) => {
+										debug!("ELOOP opening target for {}: {}", rwxp, e);
+									}
 									_ => {
-										error!(
-											"error opening target in real root for {}: {}",
-											rwxp, e
-										);
+										error!("error opening target for {}: {}", rwxp, e);
 									}
 								}
 								break;
@@ -1164,10 +1240,9 @@ fn tracing_thread(context: &'static Context) {
 										// First, don't prompt if we don't have the
 										// requested inode access anyway on the file.
 										if !matches!(fsop, FsOperation::FsChmod(_))
-											&& let Ok(statx) = target_fd.statx(
-												libc::STATX_UID
-													| libc::STATX_GID | libc::STATX_MODE,
-											) && !has_inode_permission(
+											&& !is_proc && let Ok(statx) = target_fd.statx(
+											libc::STATX_UID | libc::STATX_GID | libc::STATX_MODE,
+										) && !has_inode_permission(
 											&statx, uid, gid, rwxp.read, rwxp.write, rwxp.exec,
 										) {
 											force_continue = true;
@@ -1190,15 +1265,12 @@ fn tracing_thread(context: &'static Context) {
 										// remaining permissions of this same syscall.
 										if !prompted {
 											prompted = true;
-											// Resolve every target into the real
-											// host root so the prompter receives
-											// canonical host realpaths.  The
-											// in-sandbox targets often don't
-											// resolve yet (e.g. a not-yet-created
-											// dir, or a path whose parent is not
-											// materialised in the sandbox) and
-											// would serialize as invalid,
-											// unresolved paths.
+											// Reopen every target in the pathres sandbox so the
+											// prompter receives canonical host realpaths.  The
+											// in-sandbox targets often don't resolve yet (e.g. a
+											// not-yet-created dir, or a path whose parent is not
+											// materialised in the sandbox) and would serialize as
+											// invalid, unresolved paths.
 											let resolved_rwxps: Vec<RwxPermission> = rwxps
 												.iter()
 												.map(|p| {
