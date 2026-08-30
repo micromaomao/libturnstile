@@ -41,6 +41,10 @@ mod prompter;
 #[command(name = "turnstile-sandbox")]
 #[command(trailing_var_arg = true)]
 struct Cli {
+	/// Print shell integration code for the shell named by $SHELL and exit.
+	#[arg(long = "print-shell-hook")]
+	print_shell_hook: bool,
+
 	/// Block the sandboxed process from creating more unprivileged user
 	/// namespaces.
 	#[arg(long = "block-nested-userns")]
@@ -48,8 +52,8 @@ struct Cli {
 
 	/// Configuration for this sandbox. Changes to this file will be
 	/// live-reloaded.
-	#[arg(required = true)]
-	config: PathBuf,
+	#[arg(required_unless_present = "print_shell_hook")]
+	config: Option<PathBuf>,
 
 	/// If set, and if the config file provided either does not exist or is
 	/// empty, a default config will be written to the file.
@@ -83,12 +87,13 @@ struct Cli {
 	sandbox_id: Option<u64>,
 
 	/// Program to run and its arguments
-	#[arg(required = true)]
+	#[arg(required_unless_present = "print_shell_hook")]
 	command: Vec<OsString>,
 }
 
 const QT_PROMPTER_SCRIPT: &[u8] = include_bytes!("../../prompter/main.py");
 const DEFAULT_CONFIG: &[u8] = include_bytes!("sandbox-config-default.yaml");
+const FISH_HOOK: &str = include_str!("hook.fish");
 
 fn write_default_config_if_empty(path: &Path) -> io::Result<()> {
 	// Don't require write permission if the config exists.  Therefore we only
@@ -1480,7 +1485,23 @@ fn tracing_thread(context: &'static Context) {
 fn main() {
 	common::init_logger();
 
-	let cli = Cli::parse();
+	let mut cli = Cli::parse();
+	if cli.print_shell_hook {
+		let shell = std::env::var_os("SHELL").unwrap_or_default();
+		if Path::new(&shell).file_name() != Some(OsStr::new("fish")) {
+			eprintln!(
+				"turnstile-sandbox: unsupported shell {:?}; only fish is supported",
+				shell
+			);
+			std::process::exit(1);
+		}
+		print!("{}", FISH_HOOK);
+		return;
+	}
+	let config = cli
+		.config
+		.take()
+		.expect("config is required unless printing the shell hook");
 
 	if [cli.permissive, cli.prompter.is_some(), cli.qt_prompter]
 		.into_iter()
@@ -1492,7 +1513,7 @@ fn main() {
 		std::process::exit(1);
 	}
 	if cli.default_config {
-		write_default_config_if_empty(&cli.config).unwrap_or_else(|e| {
+		write_default_config_if_empty(&config).unwrap_or_else(|e| {
 			eprintln!("Unable to write default config: {}", e);
 			std::process::exit(1);
 		});
@@ -1579,7 +1600,7 @@ fn main() {
 		should_exit: AtomicBool::new(false),
 		permissive: cli.permissive,
 		prompter,
-		config_path: cli.config.clone(),
+		config_path: config,
 		ignore_paths: Mutex::new(Vec::new()),
 		sandbox_cmd: cli
 			.command
