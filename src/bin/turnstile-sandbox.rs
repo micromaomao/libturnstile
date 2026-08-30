@@ -1028,6 +1028,9 @@ fn tracing_thread(context: &'static Context) {
 									io::ErrorKind::NotADirectory => {
 										debug!("ENOTDIR opening target for {}: {}", rwxp, e);
 									}
+									_ if e.raw_os_error() == Some(libc::ELOOP) => {
+										debug!("ELOOP opening target for {}: {}", rwxp, e);
+									}
 									_ => {
 										error!(
 											"error opening target in real root for {}: {}",

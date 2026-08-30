@@ -384,15 +384,24 @@ impl FsTarget {
 			return Ok(self.dfd.clone());
 		}
 
-		let mut flags = libc::O_PATH | libc::O_CLOEXEC;
-		if self.no_follow {
-			flags |= libc::O_NOFOLLOW;
-		}
-
 		// We should have gotten rid of any absolute paths.
 		debug_assert!(self.path.as_bytes().first().copied() != Some(b'/'));
 
-		let fd = unsafe { libc::openat(self.dfd.as_raw_fd(), self.path.as_ptr(), flags, 0) };
+		let fd = unsafe {
+			let mut openhow: libc::open_how = std::mem::zeroed();
+			openhow.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+			if self.no_follow {
+				openhow.flags |= libc::O_NOFOLLOW as u64;
+			}
+			openhow.resolve = libc::RESOLVE_NO_MAGICLINKS;
+			libc::syscall(
+				libc::SYS_openat2,
+				self.dfd.as_raw_fd(),
+				self.path.as_ptr(),
+				&openhow,
+				std::mem::size_of_val(&openhow),
+			) as libc::c_int
+		};
 		if fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
@@ -540,12 +549,16 @@ impl FsTarget {
 			// We should have gotten rid of any absolute paths
 			debug_assert!(dir_path.to_bytes().first().copied() != Some(b'/'));
 			let parent_fd = unsafe {
-				libc::openat(
+				let mut openhow: libc::open_how = std::mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY) as u64;
+				openhow.resolve = libc::RESOLVE_NO_MAGICLINKS;
+				libc::syscall(
+					libc::SYS_openat2,
 					self.dfd.as_raw_fd(),
 					dir_path.as_ptr(),
-					libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
-					0,
-				)
+					&openhow,
+					std::mem::size_of_val(&openhow),
+				) as libc::c_int
 			};
 			if parent_fd < 0 {
 				return Err(io::Error::last_os_error());
