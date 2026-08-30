@@ -284,6 +284,8 @@ fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io:
 /// the sandbox that mirrors the host, and continue resolution through
 /// the symlink.
 ///
+/// Anything under /proc is not followed.
+///
 /// `dfd` is the base the path resolves against (the target's dfd,
 /// already reopened in the host-mapped root); its `readlink()` gives the
 /// starting resolved path, on top of which `path` is walked one
@@ -434,6 +436,17 @@ fn create_symlinks_for_user_path(
 		} else {
 			debug!("walked to {:?}", OsStr::from_bytes(&candidate));
 			resolved = candidate;
+			if resolved.starts_with(b"/proc/") || resolved == b"/proc" {
+				// Don't walk anything under /proc.  We can't
+				// reasonably recreate things like /proc/self or
+				// /proc/*/fd/*.  This should not be necessary anyway
+				// if the policy has /proc mounted whole.
+				debug!(
+					"create_symlinks_for_user_path: stopping at {:?}",
+					OsStr::from_bytes(&resolved)
+				);
+				return Ok(());
+			}
 		}
 	}
 	Ok(())
