@@ -278,11 +278,11 @@ fn build_resolve_placeholder(host_path: &CStr) -> Result<ManagedPlaceholder, io:
 	})
 }
 
-/// Walk the *ancestor* components of a user-supplied path (the raw
+/// Walk the ancestor components of a user-supplied path (the raw
 /// `path` as passed by the app, resolved against `dfd`) on the host.
-/// For every symlink encountered we record a symlink placeholder in the
-/// sandbox that mirrors the host (same target), and continue resolution
-/// through the symlink.  The leaf component is never touched.
+/// For every symlink encountered we create a symlink placeholder in
+/// the sandbox that mirrors the host, and continue resolution through
+/// the symlink.
 ///
 /// `dfd` is the base the path resolves against (the target's dfd,
 /// already reopened in the host-mapped root); its `readlink()` gives the
@@ -1032,10 +1032,7 @@ fn tracing_thread(context: &'static Context) {
 										debug!("ELOOP opening target for {}: {}", rwxp, e);
 									}
 									_ => {
-										error!(
-											"error opening target in real root for {}: {}",
-											rwxp, e
-										);
+										error!("error opening target for {}: {}", rwxp, e);
 									}
 								}
 								break;
@@ -1193,15 +1190,12 @@ fn tracing_thread(context: &'static Context) {
 										// remaining permissions of this same syscall.
 										if !prompted {
 											prompted = true;
-											// Resolve every target into the real
-											// host root so the prompter receives
-											// canonical host realpaths.  The
-											// in-sandbox targets often don't
-											// resolve yet (e.g. a not-yet-created
-											// dir, or a path whose parent is not
-											// materialised in the sandbox) and
-											// would serialize as invalid,
-											// unresolved paths.
+											// Reopen every target in the pathres sandbox so the
+											// prompter receives canonical host realpaths.  The
+											// in-sandbox targets often don't resolve yet (e.g. a
+											// not-yet-created dir, or a path whose parent is not
+											// materialised in the sandbox) and would serialize as
+											// invalid, unresolved paths.
 											let resolved_rwxps: Vec<RwxPermission> = rwxps
 												.iter()
 												.map(|p| {
