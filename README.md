@@ -26,6 +26,80 @@ https://github.com/user-attachments/assets/667bd18a-999d-4347-916f-1e99dc3f7f1a
 > At this moment, the included `turnstile-sandbox` binary is also not
 > protected against the above, but this is WIP.
 
+## Example usage
+
+### Install binaries
+
+```
+cargo install libturnstile --features tools
+```
+
+### turnstile-sandbox
+
+Launches a sandboxed shell with read-permission to `$PWD`.  Any other
+non-default accesses will trigger a GUI prompt, with decision
+persisted to /tmp/my-config.yaml (file will be created):
+
+```
+turnstile-sandbox /tmp/my-config.yaml --default-config --qt-prompter bash
+```
+
+### fstrace
+
+Trace all unique writes performed by a command:
+
+```
+fstrace --unique --only-writes touch /tmp/hello
+```
+
+Trace all operations under the user's home directory by a command:
+
+```
+fstrace --include ~ npm version
+```
+
+### Fish shell integration
+
+Install hooks:
+
+```fish
+source (turnstile-sandbox --print-shell-hook | psub)
+```
+
+Set current config (applies indefinitely in the current shell):
+
+```fish
+tscfg /tmp/my-config.yaml
+```
+
+Get current config (e.g. as part of the shell prompt):
+
+```fish
+echo $_CURRENT_TURNSTILE_CONFIG
+```
+
+Run command under the sandbox:
+
+```fish
+npm i parcel
+```
+
+> [!WARNING]
+> Command substitutions (e.g. `(command)`) are not currently
+> sandboxed.  For anything complex, use `fish -c '...'`
+
+Run command without sandbox:
+
+```fish
+nosandbox vim /tmp/my-config.yaml
+```
+
+Clear config (back to no sandboxing):
+
+```fish
+tscfg --clear
+```
+
 ## Features
 
 ### Tracer
