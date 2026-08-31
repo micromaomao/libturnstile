@@ -218,6 +218,22 @@ fn read_fdinfo(pid: libc::pid_t, raw: libc::c_int) -> Result<FdInfo, io::Error> 
 	}
 }
 
+/// FsTarget::realpath() effectively adds a "/." to the end of a path
+/// which has a trailing "/", "/." or "/..".  The part before this "/." is
+/// already resolved, and while this "/." is a useful indication and
+/// forces correct behaviour with openat even with O_NOFOLLOW, FsTree does
+/// not allow it.
+fn trim_slashdot(path: &OsStr) -> &OsStr {
+	let mut path_bytes = path.as_bytes();
+	if path_bytes.ends_with(b"/.") {
+		path_bytes = &path_bytes[..path_bytes.len() - 2];
+		if path_bytes.is_empty() {
+			path_bytes = b"/";
+		}
+	}
+	OsStr::from_bytes(path_bytes)
+}
+
 /// Why an [`ManagedBindMountSandbox::m1_open_checked`] reopen did not
 /// yield a usable handle.
 enum M1OpenError {
@@ -789,12 +805,12 @@ impl ManagedBindMountSandbox {
 				return ctx.send_continue();
 			}
 		};
+		let abspath = trim_slashdot(&abspath);
 		let abspath_bytes = abspath.as_bytes();
 		if abspath_bytes == b"/" {
 			return ctx.send_continue();
 		}
-		let target_os = OsStr::from_bytes(abspath_bytes);
-		let Some((cov_path, cov_host, cov_attrs)) = self.covering_mount(target_os) else {
+		let Some((cov_path, cov_host, cov_attrs)) = self.covering_mount(abspath) else {
 			// No covering mount means the policy does not in fact grant
 			// this chdir at all, even though it called allow_request.
 			// Let's just do nothing.
@@ -813,7 +829,7 @@ impl ManagedBindMountSandbox {
 		// attribute of this existing mount or move it after the fact if
 		// we want to change permission on either this dir or any of its
 		// parent.
-		if cov_path.as_os_str() == target_os {
+		if cov_path.as_os_str() == abspath {
 			// TODO: this is not technically correct - if we don't tie the
 			// pid here with the mount, we may try to unmount it in the
 			// future without realizing that it's supposed to eventually
@@ -846,7 +862,7 @@ impl ManagedBindMountSandbox {
 						attrs: cov_attrs,
 					};
 					if let Err(e) =
-						self.make_ephemeral_mount_for_cwd(target_os, mp, std::sync::Arc::new(pidfd))
+						self.make_ephemeral_mount_for_cwd(abspath, mp, std::sync::Arc::new(pidfd))
 					{
 						warn!(
 							"chdir: failed to add ephemeral mount on {:?}: {}",
@@ -882,6 +898,7 @@ impl ManagedBindMountSandbox {
 				return;
 			}
 		};
+		let abspath = trim_slashdot(&abspath);
 		let (policy, mut pt, mut mt) = self.lock_trees();
 		let on_ephemeral_mount = mt.get(&abspath).is_some() && policy.get(&abspath).is_none();
 		if on_ephemeral_mount {
@@ -923,16 +940,18 @@ impl ManagedBindMountSandbox {
 				return;
 			}
 		};
+		let from_path = trim_slashdot(&from_path);
+		let to_path = trim_slashdot(&to_path);
 		let mut need_reconcile = false;
 		let (policy, mut pt, mut mt) = self.lock_trees();
-		let cur_from = mt.find(&from_path, |_, _| true).map(|(p, _)| p);
-		let cur_to = mt.find(&to_path, |_, _| true).map(|(p, _)| p);
+		let cur_from = mt.find(from_path, |_, _| true).map(|(p, _)| p);
+		let cur_to = mt.find(to_path, |_, _| true).map(|(p, _)| p);
 		if cur_from == cur_to {
 			// then pol_from == pol_to is implied.  In this case we don't
 			// need to reconcile to resolve EXDEV, but we still check if
 			// we can get rid of EBUSY
 			let (n_ephemeral, n_policy) =
-				self.count_mount_kinds_under_path(&from_path, &policy, &mut mt);
+				self.count_mount_kinds_under_path(from_path, &policy, &mut mt);
 			if n_policy > 0 {
 				// it will fail anyway, don't bother.
 				return;
@@ -941,7 +960,7 @@ impl ManagedBindMountSandbox {
 				need_reconcile = true;
 			}
 			let (n_ephemeral, n_policy) =
-				self.count_mount_kinds_under_path(&to_path, &policy, &mut mt);
+				self.count_mount_kinds_under_path(to_path, &policy, &mut mt);
 			if n_policy > 0 || (!is_exchange && n_ephemeral > 0) {
 				// it will fail anyway, don't bother.
 				return;
@@ -953,8 +972,8 @@ impl ManagedBindMountSandbox {
 				return;
 			}
 		} else {
-			let pol_from = policy.find(&from_path, |_, _| true).map(|(p, _)| p);
-			let pol_to = policy.find(&to_path, |_, _| true).map(|(p, _)| p);
+			let pol_from = policy.find(from_path, |_, _| true).map(|(p, _)| p);
+			let pol_to = policy.find(to_path, |_, _| true).map(|(p, _)| p);
 			if pol_from != pol_to {
 				return;
 			}

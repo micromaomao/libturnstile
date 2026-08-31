@@ -1,0 +1,50 @@
+rules:
+  $PWD: rwx
+  /usr: rx
+  /etc: rx
+  /bin: rx
+  /lib: rx
+  /lib64: rx
+  /dev/null: rw
+  /dev/zero: rw
+  /dev/urandom: rw
+  /proc: rwx
+  /dev/tty:
+    ignore: true
+  /dev/pts:
+    ignore: true
+  /sys: r
+  /dev:
+    permissions: r
+  /tmp: rwx
+  /run/dbus/system_bus_socket: rw
+  /dev/dri: rw
+  $HOME/.cache/mesa_shader_cache: rw
+  $HOME/.vscode: rwx
+  $HOME/.config/Code: rwx
+  $HOME/.config/fontconfig: r
+  $HOME/.local/share/fonts: r
+  $HOME/.cache/fontconfig: r
+  /var/cache/fontconfig: r
+  $HOME/.fonts: r
+  $HOME/.config/dconf/user: r
+  $HOME/.config/gtk-3.0: r
+  /dev/shm: rw
+  $HOME/.config/user-dirs.dirs: r
+  $HOME/.local/share/vulkan: r
+  $HOME/.cargo/bin: rx
+  $XDG_RUNTIME_DIR: rw
+  $HOME/.vscode-shared: rw
+  $HOME/.cache/Microsoft: rw
+  $HOME/.local/share/mime: r
+  $HOME/.pki: r
+  $HOME/.pki/nssdb: rw
+  $HOME/.copilot: rw
+  $HOME/.claude: rw
+  $HOME/.claude.json: r
+  $HOME/.gitconfig: r
+  $HOME/.ssh/config: r
+  $HOME/.local/share/GitKrakenCLI: rwx
+  $HOME/.gk: rw
+  /dev/ptmx: rw
+  $HOME/.cargo: rwx
