@@ -204,7 +204,7 @@ pub(crate) fn add_filter_rules(
 pub(crate) fn handle_notification<'a>(
 	req: &mut RequestContext<'a>,
 ) -> Result<Option<AccessRequest>, AccessRequestError> {
-	let syscall = req.sreq.data.syscall;
+	let syscall = req.syscall();
 
 	for &(sys, handler, addr_arg, addrlen_arg) in unix_sock_syscalls_table() {
 		if syscall != sys {

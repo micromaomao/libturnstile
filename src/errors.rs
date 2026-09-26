@@ -9,6 +9,8 @@ pub enum TurnstileTracerError {
 	Init(#[source] libseccomp::error::SeccompError),
 	#[error("seccomp_arch_add : {0}")]
 	AddArch(#[source] libseccomp::error::SeccompError),
+	#[error("seccomp_arch_add for {0} : {1}")]
+	AddArch32(&'static str, #[source] libseccomp::error::SeccompError),
 	#[error("seccomp_load failed with error code {0}")]
 	Load(libc::c_int),
 	#[error("seccomp_set_ctl_tsync : {0}")]

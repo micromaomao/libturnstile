@@ -208,6 +208,19 @@ impl TurnstileTracer {
 			.add_arch(native_arch)
 			.map_err(TurnstileTracerError::AddArch)?;
 
+		// The following lines support running 32-bit binaries on 64-bit
+		// systems under the tracer.
+		if cfg!(target_arch = "x86_64") {
+			filter_ctx
+				.add_arch(ScmpArch::X86)
+				.map_err(|e| TurnstileTracerError::AddArch32("x86", e))?;
+		}
+		if cfg!(target_arch = "aarch64") {
+			filter_ctx
+				.add_arch(ScmpArch::Arm)
+				.map_err(|e| TurnstileTracerError::AddArch32("arm", e))?;
+		}
+
 		syscalls::fs::add_filter_rules(&mut filter_ctx)?;
 		syscalls::net::add_filter_rules(&mut filter_ctx)?;
 
