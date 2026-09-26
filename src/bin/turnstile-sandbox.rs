@@ -22,7 +22,7 @@ use libturnstile::{
 	TurnstileTracer,
 	access::{
 		AccessRequest, Operation,
-		fs::{ForeignFd, FsOperation, FsTarget, OriginalHandle, RwxPermission},
+		fs::{CreateKind, ForeignFd, FsOperation, FsTarget, OriginalHandle, RwxPermission},
 	},
 	fstree::FsTree,
 };
@@ -1001,6 +1001,7 @@ fn tracing_thread(context: &'static Context) {
 								)
 							}];
 						}
+
 						for rwxp in &rwxps {
 							macro_rules! check_req_valid {
 								() => {
@@ -1010,9 +1011,19 @@ fn tracing_thread(context: &'static Context) {
 									}
 								};
 							}
-							// This is the fd opened in the path resolution sandbox (which is not
-							// the host).  The path resolution sandbox is allowed to access
-							// everything, but still has any redirects applied.
+
+							let mut need_read = rwxp.read;
+							let mut need_write = rwxp.write;
+							let need_exec = rwxp.exec;
+							let mut resolve_only =
+								!need_read && !need_write && !need_exec && !rwxp.chdir;
+							let mut create_existing = false;
+
+							// This is the FsTarget re-opened in the path resolution sandbox (which
+							// is not the host).  The path resolution sandbox is allowed read-access
+							// on everything, but still has any redirects applied.  Note that a
+							// FsTarget only holds a fd on the dfd of the syscall, and for create
+							// operations this may still point to a non-existent target.
 							let t_pres = match rwxp.target.in_root(resolve_sandbox_root.as_raw_fd())
 							{
 								Ok(t) => t,
@@ -1038,53 +1049,35 @@ fn tracing_thread(context: &'static Context) {
 									break;
 								}
 							};
-							// For a create-like directory operation, if the
-							// target entry itself already exists and is already
-							// covered, the continued syscall will just open the
-							// existing entry or fail with EEXIST - neither needs
-							// access on the parent directory.  Short-circuit so we
-							// don't spuriously prompt for (or deny on) the parent,
-							// e.g. creating /dev/null when /dev/null is mounted
-							// but /dev is not.  Only open(O_CREAT) / mkdir /
-							// symlink / mknod qualify (a dir-op on FsOpen /
-							// FsCreate); ops that genuinely mutate the parent
-							// (unlink / rename / link) are excluded.
+
+							// For a create-like operation, if the target entry itself already
+							// exists, we can sometimes let the request continue as-is without
+							// requesting additional permission at this stage.  For example, some
+							// applications may try to "mkdir" a path which it nevertheless does not
+							// need complete write access to, such as ~/.config.  Even when write
+							// access is required on the entity, such as open() with O_CREAT |
+							// O_RDWR, it does not need permission on the parent directory.
 							if rwxp.is_dir_op
 								&& matches!(fsop, FsOperation::FsOpen(_) | FsOperation::FsCreate(_))
-								&& let Ok(leaf_fd) = t_pres.open_target()
-								&& let Ok(leaf_path) = leaf_fd.readlink()
+								&& let Ok(_) = t_pres.open_target()
 							{
-								let mut bytes = leaf_path.into_encoded_bytes();
-								bytes.push(b'\0');
-								let leaf_abspath = CString::from_vec_with_nul(bytes).unwrap();
-								if leaf_abspath.as_bytes() != b"/"
-									&& matches!(
-										check_covered_or_placeholder(
-											&context.sandbox,
-											&leaf_abspath,
-											rwxp.write,
-											rwxp.exec,
-											false,
-										),
-										Ok((true, _))
-									) {
-									debug!(
-										"{} target {:?} already exists and is covered; \
-										 not requiring parent access",
-										rwxp, leaf_abspath
-									);
-									if let Err(e) = create_symlinks_for_user_path(
-										&context.sandbox,
-										t_pres.dfd(),
-										t_pres.path(),
-										!t_pres.no_follow(),
-									) {
-										debug!("could not mirror symlinks for {}: {}", rwxp, e);
-									}
-									continue;
+								create_existing = true;
+								if let FsOperation::FsCreate(creatop) = fsop
+									&& creatop.kind == CreateKind::Directory
+								{
+									// For mkdir specifically, because it can only return EEXIST in
+									// this case, we don't even need read permission.
+									resolve_only = true;
+									need_read = false;
+									need_write = false;
+								} else if let FsOperation::FsOpen(openop) = fsop
+									&& !openop.need_write
+								{
+									need_write = false;
 								}
 							}
-							let target_fd = if rwxp.is_dir_op {
+
+							let target_fd = if rwxp.is_dir_op && !create_existing {
 								t_pres.open_target_dir().map(|x| x.0)
 							} else {
 								t_pres.open_target()
@@ -1142,8 +1135,6 @@ fn tracing_thread(context: &'static Context) {
 							let mut add_symlinks = false;
 							let mut add_placeholder = false;
 							let mut add_mount = false;
-							let resolve_only =
-								!rwxp.read && !rwxp.write && !rwxp.exec && !rwxp.chdir;
 							// We consider a request covered if either it is under a
 							// mount with sufficient permissions, or if it is a
 							// resolve-only request and the path is covered by a
@@ -1170,8 +1161,8 @@ fn tracing_thread(context: &'static Context) {
 							let cover = check_covered_or_placeholder(
 								&context.sandbox,
 								&sandbox_abspath,
-								rwxp.write,
-								rwxp.exec,
+								need_write,
+								need_exec,
 								resolve_only,
 							);
 							match cover.as_ref().map(|x| x.0) {
@@ -1183,9 +1174,9 @@ fn tracing_thread(context: &'static Context) {
 											.unwrap_or_else(|_| OsString::from("???"))
 											.to_string_lossy(),
 										req_ctx.pid(),
-										if rwxp.read || rwxp.chdir { "r" } else { "-" },
-										if rwxp.write { "w" } else { "-" },
-										if rwxp.exec { "x" } else { "-" },
+										if need_read || rwxp.chdir { "r" } else { "-" },
+										if need_write { "w" } else { "-" },
+										if need_exec { "x" } else { "-" },
 										t_pres,
 									);
 									add_symlinks = true;
@@ -1217,18 +1208,18 @@ fn tracing_thread(context: &'static Context) {
 											.unwrap_or_else(|_| OsString::from("???"))
 											.to_string_lossy(),
 										req_ctx.pid(),
-										if rwxp.read || rwxp.chdir { "r" } else { "-" },
-										if rwxp.write { "w" } else { "-" },
-										if rwxp.exec { "x" } else { "-" },
+										if need_read || rwxp.chdir { "r" } else { "-" },
+										if need_write { "w" } else { "-" },
+										if need_exec { "x" } else { "-" },
 										t_pres,
 									);
 									let d = denials.get_mut_or_insert(
 										OsStr::from_bytes(sandbox_abspath.as_bytes()),
 										DenialLogNode::default,
 									);
-									d.need_read |= rwxp.read || rwxp.chdir;
-									d.need_write |= rwxp.write;
-									d.need_exec |= rwxp.exec;
+									d.need_read |= need_read || rwxp.chdir;
+									d.need_write |= need_write;
+									d.need_exec |= need_exec;
 									if context.permissive {
 										add_symlinks = true;
 										if !resolve_only {
@@ -1243,7 +1234,7 @@ fn tracing_thread(context: &'static Context) {
 											&& !is_proc && let Ok(statx) = target_fd.statx(
 											libc::STATX_UID | libc::STATX_GID | libc::STATX_MODE,
 										) && !has_inode_permission(
-											&statx, uid, gid, rwxp.read, rwxp.write, rwxp.exec,
+											&statx, uid, gid, need_read, need_write, need_exec,
 										) {
 											force_continue = true;
 											debug!(
@@ -1410,10 +1401,10 @@ fn tracing_thread(context: &'static Context) {
 										mp.attrs.noexec = false;
 									}
 								}
-								if rwxp.write {
+								if need_write {
 									mp.attrs.readonly = false;
 								}
-								if rwxp.exec {
+								if need_exec {
 									mp.attrs.noexec = false;
 								}
 								let new_attrs = mp.attrs;

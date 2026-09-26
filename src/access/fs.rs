@@ -195,7 +195,7 @@ impl Clone for ForeignFd {
 ///
 /// Since the base fd is provided by the traced process, unless it
 /// provides an invalid fd, it is always guaranteed to exist.  The path,
-/// however, may either point to an non-existent entry in an existing
+/// however, may either point to a non-existent entry in an existing
 /// directory, or a completely non-existent place even ignoring the last
 /// component.
 ///
@@ -830,7 +830,7 @@ pub struct CreateOperation {
 }
 
 #[cfg_attr(feature = "serialize", derive(Serialize))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateKind {
 	File,
 	Directory,
